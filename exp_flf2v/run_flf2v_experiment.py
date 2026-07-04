@@ -108,6 +108,8 @@ def save_video_mp4(frames, path, fps=16):
     for f in frames: writer.append_data(np.array(f))
     writer.close()
 
+from attacks import ATTACK_CHOICES, apply_attack
+from defenses import DEFENSE_CHOICES, apply_defense
 # ==================================================================
 # FLF2V encode / decode helpers
 # ==================================================================
@@ -231,13 +233,28 @@ def main():
     parser.add_argument("--ref_quality", type=int, default=4)
     parser.add_argument("--flow_shift", type=float, default=None)
     parser.add_argument("--sequences", nargs="*", default=None)
+    parser.add_argument("--run_name", default=None, help="Optional subdirectory name under output_dir")
+    parser.add_argument("--attack", default="none", choices=ATTACK_CHOICES)
+    parser.add_argument("--defense", default="none", choices=DEFENSE_CHOICES)
+    parser.add_argument("--epsilon", type=float, default=4.0, help="Attack budget; values > 1 are interpreted as pixel levels out of 255")
+    parser.add_argument("--attack_steps", type=int, default=8)
+    parser.add_argument("--attack_alpha", type=float, default=0.0, help="Attack step size; 0 uses epsilon / attack_steps")
+    parser.add_argument("--jpeg_quality", type=int, default=85)
+    parser.add_argument("--median_size", type=int, default=3)
     args = parser.parse_args()
 
     if args.flow_shift is None: args.flow_shift = 3.0 if args.height <= 480 else 5.0
 
     HEIGHT, WIDTH = args.height, args.width
     out = Path(args.output_dir)
+    if args.run_name:
+        out = out / args.run_name
+    elif args.attack != "none" or args.defense != "none":
+        eps_tag = str(args.epsilon).replace(".", "p")
+        out = out / f"{args.attack}_{args.defense}_eps{eps_tag}"
     out.mkdir(parents=True, exist_ok=True)
+    with open(out / "experiment_config.json", "w") as cf:
+        json.dump(vars(args), cf, indent=2)
     FPG = args.num_frames_per_gop
     frames_per_gop_excl_first = FPG - 1 
 
@@ -367,20 +384,44 @@ def main():
         frames_resized = resize_frames(raw_frames, WIDTH, HEIGHT)
         del raw_frames
 
+        attacked_frames, attack_metadata = apply_attack(
+            frames_resized,
+            args.attack,
+            epsilon=args.epsilon,
+            attack_steps=args.attack_steps,
+            attack_alpha=args.attack_alpha,
+            seed=args.seed,
+            frames_per_gop_excl_first=frames_per_gop_excl_first,
+        )
+        codec_frames, defense_metadata = apply_defense(
+            attacked_frames,
+            args.defense,
+            jpeg_quality=args.jpeg_quality,
+            median_size=args.median_size,
+        )
+
         gops_gt = []
+        gops_codec = []
         for g in range(actual_gops):
             start = g * frames_per_gop_excl_first
             end = start + FPG
             gops_gt.append(frames_resized[start:end])
+            gops_codec.append(codec_frames[start:end])
 
         save_video_mp4(frames_resized, seq_dir / "original.mp4")
+        if args.attack != "none":
+            save_video_mp4(attacked_frames, seq_dir / "attacked_input.mp4")
+        if args.attack != "none" or args.defense != "none":
+            save_video_mp4(codec_frames, seq_dir / "codec_input.mp4")
+        with open(seq_dir / "preprocess_config.json", "w") as pf:
+            json.dump({"attack": attack_metadata, "defense": defense_metadata}, pf, indent=2)
 
-        boundary_indices = [min(g * frames_per_gop_excl_first, len(frames_resized) - 1) for g in range(actual_gops + 1)]
+        boundary_indices = [min(g * frames_per_gop_excl_first, len(codec_frames) - 1) for g in range(actual_gops + 1)]
         boundary_compressed = {}
         total_boundary_bytes = 0
 
         for idx in boundary_indices:
-            gt_frame = frames_resized[idx]
+            gt_frame = codec_frames[idx]
             if args.ref_codec == "gt":
                 boundary_compressed[idx] = (gt_frame, 0)
             else:
@@ -393,7 +434,8 @@ def main():
 
         for g in range(actual_gops):
             print(f"\n  --- {seq_name} GOP {g}/{actual_gops-1}  ({datetime.now().strftime('%H:%M:%S')}) ---")
-            gop_frames = gops_gt[g]
+            gop_frames_gt = gops_gt[g]
+            gop_frames = gops_codec[g]
             first_idx, last_idx = g * frames_per_gop_excl_first, (g + 1) * frames_per_gop_excl_first
             first_decoded, first_bytes = boundary_compressed[first_idx]
             last_decoded, last_bytes = boundary_compressed[last_idx]
@@ -431,8 +473,8 @@ def main():
             if g == 0: all_recon_frames.extend(frames_recon)
             else: all_recon_frames.extend(frames_recon[1:])
 
-            n = min(len(gop_frames), len(frames_recon))
-            t_gt, t_rec = frames_to_tensor(gop_frames[:n]), frames_to_tensor(frames_recon[:n])
+            n = min(len(gop_frames_gt), len(frames_recon))
+            t_gt, t_rec = frames_to_tensor(gop_frames_gt[:n]), frames_to_tensor(frames_recon[:n])
 
             mean_psnr, per_frame_psnr = compute_psnr(t_gt, t_rec)
             mean_msssim = compute_msssim(t_gt, t_rec)
@@ -445,8 +487,20 @@ def main():
             bpp = (gop_total_bytes * 8) / (FPG * HEIGHT * WIDTH)
             
             result = {
-                "sequence": seq_name, "gop": g, "PSNR_dB": round(mean_psnr, 2),
-                "LPIPS": round(mean_lpips, 4), "BPP": round(bpp, 6), "gop_total_bytes": gop_total_bytes,
+                "sequence": seq_name,
+                "gop": g,
+                "attack": args.attack,
+                "defense": args.defense,
+                "epsilon": args.epsilon,
+                "PSNR_dB": round(mean_psnr, 2),
+                "LPIPS": round(mean_lpips, 4),
+                "MS_SSIM": None if mean_msssim is None else round(mean_msssim, 6),
+                "BPP": round(bpp, 6),
+                "gop_total_bytes": gop_total_bytes,
+                "codebook_bytes": codebook_bytes,
+                "boundary_bytes": gop_boundary_bytes,
+                "encode_seconds": round(t_enc, 3),
+                "decode_seconds": round(t_dec, 3),
             }
             gop_results.append(result)
             with open(gop_dir / "metrics.json", "w") as mf: json.dump(result, mf, indent=2)
@@ -458,7 +512,7 @@ def main():
 
         save_video_mp4(all_recon_frames, seq_dir / "reconstructed_full.mp4")
         all_seq_results.append({"sequence": seq_name, "gop_results": gop_results})
-        del frames_resized, all_recon_frames
+        del frames_resized, attacked_frames, codec_frames, all_recon_frames
         gc.collect()
 
     print(f"\n{'='*70}\nFINAL SUMMARY\n{'='*70}")

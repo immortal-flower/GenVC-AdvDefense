@@ -92,10 +92,21 @@ class WanFLF2VWrapper:
             tokenizer_path=os.path.join(self.checkpoint_dir, self.config.clip_tokenizer),
         )
 
-        # Load DiT transformer
-        self.model = WanModel.from_pretrained(self.checkpoint_dir)
+        # Load DiT directly in the requested dtype. Avoid loading the full
+        # 14B model as FP32 and then converting every parameter on CPU.
+        print(f"[FLF2V] Loading DiT directly as {dtype}...", flush=True)
+        self.model = WanModel.from_pretrained(
+            self.checkpoint_dir,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
         self.model.eval().requires_grad_(False)
-        self.model.to(dtype=dtype).to(self.device)
+
+        if self.device.type != "cpu":
+            print(f"[FLF2V] Moving DiT to {self.device}...", flush=True)
+            self.model.to(self.device)
+
+        print("[FLF2V] DiT load complete.", flush=True)
 
         # VAE config
         self.vae_stride = self.config.vae_stride  # (4, 8, 8)

@@ -493,6 +493,7 @@ def main():
                 "defense": args.defense,
                 "epsilon": args.epsilon,
                 "PSNR_dB": round(mean_psnr, 2),
+                "per_frame_PSNR_dB": [round(float(v), 4) for v in per_frame_psnr.cpu().tolist()],
                 "LPIPS": round(mean_lpips, 4),
                 "MS_SSIM": None if mean_msssim is None else round(mean_msssim, 6),
                 "BPP": round(bpp, 6),

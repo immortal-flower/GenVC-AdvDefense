@@ -109,10 +109,19 @@ def apply_attack(frames, attack, epsilon=4.0, attack_steps=8, attack_alpha=0.0, 
             arr[idx] = arr[idx] + delta
         metadata["keyframe_indices"] = sorted(int(i) for i in key_indices)
     elif attack == "gop-shared":
-        for start in range(0, arr.shape[0], frames_per_gop_excl_first):
+        # Consecutive FLF2V GOPs share their boundary frame. Assign an
+        # overlapping boundary to the earlier GOP so every physical frame is
+        # perturbed exactly once. The old loop also started at the final
+        # boundary (e.g. frame 32 for a 33-frame clip), perturbing it twice.
+        shared_ranges = []
+        last_start = max(arr.shape[0] - 1, 1)
+        for gop_idx, start in enumerate(range(0, last_start, frames_per_gop_excl_first)):
             end = min(start + frames_per_gop_excl_first + 1, arr.shape[0])
+            apply_start = start if gop_idx == 0 else start + 1
             delta = rng.choice([-eps, eps], size=arr.shape[1:]).astype(np.float32)
-            arr[start:end] = arr[start:end] + delta[None, ...]
+            arr[apply_start:end] = arr[apply_start:end] + delta[None, ...]
+            shared_ranges.append([int(apply_start), int(end - 1)])
+        metadata["gop_shared_ranges"] = shared_ranges
     else:
         raise ValueError(f"Unsupported attack: {attack}")
 

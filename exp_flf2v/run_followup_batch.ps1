@@ -23,6 +23,7 @@ foreach ($requiredPath in @($CondaExe, $DataFile, $experimentScript, $checkpoint
 
 New-Item -ItemType Directory -Force -Path $outputDir, $logDir | Out-Null
 $env:CUDA_VISIBLE_DEVICES = $CudaDevices
+$env:PYTHONUNBUFFERED = "1"
 
 $common = @(
     "--wan_ckpt", $checkpoint,
@@ -96,8 +97,18 @@ try {
         Write-Host "[LOG] $logPath"
         Write-Host ("=" * 78)
 
-        & $CondaExe @commandArgs 2>&1 | Tee-Object -FilePath $logPath
-        $exitCode = $LASTEXITCODE
+        # Run the native command directly so tqdm/Hugging Face progress written
+        # to stderr is not converted into a terminating PowerShell error.
+        # Transcript preserves a per-run log without piping native streams.
+        $exitCode = -1
+        Start-Transcript -Path $logPath -Force | Out-Null
+        try {
+            & $CondaExe @commandArgs
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            Stop-Transcript | Out-Null
+        }
         if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $metricsPath)) {
             $failures += $task.Name
             Write-Warning "Task failed or produced no metrics: $($task.Name) (exit=$exitCode)"
@@ -142,4 +153,3 @@ $summary | Format-Table -AutoSize
 if ($failures.Count -gt 0) {
     throw "Batch completed with failures: $($failures -join ', ')"
 }
-

@@ -335,6 +335,7 @@ def main():
     parser.add_argument("--defense", default="none", choices=DEFENSE_CHOICES)
     parser.add_argument("--epsilon", type=float, default=4.0, help="Attack budget; values > 1 are interpreted as pixel levels out of 255")
     parser.add_argument("--attack_steps", type=int, default=8)
+    parser.add_argument("--attack_file", default=None, help="Saved RGB perturbation NPZ for vae-pgd")
     parser.add_argument("--attack_alpha", type=float, default=0.0, help="Attack step size; 0 uses epsilon / attack_steps")
     parser.add_argument("--jpeg_quality", type=int, default=85)
     parser.add_argument("--median_size", type=int, default=3)
@@ -543,6 +544,7 @@ def main():
             attack_alpha=args.attack_alpha,
             seed=args.seed,
             frames_per_gop_excl_first=frames_per_gop_excl_first,
+            attack_file=args.attack_file,
         )
         # 防御收到的是“攻击后的帧”；如果 defense=none，仍经过统一接口。
         # codec_frames 才是后面被 VAE 编码、用于首尾帧条件的实际输入。

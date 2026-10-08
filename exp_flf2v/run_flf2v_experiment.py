@@ -20,7 +20,7 @@ import gc
 import torch
 import numpy as np
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageOps
 from datetime import datetime
 from accelerate import dispatch_model, infer_auto_device_map
 
@@ -552,6 +552,9 @@ def main():
             jpeg_quality=args.jpeg_quality,
             median_size=args.median_size,
         )
+        # hflip 是可逆的预处理：整段 GOP 送入编码器前先镜像，重建后再
+        # 镜像回来。这样指标和保存的视频始终与原始方向的干净 GOP 对齐。
+        inverse_after_decode = defense_metadata.get("inverse_after_decode")
 
         # 分别保留“干净真值 GOP”和“攻防后编码输入 GOP”。
         # 第 g 个 GOP 的区间是 [g*(FPG-1), g*(FPG-1)+FPG)，边界帧会重复。
@@ -647,6 +650,10 @@ def main():
             flf2v_cond_dec = model.encode_first_last_frames(first_decoded, last_decoded, FPG, HEIGHT, WIDTH)
             frames_recon = flf2v_decode(pipe, model, step_data, flf2v_cond_dec)
             t_dec = time.time() - t0
+
+            if inverse_after_decode == "hflip":
+                # PIL 的 transpose 不改原帧对象；逐帧镜像后恢复显示方向。
+                frames_recon = [ImageOps.mirror(frame) for frame in frames_recon]
 
             gop_dir = seq_dir / f"gop{g}"
             gop_dir.mkdir(parents=True, exist_ok=True)

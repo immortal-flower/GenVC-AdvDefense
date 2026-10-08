@@ -17,7 +17,10 @@ from run_flf2v_experiment import load_yuv420_frames, resize_frames
 from wan.modules.vae import WanVAE
 
 
+@torch.enable_grad()
 def main():
+    # Importing the inference runner above disables autograd globally.
+    # Explicitly enable it for this attack only; VAE weights stay frozen.
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', required=True)
     p.add_argument('--vae', required=True)
@@ -64,6 +67,8 @@ def main():
         else:
             recon = (vae.decode([z])[0] + 1) / 2
             loss = (recon - target).square().mean()
+        if not loss.requires_grad:
+            raise RuntimeError('VAE loss has no gradient graph: check no_grad/inference_mode in the VAE path')
         grad, = torch.autograd.grad(loss, d)
         if not torch.isfinite(grad).all() or grad.abs().max().item() == 0:
             raise RuntimeError('Invalid/zero input gradient; aborting rather than saving a fake attack')

@@ -43,6 +43,11 @@ if($Mode -eq 'step'){
 }
 
 foreach($experiment in $experiments){
+    $existingMetrics = Join-Path 'exp_flf2v/results_720p' "$($experiment.Name)/Jockey/gop0/metrics.json"
+    if(Test-Path -LiteralPath $existingMetrics){
+        Write-Host "[SKIP] $($experiment.Name) already has metrics.json"
+        continue
+    }
     Write-Host ('=' * 78)
     Write-Host "[RUN] $($experiment.Name)"
     Write-Host ('=' * 78)

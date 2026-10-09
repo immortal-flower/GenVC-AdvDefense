@@ -38,7 +38,7 @@ def main():
     p.add_argument('--height',type=int,default=128);p.add_argument('--width',type=int,default=224)
     p.add_argument('--frames',type=int,default=9);p.add_argument('--source_frames',type=int,default=33)
     p.add_argument('--time',type=float,default=0.5);p.add_argument('--seed',type=int,default=42)
-    p.add_argument('--gpu0_memory',default='20GiB');p.add_argument('--gpu1_memory',default='10GiB')
+    p.add_argument('--gpu0_memory',default='20GiB');p.add_argument('--gpu1_memory',default='20GiB')
     p.add_argument('--no_checkpoint',action='store_true')
     a=p.parse_args()
     if a.frames<5 or (a.frames-1)%4 or a.source_frames<a.frames or a.height%16 or a.width%16 or not 0<a.time<1:
@@ -71,10 +71,16 @@ def main():
             clean_latent=model.encode_video(frames,a.height,a.width).cpu()
             model.vae.model.to('cpu');model.clip.model.to('cpu')
         gc.collect();torch.cuda.empty_cache()
+        report['gpu_memory_before_dispatch']={str(i):dict(
+            total_GiB=torch.cuda.get_device_properties(i).total_memory/2**30,
+            free_GiB=torch.cuda.mem_get_info(i)[0]/2**30) for i in range(2)}
+        report['dit_parameter_GiB']=sum(p.numel()*p.element_size() for p in model.model.parameters())/2**30
+        print(f'DiT weights: {report["dit_parameter_GiB"]:.2f} GiB; GPU weight budgets: {a.gpu0_memory}, {a.gpu1_memory}',flush=True)
         if not a.no_checkpoint:checkpoint_blocks(model.model)
         device_map=infer_auto_device_map(model.model,max_memory={0:a.gpu0_memory,1:a.gpu1_memory},
                                          no_split_module_classes=['WanAttentionBlock'])
         if any(v not in [0,1,'cuda:0','cuda:1'] for v in device_map.values()):
+            report['device_map']={k:str(v) for k,v in device_map.items()}
             raise RuntimeError(f'DiT mapping includes CPU/disk; adjust GPU memory limits: {device_map}')
         model.model=dispatch_model(model.model,device_map=device_map)
         model.device=torch.device('cuda:0')

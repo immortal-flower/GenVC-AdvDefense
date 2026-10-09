@@ -348,9 +348,15 @@ def main():
                         help="Transmission attack applied to codebook data after encoding")
     parser.add_argument("--stream_attack_rate", type=float, default=0.0,
                         help="Fraction of all codebook symbols receiving one flipped bit")
+    parser.add_argument("--stream_attack_count", type=int, default=0,
+                        help="Exact number of flipped physical bits; overrides rate when positive")
     parser.add_argument("--stream_attack_early_steps", type=int, default=0,
                         help="Restrict corruption to the first N SDE steps; 0 means all")
     parser.add_argument("--stream_attack_seed", type=int, default=42)
+    parser.add_argument("--stream_attack_target_steps", type=int, nargs="*", default=None,
+                        help="Exact 1-based SDE steps to attack, e.g. --stream_attack_target_steps 1 4")
+    parser.add_argument("--stream_attack_target_frames", type=int, nargs="*", default=None,
+                        help="Exact 0-based latent frame positions to attack (0..8 for a 33-frame GOP)")
     parser.add_argument("--stream_attack_transport", choices=STREAM_TRANSPORT_CHOICES,
                         default="logical",
                         help="logical edits Python data; serialized flips actual .tdcm payload bits")
@@ -366,12 +372,25 @@ def main():
     args = parser.parse_args()
     if args.attack_scope != "all" and args.defense != "none":
         parser.error("Split-path diagnostics require --defense none to keep clean and attacked branches aligned")
-    if args.stream_attack == "none" and args.stream_attack_rate != 0:
-        parser.error("--stream_attack_rate must be 0 when --stream_attack none")
-    if args.stream_attack != "none" and not 0 < args.stream_attack_rate <= 1:
-        parser.error("A stream attack requires --stream_attack_rate in (0,1]")
+    if args.stream_attack == "none" and (args.stream_attack_rate != 0 or args.stream_attack_count != 0):
+        parser.error("Stream attack rate/count must be 0 when --stream_attack none")
+    if args.stream_attack != "none" and args.stream_attack_count <= 0 and not 0 < args.stream_attack_rate <= 1:
+        parser.error("A stream attack requires --stream_attack_count > 0 or --stream_attack_rate in (0,1]")
+    if args.stream_attack_count < 0:
+        parser.error("--stream_attack_count cannot be negative")
+    if args.stream_attack_count > 0 and args.stream_attack_rate != 0:
+        parser.error("Specify either --stream_attack_count or --stream_attack_rate, not both")
     if args.stream_attack_early_steps < 0:
         parser.error("--stream_attack_early_steps cannot be negative")
+    if args.stream_attack_early_steps > 0 and args.stream_attack_target_steps:
+        parser.error("--stream_attack_early_steps and --stream_attack_target_steps are mutually exclusive")
+    if args.stream_attack_target_steps and any(v < 1 for v in args.stream_attack_target_steps):
+        parser.error("--stream_attack_target_steps uses 1-based positive step numbers")
+    if args.stream_attack_target_steps and any(v > args.steps - args.ddim_tail
+                                               for v in args.stream_attack_target_steps):
+        parser.error("A targeted SDE step exceeds steps - ddim_tail")
+    if args.stream_attack_target_frames and any(v < 0 for v in args.stream_attack_target_frames):
+        parser.error("--stream_attack_target_frames cannot contain negative positions")
     if args.stream_defense_steps < 1:
         parser.error("--stream_defense_steps must be positive")
     if args.stream_attack_transport == "serialized" and args.stream_defense != "none":
@@ -717,8 +736,12 @@ def main():
                     clean_path, attacked_path,
                     attack=args.stream_attack,
                     rate=args.stream_attack_rate,
+                    count=args.stream_attack_count,
                     seed=args.stream_attack_seed,
                     early_steps=args.stream_attack_early_steps,
+                    target_steps=([v - 1 for v in args.stream_attack_target_steps]
+                                  if args.stream_attack_target_steps else None),
+                    target_frames=args.stream_attack_target_frames,
                 )
                 # 重新走正式反序列化器；解码器看到的内容完全来自受损文件。
                 decode_step_data = TurboBitstream.load(str(attacked_path))["step_data"]
@@ -728,8 +751,12 @@ def main():
                     attack=args.stream_attack,
                     K=args.K,
                     rate=args.stream_attack_rate,
+                    count=args.stream_attack_count,
                     seed=args.stream_attack_seed,
                     early_steps=args.stream_attack_early_steps,
+                    target_steps=([v - 1 for v in args.stream_attack_target_steps]
+                                  if args.stream_attack_target_steps else None),
+                    target_frames=args.stream_attack_target_frames,
                     defense=args.stream_defense,
                     defense_steps=args.stream_defense_steps,
                 )

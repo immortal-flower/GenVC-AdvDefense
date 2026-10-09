@@ -560,6 +560,10 @@ class WanModel(ModelMixin, ConfigMixin):
 
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 (x2) x dim
+            # Accelerate may place img_emb and text_embedding on different
+            # GPUs. Their outputs must share a device for concatenation;
+            # Tensor.to preserves the CLIP input-gradient graph across GPUs.
+            context_clip = context_clip.to(device=context.device, dtype=context.dtype)
             context = torch.concat([context_clip, context], dim=1)
 
         # arguments

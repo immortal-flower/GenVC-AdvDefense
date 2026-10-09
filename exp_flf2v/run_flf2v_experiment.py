@@ -152,7 +152,8 @@ def save_video_mp4(frames, path, fps=16):
 
 from attacks import ATTACK_CHOICES, apply_attack, split_attack_paths
 from defenses import DEFENSE_CHOICES, apply_defense
-from bitstream_attacks import STREAM_ATTACK_CHOICES, apply_codebook_stream_attack
+from bitstream_attacks import (STREAM_ATTACK_CHOICES, STREAM_DEFENSE_CHOICES,
+                               apply_codebook_stream_attack)
 # ==================================================================
 # FLF2V 编解码核心：两端共享模型、随机种子、首尾帧条件和时间步。
 # 编码端额外拥有原视频，可计算 x0_true 并挑选码本索引；解码端只有索引。
@@ -347,6 +348,10 @@ def main():
     parser.add_argument("--stream_attack_early_steps", type=int, default=0,
                         help="Restrict corruption to the first N SDE steps; 0 means all")
     parser.add_argument("--stream_attack_seed", type=int, default=42)
+    parser.add_argument("--stream_defense", choices=STREAM_DEFENSE_CHOICES, default="none",
+                        help="Unequal error protection applied to sensitive codebook fields")
+    parser.add_argument("--stream_defense_steps", type=int, default=1,
+                        help="Number of leading SDE steps protected by the stream defense")
     parser.add_argument("--jpeg_quality", type=int, default=85)
     parser.add_argument("--median_size", type=int, default=3)
     # 之前只是在“声明”可接受哪些选项；这一行才解析实际命令行。
@@ -359,6 +364,8 @@ def main():
         parser.error("A stream attack requires --stream_attack_rate in (0,1]")
     if args.stream_attack_early_steps < 0:
         parser.error("--stream_attack_early_steps cannot be negative")
+    if args.stream_defense_steps < 1:
+        parser.error("--stream_defense_steps must be positive")
 
     # Wan 的时间步偏移随分辨率使用不同默认值；显式传参可覆盖。
     if args.flow_shift is None: args.flow_shift = 3.0 if args.height <= 480 else 5.0
@@ -678,10 +685,13 @@ def main():
                 rate=args.stream_attack_rate,
                 seed=args.stream_attack_seed,
                 early_steps=args.stream_attack_early_steps,
+                defense=args.stream_defense,
+                defense_steps=args.stream_defense_steps,
             )
             if args.stream_attack != "none":
                 print(f"  Stream attack: {args.stream_attack}, "
-                      f"changed={stream_attack_metadata['changed_symbols']}, "
+                      f"channel_flips={stream_attack_metadata['channel_flipped_bits']}, "
+                      f"residual_symbols={stream_attack_metadata['changed_symbols']}, "
                       f"payload_BER={stream_attack_metadata['payload_BER']:.8f}")
 
             # 编码阶段结束后释放条件和真值潜变量，给解码阶段留显存。
@@ -738,9 +748,11 @@ def main():
             T_sde, F_lat = pipe.num_sde_steps, pipe.num_latent_frames
             codebook_bytes = (T_sde * F_lat * pipe.codebook.bits_per_frame_step) // 8
             gop_boundary_bytes = gop_first_bytes + last_bytes
-            gop_total_bytes = codebook_bytes + gop_boundary_bytes
+            protection_overhead_bits = stream_attack_metadata["protection_overhead_bits"]
+            gop_total_bits = (codebook_bytes + gop_boundary_bytes) * 8 + protection_overhead_bits
+            gop_total_bytes = (gop_total_bits + 7) // 8
             # bit / (原 RGB 视频的总像素数)，分母是 33×720×1280，不是潜空间大小。
-            bpp = (gop_total_bytes * 8) / (FPG * HEIGHT * WIDTH)
+            bpp = gop_total_bits / (FPG * HEIGHT * WIDTH)
             
             # 每 GOP 单独保存指标，尤其 per_frame_PSNR_dB 可定位关键帧或局部退化。
             # result 是字典；键如 "PSNR_dB" 供 JSON、汇总脚本读取。
@@ -762,6 +774,7 @@ def main():
                 "gop_total_bytes": gop_total_bytes,
                 "codebook_bytes": codebook_bytes,
                 "boundary_bytes": gop_boundary_bytes,
+                "protection_overhead_bits": protection_overhead_bits,
                 "encode_seconds": round(t_enc, 3),
                 "decode_seconds": round(t_dec, 3),
             }

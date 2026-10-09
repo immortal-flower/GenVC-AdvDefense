@@ -21,6 +21,23 @@ ATTACK_CHOICES = [
 ]
 
 
+def split_attack_paths(clean_frames, processed_frames, scope):
+    """Diagnostic ablation: separate VAE target from shared FLF2V conditions.
+
+    This is not a deployment threat model: it deliberately grants a clean
+    branch to isolate which component causes reconstruction degradation.
+    """
+    if len(clean_frames) != len(processed_frames):
+        raise ValueError('Clean and processed frame counts differ')
+    if scope == 'all':
+        return processed_frames, processed_frames
+    if scope == 'target-only':
+        return processed_frames, clean_frames
+    if scope == 'condition-only':
+        return clean_frames, processed_frames
+    raise ValueError(f'Unknown attack scope: {scope}')
+
+
 def normalize_epsilon(epsilon):
     return epsilon / 255.0 if epsilon > 1.0 else epsilon
 

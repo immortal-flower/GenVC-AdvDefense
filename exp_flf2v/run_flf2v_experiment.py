@@ -150,7 +150,7 @@ def save_video_mp4(frames, path, fps=16):
     for f in frames: writer.append_data(np.array(f))
     writer.close()
 
-from attacks import ATTACK_CHOICES, apply_attack
+from attacks import ATTACK_CHOICES, apply_attack, split_attack_paths
 from defenses import DEFENSE_CHOICES, apply_defense
 # ==================================================================
 # FLF2V 编解码核心：两端共享模型、随机种子、首尾帧条件和时间步。
@@ -336,11 +336,15 @@ def main():
     parser.add_argument("--epsilon", type=float, default=4.0, help="Attack budget; values > 1 are interpreted as pixel levels out of 255")
     parser.add_argument("--attack_steps", type=int, default=8)
     parser.add_argument("--attack_file", default=None, help="Saved RGB perturbation NPZ for vae-pgd")
+    parser.add_argument("--attack_scope", choices=["all", "target-only", "condition-only"], default="all",
+                        help="Diagnostic split between x0_true target and shared FLF2V boundary conditions")
     parser.add_argument("--attack_alpha", type=float, default=0.0, help="Attack step size; 0 uses epsilon / attack_steps")
     parser.add_argument("--jpeg_quality", type=int, default=85)
     parser.add_argument("--median_size", type=int, default=3)
     # 之前只是在“声明”可接受哪些选项；这一行才解析实际命令行。
     args = parser.parse_args()
+    if args.attack_scope != "all" and args.defense != "none":
+        parser.error("Split-path diagnostics require --defense none to keep clean and attacked branches aligned")
 
     # Wan 的时间步偏移随分辨率使用不同默认值；显式传参可覆盖。
     if args.flow_shift is None: args.flow_shift = 3.0 if args.height <= 480 else 5.0
@@ -557,6 +561,13 @@ def main():
         # hflip 是可逆的预处理：整段 GOP 送入编码器前先镜像，重建后再
         # 镜像回来。这样指标和保存的视频始终与原始方向的干净 GOP 对齐。
         inverse_after_decode = defense_metadata.get("inverse_after_decode")
+        # Attribution experiment: target-only keeps boundary conditions clean;
+        # condition-only retains a clean x0_true but corrupts shared conditions.
+        target_frames, condition_frames = split_attack_paths(frames_resized, codec_frames, args.attack_scope)
+        attack_metadata["attack_scope"] = args.attack_scope
+        attack_metadata["target_source"] = "clean" if args.attack_scope == "condition-only" else "processed"
+        attack_metadata["condition_source"] = "clean" if args.attack_scope == "target-only" else "processed"
+        print(f"  Attack paths: scope={args.attack_scope}, target={attack_metadata['target_source']}, conditions={attack_metadata['condition_source']}")
 
         # 分别保留“干净真值 GOP”和“攻防后编码输入 GOP”。
         # 第 g 个 GOP 的区间是 [g*(FPG-1), g*(FPG-1)+FPG)，边界帧会重复。
@@ -569,7 +580,7 @@ def main():
             # [start:end] 取右端之前的帧；append 把一个 GOP 列表放到外层列表。
             # gops_gt[g] / gops_codec[g] 都是长度约 33 的 PIL 帧列表。
             gops_gt.append(frames_resized[start:end])
-            gops_codec.append(codec_frames[start:end])
+            gops_codec.append(target_frames[start:end])
 
         # 保存可视化视频：original、attacked_input、codec_input 分别对应上述三阶段。
         save_video_mp4(frames_resized, seq_dir / "original.mp4")
@@ -577,6 +588,9 @@ def main():
             save_video_mp4(attacked_frames, seq_dir / "attacked_input.mp4")
         if args.attack != "none" or args.defense != "none":
             save_video_mp4(codec_frames, seq_dir / "codec_input.mp4")
+        if args.attack_scope != "all":
+            save_video_mp4(target_frames, seq_dir / "target_input.mp4")
+            save_video_mp4(condition_frames, seq_dir / "condition_source.mp4")
         with open(seq_dir / "preprocess_config.json", "w") as pf:
             json.dump({"attack": attack_metadata, "defense": defense_metadata}, pf, indent=2)
 
@@ -589,7 +603,7 @@ def main():
         total_boundary_bytes = 0
 
         for idx in boundary_indices:
-            gt_frame = codec_frames[idx]
+            gt_frame = condition_frames[idx]
             # gt 是不压缩边界帧的消融模式，边界码率记为 0，不代表现实中免费传输。
             if args.ref_codec == "gt":
                 boundary_compressed[idx] = (gt_frame, 0)
@@ -698,6 +712,9 @@ def main():
                 "attack": args.attack,
                 "defense": args.defense,
                 "epsilon": args.epsilon,
+                "attack_scope": args.attack_scope,
+                "target_source": attack_metadata["target_source"],
+                "condition_source": attack_metadata["condition_source"],
                 "PSNR_dB": round(mean_psnr, 2),
                 "per_frame_PSNR_dB": [round(float(v), 4) for v in per_frame_psnr.cpu().tolist()],
                 "LPIPS": round(mean_lpips, 4),

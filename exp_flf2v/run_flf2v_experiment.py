@@ -35,6 +35,7 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _project_root)
 from sde_rf_wan.wan_flf2v_wrapper import WanFLF2VWrapper
 from sde_rf_wan.turbo_pipeline import TurboDDCMWanPipeline
+from sde_rf_wan.turbo_codebook import TurboBitstream
 from sde_rf_wan.sde_convert import velocity_to_score, diffusion_coeff, sde_drift
 from sde_rf_wan.ref_codec import compress_ref
 from uvg_data import find_uvg_sequences as find_uvg_sequences_shared
@@ -153,7 +154,9 @@ def save_video_mp4(frames, path, fps=16):
 from attacks import ATTACK_CHOICES, apply_attack, split_attack_paths
 from defenses import DEFENSE_CHOICES, apply_defense
 from bitstream_attacks import (STREAM_ATTACK_CHOICES, STREAM_DEFENSE_CHOICES,
-                               apply_codebook_stream_attack)
+                               STREAM_TRANSPORT_CHOICES,
+                               apply_codebook_stream_attack,
+                               apply_serialized_codebook_attack)
 # ==================================================================
 # FLF2V 编解码核心：两端共享模型、随机种子、首尾帧条件和时间步。
 # 编码端额外拥有原视频，可计算 x0_true 并挑选码本索引；解码端只有索引。
@@ -348,6 +351,11 @@ def main():
     parser.add_argument("--stream_attack_early_steps", type=int, default=0,
                         help="Restrict corruption to the first N SDE steps; 0 means all")
     parser.add_argument("--stream_attack_seed", type=int, default=42)
+    parser.add_argument("--stream_attack_transport", choices=STREAM_TRANSPORT_CHOICES,
+                        default="logical",
+                        help="logical edits Python data; serialized flips actual .tdcm payload bits")
+    parser.add_argument("--reuse_codebook", default=None,
+                        help="Decode an existing clean .tdcm instead of repeating codebook search; single GOP only")
     parser.add_argument("--stream_defense", choices=STREAM_DEFENSE_CHOICES, default="none",
                         help="Unequal error protection applied to sensitive codebook fields")
     parser.add_argument("--stream_defense_steps", type=int, default=1,
@@ -366,6 +374,8 @@ def main():
         parser.error("--stream_attack_early_steps cannot be negative")
     if args.stream_defense_steps < 1:
         parser.error("--stream_defense_steps must be positive")
+    if args.stream_attack_transport == "serialized" and args.stream_defense != "none":
+        parser.error("Serialized transport currently supports unprotected .tdcm only; use logical mode for the repetition pilot")
 
     # Wan 的时间步偏移随分辨率使用不同默认值；显式传参可覆盖。
     if args.flow_shift is None: args.flow_shift = 3.0 if args.height <= 480 else 5.0
@@ -399,6 +409,8 @@ def main():
     if args.sequences: all_seqs = [(n, p) for n, p in all_seqs if n in args.sequences]
     # 没有找到有效 .yuv 时停止运行。
     if not all_seqs: sys.exit(1)
+    if args.reuse_codebook and len(all_seqs) != 1:
+        parser.error("--reuse_codebook requires exactly one selected sequence")
 
     # ================================================================
     # 模型加载与双 GPU 内存分配
@@ -596,6 +608,8 @@ def main():
         gops_gt = []
         gops_codec = []
         for g in range(actual_gops):
+            if args.reuse_codebook and g > 0:
+                raise ValueError("--reuse_codebook currently supports one GOP per run")
             start = g * frames_per_gop_excl_first
             end = start + FPG
             # [start:end] 取右端之前的帧；append 把一个 GOP 列表放到外层列表。
@@ -657,6 +671,8 @@ def main():
                 guidance_scale=1.0, g_scale=args.g_scale, num_frames=FPG,
                 height=HEIGHT, width=WIDTH, seed=args.seed,
             )
+            gop_dir = seq_dir / f"gop{g}"
+            gop_dir.mkdir(parents=True, exist_ok=True)
             
             # 将解压后的两张边界 RGB 帧变成 FLF2V 条件。
             # wrapper 中：CLIP 提取两帧视觉特征；VAE 编码“首帧+零帧+尾帧”，
@@ -666,28 +682,58 @@ def main():
             flf2v_cond = model.encode_first_last_frames(first_decoded, last_decoded, FPG, HEIGHT, WIDTH)
             
             # 编码端可见完整的攻防后 GOP：VAE 得到 x0_true，再逐步搜索码本索引/符号。
-            print(f"  Encoding...")
-            t0 = time.time()
-            # 右侧函数返回两个对象，左侧两个变量一次接收（解包赋值）。
-            # step_data 保存 [SDE步][潜在时间帧] 的码本索引/符号；
-            # x0_true 是编码端的 [1,16,9,90,160] 真值潜变量，解码不用传它。
-            step_data, x0_true = flf2v_encode(pipe, model, gop_frames, flf2v_cond, HEIGHT, WIDTH)
-            t_enc = time.time() - t0
+            if args.reuse_codebook:
+                # 快速消融：复用一次正常编码得到的码流，只重复解码。
+                # 这会跳过最慢的逐步残差计算与 Top-M 搜索。
+                loaded = TurboBitstream.load(args.reuse_codebook)
+                expected = (pipe.K, pipe.M, pipe.num_sde_steps, pipe.num_latent_frames,
+                            pipe.seed, pipe.frame_shape)
+                actual = (loaded["K"], loaded["M"], loaded["num_sde_steps"],
+                          loaded["num_latent_frames"], loaded["seed"], loaded["frame_shape"])
+                if actual != expected:
+                    raise ValueError(f"Reused codebook metadata mismatch: expected {expected}, got {actual}")
+                step_data = loaded["step_data"]
+                x0_true = None
+                t_enc = 0.0
+                print(f"  Reusing clean codebook (encoding skipped): {args.reuse_codebook}")
+            else:
+                print(f"  Encoding...")
+                t0 = time.time()
+                # 右侧函数返回两个对象，左侧两个变量一次接收（解包赋值）。
+                # step_data 保存 [SDE步][潜在时间帧] 的码本索引/符号；
+                # x0_true 是编码端的 [1,16,9,90,160] 真值潜变量，解码不用传它。
+                step_data, x0_true = flf2v_encode(pipe, model, gop_frames, flf2v_cond, HEIGHT, WIDTH)
+                t_enc = time.time() - t0
 
             # A stream attack models corruption after encoding: the encoder
             # produces the normal indices/signs, then a small number of their
             # transmitted bits are changed before the decoder receives them.
             # Input pixels, model weights and codebook generation stay clean.
-            decode_step_data, stream_attack_metadata = apply_codebook_stream_attack(
-                step_data,
-                attack=args.stream_attack,
-                K=args.K,
-                rate=args.stream_attack_rate,
-                seed=args.stream_attack_seed,
-                early_steps=args.stream_attack_early_steps,
-                defense=args.stream_defense,
-                defense_steps=args.stream_defense_steps,
-            )
+            if args.stream_attack != "none" and args.stream_attack_transport == "serialized":
+                clean_path = gop_dir / "codebook_clean.tdcm"
+                attacked_path = gop_dir / "codebook.tdcm"
+                pipe.save_compressed(step_data, str(clean_path))
+                stream_attack_metadata = apply_serialized_codebook_attack(
+                    clean_path, attacked_path,
+                    attack=args.stream_attack,
+                    rate=args.stream_attack_rate,
+                    seed=args.stream_attack_seed,
+                    early_steps=args.stream_attack_early_steps,
+                )
+                # 重新走正式反序列化器；解码器看到的内容完全来自受损文件。
+                decode_step_data = TurboBitstream.load(str(attacked_path))["step_data"]
+            else:
+                decode_step_data, stream_attack_metadata = apply_codebook_stream_attack(
+                    step_data,
+                    attack=args.stream_attack,
+                    K=args.K,
+                    rate=args.stream_attack_rate,
+                    seed=args.stream_attack_seed,
+                    early_steps=args.stream_attack_early_steps,
+                    defense=args.stream_defense,
+                    defense_steps=args.stream_defense_steps,
+                )
+                stream_attack_metadata["transport"] = "logical-memory"
             if args.stream_attack != "none":
                 print(f"  Stream attack: {args.stream_attack}, "
                       f"channel_flips={stream_attack_metadata['channel_flipped_bits']}, "
@@ -695,7 +741,9 @@ def main():
                       f"payload_BER={stream_attack_metadata['payload_BER']:.8f}")
 
             # 编码阶段结束后释放条件和真值潜变量，给解码阶段留显存。
-            del flf2v_cond, x0_true
+            del flf2v_cond
+            if x0_true is not None:
+                del x0_true
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -712,17 +760,16 @@ def main():
                 # PIL 的 transpose 不改原帧对象；逐帧镜像后恢复显示方向。
                 frames_recon = [ImageOps.mirror(frame) for frame in frames_recon]
 
-            gop_dir = seq_dir / f"gop{g}"
-            gop_dir.mkdir(parents=True, exist_ok=True)
             # reconstructed.mp4 是可直接观看的重建视频；codebook.tdcm 是码本码流。
             # 指标使用内存里的 frames_recon，不使用 MP4 重新解码后的帧。
             save_video_mp4(frames_recon, gop_dir / "reconstructed.mp4")
             if args.stream_attack != "none":
-                pipe.save_compressed(step_data, str(gop_dir / "codebook_clean.tdcm"))
-                # Keep the conventional filename for the payload actually
-                # consumed by the decoder; the pristine payload is retained
-                # separately for a byte-level comparison.
-                pipe.save_compressed(decode_step_data, str(gop_dir / "codebook.tdcm"))
+                if args.stream_attack_transport != "serialized":
+                    pipe.save_compressed(step_data, str(gop_dir / "codebook_clean.tdcm"))
+                    # Keep the conventional filename for the payload actually
+                    # consumed by the decoder; the pristine payload is retained
+                    # separately for a byte-level comparison.
+                    pipe.save_compressed(decode_step_data, str(gop_dir / "codebook.tdcm"))
             else:
                 pipe.save_compressed(step_data, str(gop_dir / "codebook.tdcm"))
 

@@ -402,7 +402,20 @@ class WanFLF2VWrapper:
     # ================================================================
 
     @torch.no_grad()
-    def predict_velocity(
+    def predict_velocity(self, x_t, t, prompt_embeds, i2v_cond=None):
+        """Inference-only velocity; existing compression behavior is unchanged."""
+        return self._predict_velocity_impl(x_t, t, prompt_embeds, i2v_cond)
+
+    @torch.enable_grad()
+    def predict_velocity_with_grad(self, x_t, t, prompt_embeds, i2v_cond=None):
+        """Explicit input-gradient path for diagnostics; weights remain frozen.
+
+        Do not use the inference runner's temporary no_grad/offload interceptors
+        with this method. Modules participating in backward must stay resident.
+        """
+        return self._predict_velocity_impl(x_t, t, prompt_embeds, i2v_cond)
+
+    def _predict_velocity_impl(
         self,
         x_t: torch.Tensor,
         t: float,

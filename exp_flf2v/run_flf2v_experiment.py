@@ -152,6 +152,7 @@ def save_video_mp4(frames, path, fps=16):
 
 from attacks import ATTACK_CHOICES, apply_attack, split_attack_paths
 from defenses import DEFENSE_CHOICES, apply_defense
+from bitstream_attacks import STREAM_ATTACK_CHOICES, apply_codebook_stream_attack
 # ==================================================================
 # FLF2V 编解码核心：两端共享模型、随机种子、首尾帧条件和时间步。
 # 编码端额外拥有原视频，可计算 x0_true 并挑选码本索引；解码端只有索引。
@@ -339,12 +340,25 @@ def main():
     parser.add_argument("--attack_scope", choices=["all", "target-only", "condition-only"], default="all",
                         help="Diagnostic split between x0_true target and shared FLF2V boundary conditions")
     parser.add_argument("--attack_alpha", type=float, default=0.0, help="Attack step size; 0 uses epsilon / attack_steps")
+    parser.add_argument("--stream_attack", choices=STREAM_ATTACK_CHOICES, default="none",
+                        help="Transmission attack applied to codebook data after encoding")
+    parser.add_argument("--stream_attack_rate", type=float, default=0.0,
+                        help="Fraction of all codebook symbols receiving one flipped bit")
+    parser.add_argument("--stream_attack_early_steps", type=int, default=0,
+                        help="Restrict corruption to the first N SDE steps; 0 means all")
+    parser.add_argument("--stream_attack_seed", type=int, default=42)
     parser.add_argument("--jpeg_quality", type=int, default=85)
     parser.add_argument("--median_size", type=int, default=3)
     # 之前只是在“声明”可接受哪些选项；这一行才解析实际命令行。
     args = parser.parse_args()
     if args.attack_scope != "all" and args.defense != "none":
         parser.error("Split-path diagnostics require --defense none to keep clean and attacked branches aligned")
+    if args.stream_attack == "none" and args.stream_attack_rate != 0:
+        parser.error("--stream_attack_rate must be 0 when --stream_attack none")
+    if args.stream_attack != "none" and not 0 < args.stream_attack_rate <= 1:
+        parser.error("A stream attack requires --stream_attack_rate in (0,1]")
+    if args.stream_attack_early_steps < 0:
+        parser.error("--stream_attack_early_steps cannot be negative")
 
     # Wan 的时间步偏移随分辨率使用不同默认值；显式传参可覆盖。
     if args.flow_shift is None: args.flow_shift = 3.0 if args.height <= 480 else 5.0
@@ -653,6 +667,23 @@ def main():
             step_data, x0_true = flf2v_encode(pipe, model, gop_frames, flf2v_cond, HEIGHT, WIDTH)
             t_enc = time.time() - t0
 
+            # A stream attack models corruption after encoding: the encoder
+            # produces the normal indices/signs, then a small number of their
+            # transmitted bits are changed before the decoder receives them.
+            # Input pixels, model weights and codebook generation stay clean.
+            decode_step_data, stream_attack_metadata = apply_codebook_stream_attack(
+                step_data,
+                attack=args.stream_attack,
+                K=args.K,
+                rate=args.stream_attack_rate,
+                seed=args.stream_attack_seed,
+                early_steps=args.stream_attack_early_steps,
+            )
+            if args.stream_attack != "none":
+                print(f"  Stream attack: {args.stream_attack}, "
+                      f"changed={stream_attack_metadata['changed_symbols']}, "
+                      f"payload_BER={stream_attack_metadata['payload_BER']:.8f}")
+
             # 编码阶段结束后释放条件和真值潜变量，给解码阶段留显存。
             del flf2v_cond, x0_true
             gc.collect()
@@ -664,7 +695,7 @@ def main():
             # 这里是内存中的编解码往返：直接传 step_data，而非重新打开 .tdcm。
             # 单独再次构造条件，是为了模拟编解码器两侧各自计算条件特征。
             flf2v_cond_dec = model.encode_first_last_frames(first_decoded, last_decoded, FPG, HEIGHT, WIDTH)
-            frames_recon = flf2v_decode(pipe, model, step_data, flf2v_cond_dec)
+            frames_recon = flf2v_decode(pipe, model, decode_step_data, flf2v_cond_dec)
             t_dec = time.time() - t0
 
             if inverse_after_decode == "hflip":
@@ -676,7 +707,14 @@ def main():
             # reconstructed.mp4 是可直接观看的重建视频；codebook.tdcm 是码本码流。
             # 指标使用内存里的 frames_recon，不使用 MP4 重新解码后的帧。
             save_video_mp4(frames_recon, gop_dir / "reconstructed.mp4")
-            pipe.save_compressed(step_data, str(gop_dir / "codebook.tdcm"))
+            if args.stream_attack != "none":
+                pipe.save_compressed(step_data, str(gop_dir / "codebook_clean.tdcm"))
+                # Keep the conventional filename for the payload actually
+                # consumed by the decoder; the pristine payload is retained
+                # separately for a byte-level comparison.
+                pipe.save_compressed(decode_step_data, str(gop_dir / "codebook.tdcm"))
+            else:
+                pipe.save_compressed(step_data, str(gop_dir / "codebook.tdcm"))
 
             # 拼接整条序列时跳过后一 GOP 重复的首帧；单个 GOP 文件仍保留 33 帧。
             # extend 会把列表中的每帧逐一追加；[1:] 跳过第 0 帧。
@@ -715,6 +753,7 @@ def main():
                 "attack_scope": args.attack_scope,
                 "target_source": attack_metadata["target_source"],
                 "condition_source": attack_metadata["condition_source"],
+                "stream_attack": stream_attack_metadata,
                 "PSNR_dB": round(mean_psnr, 2),
                 "per_frame_PSNR_dB": [round(float(v), 4) for v in per_frame_psnr.cpu().tolist()],
                 "LPIPS": round(mean_lpips, 4),
@@ -731,7 +770,7 @@ def main():
             with open(gop_dir / "metrics.json", "w") as mf: json.dump(result, mf, indent=2)
 
             print(f"    PSNR={mean_psnr:.2f} dB, LPIPS={mean_lpips:.4f}, BPP={bpp:.6f}")
-            del pipe, frames_recon, t_gt, t_rec, step_data, flf2v_cond_dec
+            del pipe, frames_recon, t_gt, t_rec, step_data, decode_step_data, flf2v_cond_dec
             gc.collect()
             torch.cuda.empty_cache()
 

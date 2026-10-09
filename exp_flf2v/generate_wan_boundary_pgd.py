@@ -1,9 +1,11 @@
-"""Single-step Wan velocity attack on first/last RGB frames.
+"""Multi-time Wan velocity attack on first/last RGB frames.
 
 Two-stage vector-Jacobian products propagate the exact condition gradient
 back to pixels without retaining VAE/CLIP and DiT graphs simultaneously.
 Reference compression is evaluated afterwards, not differentiated through.
-The optimization is a low-resolution RF-state surrogate, not full GVCC PGD.
+An optional full-GOP VAE perturbation can initialize the attack, producing a
+joint VAE-target plus Wan-condition perturbation. This remains a reduced-
+resolution RF-state surrogate, not differentiation through codebook search.
 """
 import argparse
 import gc
@@ -48,17 +50,22 @@ def main():
     p.add_argument('--output',default='exp_flf2v/attack_assets/jockey_wan_boundary_eps2.npz')
     p.add_argument('--height',type=int,default=128);p.add_argument('--width',type=int,default=224)
     p.add_argument('--source_height',type=int,default=720);p.add_argument('--source_width',type=int,default=1280)
-    p.add_argument('--frames',type=int,default=9);p.add_argument('--source_frames',type=int,default=33)
+    p.add_argument('--frames',type=int,default=33);p.add_argument('--source_frames',type=int,default=33)
     p.add_argument('--steps',type=int,default=8);p.add_argument('--epsilon',type=float,default=2)
-    p.add_argument('--alpha',type=float,default=0.5);p.add_argument('--time',type=float,default=0.5)
+    p.add_argument('--alpha',type=float,default=0.5)
+    p.add_argument('--times',type=float,nargs='+',default=[0.25,0.5,0.75])
+    p.add_argument('--initial_attack_file',default=None,
+                   help='Optional HWC/FHWC VAE perturbation to preserve on the full GOP')
     p.add_argument('--seed',type=int,default=42)
     p.add_argument('--gpu0_memory',default='20GiB');p.add_argument('--gpu1_memory',default='20GiB')
     a=p.parse_args()
-    if a.height%16 or a.width%16 or (a.frames-1)%4 or a.frames<5 or a.source_frames<a.frames or a.steps<1 or a.epsilon<=0 or a.alpha<=0 or not 0<a.time<1:
+    if (a.height%16 or a.width%16 or (a.frames-1)%4 or a.frames<5
+            or a.source_frames<a.frames or a.steps<1 or a.epsilon<=0
+            or a.alpha<=0 or not a.times or any(not 0<t<1 for t in a.times)):
         p.error('Invalid dimensions or optimization parameters')
     if torch.cuda.device_count()<2:raise RuntimeError('Requires two GPUs')
     out=Path(a.output);out.parent.mkdir(parents=True,exist_ok=True)
-    report=vars(a)|dict(status='started',scope='boundary pixels, frozen Wan single-step low-resolution surrogate',
+    report=vars(a)|dict(status='started',scope='joint full-GOP initialization plus frozen-Wan multi-time boundary surrogate',
                         reference_codec_in_optimization=False,history=[])
     def save():out.with_suffix('.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
     save()
@@ -98,55 +105,92 @@ def main():
         embeds=[u.to('cuda:0') for u in embeds]
         gen=torch.Generator(device='cpu').manual_seed(a.seed)
         noise=torch.randn(clean_latent.shape,generator=gen)
-        x_t=((1-a.time)*clean_latent+a.time*noise).to('cuda:0')
+        states=[]
         with torch.no_grad():
-            baseline=model.predict_velocity(x_t,a.time,embeds,{k:v.to('cuda:0') for k,v in base.items()})
+            base_gpu={k:v.to('cuda:0') for k,v in base.items()}
+            for time_value in a.times:
+                x_t=((1-time_value)*clean_latent+time_value*noise).to('cuda:0')
+                baseline=model.predict_velocity(x_t,time_value,embeds,base_gpu)
+                states.append((time_value,x_t,baseline))
+            del base_gpu
         torch.manual_seed(a.seed)
         eps=a.epsilon/255;alpha=a.alpha/255
-        delta=torch.empty_like(original).uniform_(-eps,eps)
+        initial_full=None
+        if a.initial_attack_file:
+            with np.load(a.initial_attack_file,allow_pickle=False) as saved:
+                initial_full=saved['delta'].astype(np.float32)
+            expected=(a.source_frames,a.source_height,a.source_width,3)
+            if initial_full.shape==(a.source_height,a.source_width,3):
+                initial_full=np.repeat(initial_full[None],a.source_frames,axis=0)
+            if initial_full.shape!=expected:
+                raise ValueError(f'Initial perturbation shape {initial_full.shape} != {expected}')
+            if not np.isfinite(initial_full).all() or np.abs(initial_full).max()>eps+1e-6:
+                raise ValueError('Initial perturbation is invalid or exceeds epsilon')
+            boundary=np.stack([initial_full[0],initial_full[-1]])
+            boundary=torch.from_numpy(boundary).permute(0,3,1,2).to('cuda:1')
+            delta=F.interpolate(boundary,size=(a.height,a.width),mode='bilinear',align_corners=False).clamp(-eps,eps)
+            report['initialization']='full-GOP saved VAE perturbation'
+        else:
+            delta=torch.empty_like(original).uniform_(-eps,eps)
+            report['initialization']='random boundary perturbation; middle frames remain clean'
         initial=delta.clone()
         @torch.no_grad()
         def evaluate(pixels):
             cond=tensor_conditions(model,pixels,a.frames)
-            velocity=model.predict_velocity(x_t,a.time,embeds,cond)
-            return float((velocity-baseline).square().mean())
-        report['random_velocity_shift_MSE']=evaluate(((original+initial).clamp(0,1)*255).round()/255)
+            per_time={}
+            for time_value,x_t,baseline in states:
+                velocity=model.predict_velocity(x_t,time_value,embeds,cond)
+                per_time[str(time_value)]=float((velocity-baseline).square().mean())
+            return dict(mean=float(np.mean(list(per_time.values()))),per_time=per_time)
+        report['initial_velocity_shift_MSE']=evaluate(((original+initial).clamp(0,1)*255).round()/255)
         for step in range(a.steps):
             pixels=(original+delta).clamp(0,1)
             with torch.no_grad():cond=tensor_conditions(model,pixels,a.frames)
-            y=cond['y'].detach().to('cuda:0').requires_grad_(True)
-            clip=cond['clip_fea'].detach().to('cuda:0').requires_grad_(True)
-            velocity=model.predict_velocity_with_grad(x_t,a.time,embeds,dict(y=y,clip_fea=clip))
-            loss=(velocity-baseline).square().mean()
-            gy,gclip=torch.autograd.grad(loss,(y,clip))
-            value=float(loss.detach())
-            gy=gy.detach().to('cuda:1');gclip=gclip.detach().to('cuda:1')
-            del velocity,loss,y,clip,cond
+            gy_total=torch.zeros_like(cond['y'],device='cuda:1')
+            gclip_total=torch.zeros_like(cond['clip_fea'],device='cuda:1')
+            time_losses={}
+            for time_value,x_t,baseline in states:
+                y=cond['y'].detach().to('cuda:0').requires_grad_(True)
+                clip=cond['clip_fea'].detach().to('cuda:0').requires_grad_(True)
+                velocity=model.predict_velocity_with_grad(x_t,time_value,embeds,dict(y=y,clip_fea=clip))
+                loss=(velocity-baseline).square().mean()/len(states)
+                gy,gclip=torch.autograd.grad(loss,(y,clip))
+                time_losses[str(time_value)]=float(loss.detach()*len(states))
+                gy_total+=gy.detach().to('cuda:1')
+                gclip_total+=gclip.detach().to('cuda:1')
+                del velocity,loss,y,clip,gy,gclip
+            del cond
             # Rebuild each smaller encoder graph separately and apply its VJP.
             leaf=pixels.detach().requires_grad_(True)
             vae_cond=tensor_conditions(model,leaf,a.frames,'vae')['y']
-            g_vae,=torch.autograd.grad(vae_cond,leaf,grad_outputs=gy)
-            del vae_cond,gy
+            g_vae,=torch.autograd.grad(vae_cond,leaf,grad_outputs=gy_total)
+            del vae_cond,gy_total
             clip_cond=tensor_conditions(model,leaf,a.frames,'clip')['clip_fea']
-            g_clip,=torch.autograd.grad(clip_cond,leaf,grad_outputs=gclip)
+            g_clip,=torch.autograd.grad(clip_cond,leaf,grad_outputs=gclip_total)
             grad=g_vae+g_clip
             if not torch.isfinite(grad).all() or grad.abs().max().item()==0:raise RuntimeError('Invalid/zero RGB input gradient')
             delta=(delta+alpha*grad.sign()).clamp(-eps,eps).detach()
-            row=dict(step=step+1,velocity_shift_MSE=value,pixel_grad_max=float(grad.abs().max()),
+            row=dict(step=step+1,mean_velocity_shift_MSE=float(np.mean(list(time_losses.values()))),
+                     per_time_velocity_shift_MSE=time_losses,pixel_grad_max=float(grad.abs().max()),
                      vae_pixel_grad_mean=float(g_vae.abs().mean()),clip_pixel_grad_mean=float(g_clip.abs().mean()))
             report['history'].append(row);save()
             print(f'Boundary PGD {step+1}/{a.steps}: {json.dumps(row)}',flush=True)
-            del leaf,clip_cond,gclip,g_vae,g_clip,grad,pixels
+            del leaf,clip_cond,gclip_total,g_vae,g_clip,grad,pixels
         report['optimized_velocity_shift_MSE']=evaluate(((original+delta).clamp(0,1)*255).round()/255)
         with torch.no_grad():lifted=F.interpolate(delta,size=(a.source_height,a.source_width),mode='bilinear',align_corners=False).permute(0,2,3,1).cpu().numpy()
-        # Only boundary frames are changed; middle-frame delta is exactly zero.
-        full_delta=np.zeros((a.source_frames,a.source_height,a.source_width,3),np.float32)
+        # Preserve the optional VAE attack on middle frames, then replace its
+        # two boundary slices with the multi-time Wan-optimized perturbation.
+        full_delta=(initial_full.copy() if initial_full is not None else
+                    np.zeros((a.source_frames,a.source_height,a.source_width,3),np.float32))
         full_delta[0]=lifted[0];full_delta[-1]=lifted[1]
-        native=np.stack([np.asarray(source[0]),np.asarray(source[-1])]).astype(np.float32)/255
-        quantized=np.floor(np.clip(native+lifted,0,1)*255+0.5)/255
-        mse=float(np.mean((quantized-native)**2))
-        report['boundary_input_PSNR_dB']=float(-10*np.log10(max(mse,1e-12)))
-        report['boundary_Linf_pixel']=float(np.abs(quantized-native).max()*255)
+        native_all=np.stack([np.asarray(frame) for frame in source]).astype(np.float32)/255
+        quantized_all=np.floor(np.clip(native_all+full_delta,0,1)*255+0.5)/255
+        actual=quantized_all-native_all
+        report['input_PSNR_dB']=float(-10*np.log10(max(float(np.mean(actual**2)),1e-12)))
+        report['measured_Linf_pixel']=float(np.abs(actual).max()*255)
+        boundary_actual=actual[[0,-1]]
+        report['boundary_input_PSNR_dB']=float(-10*np.log10(max(float(np.mean(boundary_actual**2)),1e-12)))
+        quantized=quantized_all[[0,-1]]
         previews=out.parent/(out.stem+'_input_png');previews.mkdir(parents=True,exist_ok=True)
         attacked=[Image.fromarray(np.rint(f*255).astype(np.uint8)) for f in quantized]
         for n,f in enumerate([0,a.source_frames-1]):
@@ -164,9 +208,13 @@ def main():
         with torch.no_grad():
             cc=tensor_conditions(model,pair_tensor(codec_clean),a.frames)
             ac=tensor_conditions(model,pair_tensor(codec_adv),a.frames)
-            vc=model.predict_velocity(x_t,a.time,embeds,cc)
-            va=model.predict_velocity(x_t,a.time,embeds,ac)
-            report['after_real_codec_velocity_shift_MSE']=float((va-vc).square().mean())
+            codec_per_time={}
+            for time_value,x_t,_ in states:
+                vc=model.predict_velocity(x_t,time_value,embeds,cc)
+                va=model.predict_velocity(x_t,time_value,embeds,ac)
+                codec_per_time[str(time_value)]=float((va-vc).square().mean())
+            report['after_real_codec_velocity_shift_MSE']=dict(
+                mean=float(np.mean(list(codec_per_time.values()))),per_time=codec_per_time)
         report['reference_codec_bytes']=codec_stats
         report['status']='completed';report['lossless_input_png_dir']=str(previews)
         np.savez_compressed(out,delta=full_delta);save()

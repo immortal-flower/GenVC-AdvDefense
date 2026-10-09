@@ -3,16 +3,19 @@ param(
     [string]$Data = 'D:\yzb and lmk\dataset-720P\UVG\Jockey_720p.yuv',
     [int]$Crop = 192,
     [int]$TileSteps = 10,
+    [double]$Epsilon = 4,
     [switch]$GenerateOnly
 )
 $ErrorActionPreference = 'Continue'
 Set-Location (Split-Path -Parent $PSScriptRoot)
 $env:CUDA_VISIBLE_DEVICES = '0,1'
-$asset = 'exp_flf2v/attack_assets/jockey_vae_pgd_grid_deviation_eps4.npz'
+$epsText = $Epsilon.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+$runName = "vae_pgd_grid_deviation_eps${epsText}"
+$asset = "exp_flf2v/attack_assets/jockey_${runName}.npz"
 $generateArgs = @('run', '--no-capture-output', '-n', 'GVCC-5090', 'python',
     'exp_flf2v/generate_vae_pgd.py', '--data', $Data,
     '--vae', 'exp_flf2v/Wan2.1-FLF2V-14B-720P/Wan2.1_VAE.pth',
-    '--output', $asset, '--epsilon', '4', '--alpha', '0.5',
+    '--output', $asset, '--epsilon', $epsText, '--alpha', '0.5',
     '--schedule', 'grid', '--tile_steps', "$TileSteps", '--crop', "$Crop",
     '--objective', 'deviation', '--eval_every', '70')
 & $CondaExe @generateArgs
@@ -26,6 +29,6 @@ $experimentArgs = @('run', '--no-capture-output', '-n', 'GVCC-5090', 'python',
     '--K', '16384', '--steps', '20', '--ddim_tail', '3', '--g_scale', '3.0',
     '--ref_codec', 'compressai', '--ref_quality', '4', '--seed', '42',
     '--sequences', 'Jockey', '--attack', 'vae-pgd', '--attack_file', $asset,
-    '--epsilon', '4', '--defense', 'none', '--run_name', 'vae_pgd_grid_deviation_eps4')
+    '--epsilon', $epsText, '--defense', 'none', '--run_name', $runName)
 & $CondaExe @experimentArgs
 if ($LASTEXITCODE -ne 0) { throw 'GVCC evaluation failed.' }

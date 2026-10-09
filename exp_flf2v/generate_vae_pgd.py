@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -170,6 +171,12 @@ def main():
     output = Path(a.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output, delta=delta.permute(1, 2, 0).numpy())
+    previews = output.parent / (output.stem + '_input_png')
+    previews.mkdir(parents=True, exist_ok=True)
+    for f in [0, a.frames//2, a.frames-1]:
+        Image.fromarray(np.rint(original[f]*255).astype(np.uint8)).save(previews / f'frame{f:02d}_original.png')
+        Image.fromarray(np.rint(quantized[f]*255).astype(np.uint8)).save(previews / f'frame{f:02d}_attacked.png')
+    report['lossless_input_png_dir'] = str(previews)
     for name, baseline in [('random_uniform', initial_delta), ('random_sign', sign_delta)]:
         np.savez_compressed(output.with_name(output.stem + '_' + name + '.npz'),
                             delta=baseline.permute(1, 2, 0).numpy())

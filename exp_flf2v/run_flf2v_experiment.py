@@ -157,7 +157,8 @@ from bitstream_attacks import (STREAM_ATTACK_CHOICES, STREAM_DEFENSE_CHOICES,
                                STREAM_TRANSPORT_CHOICES,
                                apply_codebook_stream_attack,
                                apply_serialized_codebook_attack,
-                               select_impact_sign_slots)
+                               select_impact_sign_slots,
+                               select_trajectory_sign_slots)
 # ==================================================================
 # FLF2V 编解码核心：两端共享模型、随机种子、首尾帧条件和时间步。
 # 编码端额外拥有原视频，可计算 x0_true 并挑选码本索引；解码端只有索引。
@@ -354,6 +355,10 @@ def main():
     parser.add_argument("--stream_attack_early_steps", type=int, default=0,
                         help="Restrict corruption to the first N SDE steps; 0 means all")
     parser.add_argument("--stream_attack_seed", type=int, default=42)
+    parser.add_argument("--stream_attack_trajectory_trials", type=int, default=8,
+                        help="Forward-only candidate probes for sign-trajectory-bitflip")
+    parser.add_argument("--stream_attack_trajectory_pool_factor", type=float, default=2.0,
+                        help="Geometric candidate-pool size relative to the bit budget")
     parser.add_argument("--stream_attack_target_steps", type=int, nargs="*", default=None,
                         help="Exact 1-based SDE steps to attack, e.g. --stream_attack_target_steps 1 4")
     parser.add_argument("--stream_attack_target_frames", type=int, nargs="*", default=None,
@@ -396,15 +401,21 @@ def main():
         parser.error("--stream_defense_steps must be positive")
     if args.stream_attack_transport == "serialized" and args.stream_defense != "none":
         parser.error("Serialized transport currently supports unprotected .tdcm only; use logical mode for the repetition pilot")
-    if args.stream_attack == "sign-impact-bitflip":
+    if args.stream_attack in ("sign-impact-bitflip", "sign-trajectory-bitflip"):
         if args.stream_attack_transport != "serialized":
-            parser.error("sign-impact-bitflip requires --stream_attack_transport serialized")
+            parser.error("Ranked sign attacks require --stream_attack_transport serialized")
         if args.stream_attack_count <= 0:
-            parser.error("sign-impact-bitflip requires an exact --stream_attack_count")
+            parser.error("Ranked sign attacks require an exact --stream_attack_count")
         if not args.stream_attack_target_steps or len(args.stream_attack_target_steps) != 1:
-            parser.error("sign-impact-bitflip currently targets exactly one SDE step")
+            parser.error("Ranked sign attacks currently target exactly one SDE step")
         if not args.stream_attack_target_frames:
-            parser.error("sign-impact-bitflip requires at least one target latent frame")
+            parser.error("Ranked sign attacks require at least one target latent frame")
+    if args.stream_attack == "sign-trajectory-bitflip" and args.stream_attack_target_steps != [1]:
+        parser.error("sign-trajectory-bitflip currently supports only --stream_attack_target_steps 1")
+    if args.stream_attack_trajectory_trials < 1:
+        parser.error("--stream_attack_trajectory_trials must be positive")
+    if args.stream_attack_trajectory_pool_factor < 1.0:
+        parser.error("--stream_attack_trajectory_pool_factor must be at least 1")
 
     # Wan 的时间步偏移随分辨率使用不同默认值；显式传参可覆盖。
     if args.flow_shift is None: args.flow_shift = 3.0 if args.height <= 480 else 5.0
@@ -753,6 +764,21 @@ def main():
                     print(f"  Impact ranking: noise_MSE={impact_metadata['final_noise_mse']:.6f}, "
                           f"cosine={impact_metadata['final_noise_cosine']:.6f}, "
                           f"allocation={impact_metadata['allocation_by_frame']}")
+                elif args.stream_attack == "sign-trajectory-bitflip":
+                    impact_slots, impact_metadata = select_trajectory_sign_slots(
+                        step_data, pipe.codebook, args.stream_attack_count,
+                        args.stream_attack_target_steps[0] - 1,
+                        args.stream_attack_target_frames,
+                        pipe, model, flf2v_cond,
+                        trials=args.stream_attack_trajectory_trials,
+                        pool_factor=args.stream_attack_trajectory_pool_factor,
+                        seed=args.stream_attack_seed,
+                    )
+                    print(f"  Trajectory ranking: velocity_MSE="
+                          f"{impact_metadata['winning_velocity_mse']:.6f}, "
+                          f"state_MSE={impact_metadata['winning_next_state_mse']:.6f}, "
+                          f"allocation={impact_metadata['allocation_by_frame']}, "
+                          f"trials={impact_metadata['evaluated_trials']}")
                 stream_attack_metadata = apply_serialized_codebook_attack(
                     clean_path, attacked_path,
                     attack=args.stream_attack,

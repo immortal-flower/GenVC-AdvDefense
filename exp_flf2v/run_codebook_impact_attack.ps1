@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('single','joint','dose')]
+    [ValidateSet('single','joint','dose','trajectory')]
     [string]$Mode = 'single',
     [string]$CondaExe = 'D:\anaconda\Scripts\conda.exe',
     [string]$Data = 'D:\yzb and lmk\dataset-720P\UVG\Jockey_720p.yuv',
@@ -33,7 +33,7 @@ if($Mode -eq 'single'){
         [pscustomobject]@{Name='impact_frames3_4_random16'; Attack='sign-bitflip'; Count=16; Frames=@(3,4)},
         [pscustomobject]@{Name='impact_frames3_4_ranked16'; Attack='sign-impact-bitflip'; Count=16; Frames=@(3,4)}
     )
-} else {
+} elseif($Mode -eq 'dose') {
     # Frame 3 is the most vulnerable latent temporal position in the earlier
     # sweep.  This dose curve compares random and geometry-ranked corruption
     # under exactly the same physical sign-bit budget.  The wider range is
@@ -52,6 +52,17 @@ if($Mode -eq 'single'){
             Frames=@(3)
         }
     }
+} else {
+    # Compare three selection policies under identical step/frame/bit budgets:
+    # random, codebook-geometry ranking, and forward Wan-trajectory probing.
+    $experiments = @(
+        [pscustomobject]@{Name='trajectory_frame3_random8'; Attack='sign-bitflip'; Count=8; Frames=@(3)},
+        [pscustomobject]@{Name='trajectory_frame3_geometry8'; Attack='sign-impact-bitflip'; Count=8; Frames=@(3)},
+        [pscustomobject]@{Name='trajectory_frame3_wan8'; Attack='sign-trajectory-bitflip'; Count=8; Frames=@(3)},
+        [pscustomobject]@{Name='trajectory_frame3_random16'; Attack='sign-bitflip'; Count=16; Frames=@(3)},
+        [pscustomobject]@{Name='trajectory_frame3_geometry16'; Attack='sign-impact-bitflip'; Count=16; Frames=@(3)},
+        [pscustomobject]@{Name='trajectory_frame3_wan16'; Attack='sign-trajectory-bitflip'; Count=16; Frames=@(3)}
+    )
 }
 
 foreach($experiment in $experiments){
@@ -81,7 +92,12 @@ foreach($experiment in $experiments){
         '--stream_attack_target_frames'
     )
     foreach($frame in $experiment.Frames){$experimentArgs += [string]$frame}
-    $experimentArgs += @('--stream_attack_seed','42','--run_name',$experiment.Name)
+    $experimentArgs += @(
+        '--stream_attack_seed','42',
+        '--stream_attack_trajectory_trials','8',
+        '--stream_attack_trajectory_pool_factor','2.0',
+        '--run_name',$experiment.Name
+    )
     & $CondaExe @experimentArgs
     if($LASTEXITCODE -ne 0){throw "Impact attack failed: $($experiment.Name)"}
 }
@@ -102,6 +118,7 @@ $summary = foreach($experiment in $experiments){
         Bits = $experiment.Count
         NoiseMSE = if($null -ne $selection){$selection.final_noise_mse}else{$null}
         NoiseCosine = if($null -ne $selection){$selection.final_noise_cosine}else{$null}
+        TrajectoryMSE = if($null -ne $selection){$selection.winning_velocity_mse}else{$null}
         PSNR = $metrics.PSNR_dB
         DeltaPSNR = [math]::Round([double]$metrics.PSNR_dB - $cleanPSNR, 4)
         LPIPS = $metrics.LPIPS

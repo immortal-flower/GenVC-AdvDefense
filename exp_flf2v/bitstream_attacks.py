@@ -7,7 +7,7 @@ import numpy as np
 
 
 STREAM_ATTACK_CHOICES = ['none', 'index-bitflip', 'sign-bitflip',
-                         'sign-impact-bitflip']
+                         'sign-impact-bitflip', 'sign-trajectory-bitflip']
 STREAM_DEFENSE_CHOICES = ['none', 'sign-repetition3']
 STREAM_TRANSPORT_CHOICES = ['logical', 'serialized']
 
@@ -156,6 +156,132 @@ def select_impact_sign_slots(step_data, codebook, count, step_idx, frame_indices
     )
 
 
+def select_trajectory_sign_slots(step_data, codebook, count, step_idx,
+                                 frame_indices, pipe, model, i2v_cond,
+                                 trials=8, pool_factor=2.0, seed=42):
+    """Choose sign flips by probing their effect on the next Wan prediction.
+
+    A cheap geometric pass first constructs a candidate pool.  Several exact
+    ``count``-bit subsets from that pool are then injected into the first SDE
+    update.  The winner maximizes the MSE between the clean and corrupted Wan
+    velocity at the *next* timestep.  This is a forward-only white-box probe:
+    it uses the public model, bitstream, conditions and shared seed, but no
+    source-video pixels, reconstruction labels or backward pass.
+
+    Only the first SDE step is supported for now.  Probing a later step would
+    require replaying every preceding attacked trajectory for each candidate.
+    """
+    import torch
+    from sde_rf_wan.sde_convert import velocity_to_score, diffusion_coeff, sde_drift
+
+    if step_idx != 0:
+        raise ValueError('Trajectory sign ranking currently supports SDE step 1 only')
+    if trials < 1:
+        raise ValueError('Trajectory trials must be positive')
+    frame_indices = sorted({int(frame) for frame in frame_indices})
+    capacity = sum(len(step_data[step_idx][frame][1]) for frame in frame_indices)
+    if count < 1 or count > capacity:
+        raise ValueError(f'Trajectory count must be in [1,{capacity}]')
+    pool_size = min(capacity, max(count, int(math.ceil(count * pool_factor))))
+
+    # The returned order is the greedy geometry ranking trajectory.  Its first
+    # ``count`` entries form a deterministic baseline candidate.
+    pool_slots, pool_metadata = select_impact_sign_slots(
+        step_data, codebook, pool_size, step_idx, frame_indices)
+    pool_slots = [tuple(slot) for slot in pool_slots]
+    candidates = [tuple(range(count))]
+    seen = {candidates[0]}
+    rng = np.random.default_rng(seed)
+    attempts = 0
+    while len(candidates) < trials and attempts < max(100, trials * 50):
+        attempts += 1
+        proposal = tuple(sorted(int(v) for v in
+                                rng.choice(pool_size, size=count, replace=False)))
+        if proposal not in seen:
+            seen.add(proposal)
+            candidates.append(proposal)
+
+    with torch.no_grad():
+        embeds = model.encode_prompt('')
+        model_fn = pipe._model_fn(embeds, i2v_cond)
+        gen = torch.Generator(device='cpu').manual_seed(pipe.seed)
+        x_t = torch.randn(1, *pipe.latent_shape, generator=gen).to(pipe.device)
+        t_curr = pipe.timesteps[0].item()
+        t_next = pipe.timesteps[1].item()
+        delta_t = t_curr - t_next
+        u_t = model_fn(x_t, t_curr)
+        score = velocity_to_score(u_t, x_t, t_curr)
+        g_t = diffusion_coeff(t_curr, pipe.g_scale)
+        f_t = sde_drift(u_t, score, g_t)
+        noise_coeff = g_t * (delta_t ** 0.5)
+        drift_state = x_t - f_t * delta_t
+
+        clean_frames = []
+        for frame_idx in range(pipe.num_latent_frames):
+            indices, signs = step_data[0][frame_idx]
+            clean_frames.append(codebook.reconstruct(indices, signs, 0, frame_idx))
+        clean_noise = torch.stack(clean_frames, dim=1).unsqueeze(0)
+        clean_next = drift_state + noise_coeff * clean_noise
+        clean_velocity = model_fn(clean_next, t_next)
+
+        scores = []
+        best_score = -1.0
+        best_slots = None
+        best_state_mse = None
+        for candidate_id, pool_positions in enumerate(candidates):
+            selected = [pool_slots[position] for position in pool_positions]
+            by_frame = {}
+            for _, frame_idx, atom_position in selected:
+                by_frame.setdefault(frame_idx, []).append(atom_position)
+            attacked_noise = clean_noise.clone()
+            for frame_idx, atom_positions in by_frame.items():
+                indices, signs = step_data[0][frame_idx]
+                attacked_signs = list(signs)
+                for atom_position in atom_positions:
+                    attacked_signs[atom_position] *= -1
+                attacked_noise[0, :, frame_idx] = codebook.reconstruct(
+                    indices, attacked_signs, 0, frame_idx)
+            attacked_next = drift_state + noise_coeff * attacked_noise
+            attacked_velocity = model_fn(attacked_next, t_next)
+            velocity_mse = float(((attacked_velocity - clean_velocity) ** 2).mean().item())
+            state_mse = float(((attacked_next - clean_next) ** 2).mean().item())
+            scores.append(dict(candidate=candidate_id,
+                               pool_positions=list(pool_positions),
+                               velocity_mse=velocity_mse,
+                               next_state_mse=state_mse))
+            if velocity_mse > best_score:
+                best_score = velocity_mse
+                best_state_mse = state_mse
+                best_slots = selected
+            del attacked_noise, attacked_next, attacked_velocity
+
+        del embeds, model_fn, x_t, u_t, score, f_t, drift_state
+        del clean_frames, clean_noise, clean_next, clean_velocity
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    allocation = {str(frame): sum(1 for _, selected_frame, _ in best_slots
+                                   if selected_frame == frame)
+                  for frame in frame_indices}
+    selected_indices = [int(step_data[step][frame][0][position])
+                        for step, frame, position in best_slots]
+    return best_slots, dict(
+        objective='maximum next-timestep Wan velocity MSE',
+        target_frames=frame_indices,
+        allocation_by_frame=allocation,
+        selected_atom_positions=[position for _, _, position in best_slots],
+        selected_frame_positions=[frame for _, frame, _ in best_slots],
+        selected_codebook_indices=selected_indices,
+        candidate_pool_size=pool_size,
+        requested_trials=int(trials),
+        evaluated_trials=len(candidates),
+        winning_velocity_mse=best_score,
+        winning_next_state_mse=best_state_mse,
+        candidate_scores=scores,
+        geometry_pool=pool_metadata,
+    )
+
+
 def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
                                      seed=42, early_steps=0, count=0,
                                      target_steps=None, target_frames=None,
@@ -167,7 +293,8 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
     experiment measures codebook-trajectory sensitivity rather than parser
     failure.  Index flips are constrained to valid, unique codebook indices.
     """
-    if attack not in ('index-bitflip', 'sign-bitflip', 'sign-impact-bitflip'):
+    if attack not in ('index-bitflip', 'sign-bitflip', 'sign-impact-bitflip',
+                      'sign-trajectory-bitflip'):
         raise ValueError('Serialized attack requires index-bitflip or sign-bitflip')
     if count < 0:
         raise ValueError('Serialized stream attack count cannot be negative')
@@ -202,8 +329,8 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
         raise ValueError(f'Requested {requested} flips but only {len(eligible)} symbols are eligible')
     rng = np.random.default_rng(seed)
     if selected_slots is not None:
-        if attack != 'sign-impact-bitflip':
-            raise ValueError('Explicit selected_slots are reserved for sign-impact-bitflip')
+        if attack not in ('sign-impact-bitflip', 'sign-trajectory-bitflip'):
+            raise ValueError('Explicit selected_slots require a ranked sign attack')
         selected_set = {tuple(slot) for slot in selected_slots}
         chosen = [i for i, slot in enumerate(eligible)
                   if (slot['step'], slot['frame'], slot['atom']) in selected_set]
@@ -216,7 +343,8 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
     for slot_id in chosen:
         slot = eligible[int(slot_id)]
         detail = dict(step=slot['step'], frame=slot['frame'], atom=slot['atom'])
-        if attack in ('sign-bitflip', 'sign-impact-bitflip'):
+        if attack in ('sign-bitflip', 'sign-impact-bitflip',
+                      'sign-trajectory-bitflip'):
             old_positive = bool(raw[slot['sign_offset']] & slot['sign_mask'])
             raw[slot['sign_offset']] ^= slot['sign_mask']
             detail.update(old_sign=1 if old_positive else -1,

@@ -320,6 +320,8 @@ def main():
     parser.add_argument("--output_dir", default="./results")
     parser.add_argument("--num_frames_per_gop", type=int, default=33)
     parser.add_argument("--num_gops", type=int, default=3)
+    parser.add_argument("--start_gop", type=int, default=0,
+                        help="Zero-based source GOP offset; useful when reusing a later GOP bitstream")
     # type=int/float 表示解析后得到数值；不传选项时才使用 default。
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--width", type=int, default=1280)
@@ -420,6 +422,8 @@ def main():
         parser.error("--stream_attack_trajectory_pool_factor must be at least 1")
     if not 1 <= args.stream_attack_trajectory_rollout_steps <= args.steps - args.ddim_tail:
         parser.error("--stream_attack_trajectory_rollout_steps must lie within the SDE steps")
+    if args.start_gop < 0:
+        parser.error("--start_gop cannot be negative")
 
     # Wan 的时间步偏移随分辨率使用不同默认值；显式传参可覆盖。
     if args.flow_shift is None: args.flow_shift = 3.0 if args.height <= 480 else 5.0
@@ -601,7 +605,9 @@ def main():
         # ★ 真正读取视频数据的是这一行：传入 yuv_path，内部 open(...,'rb')、f.read(...)。
         # raw_frames 是按时间排序的 PIL.Image 列表，尚不是 PyTorch Tensor；
         # 第 0 项 raw_frames[0] 是一张 RGB 帧，大小由 YUV 文件名/默认值决定。
-        raw_frames = load_yuv420_frames(yuv_path, total_unique_frames, start_frame=0)
+        source_start_frame = args.start_gop * frames_per_gop_excl_first
+        raw_frames = load_yuv420_frames(
+            yuv_path, total_unique_frames, start_frame=source_start_frame)
         # 文件短于请求长度时缩减 GOP 数；num_gops<=0 则按实际读到的帧数估算。
         # len(raw_frames) 是实际成功读取的帧数；// 是整数除法。
         actual_gops = max(1, (len(raw_frames) - 1) // frames_per_gop_excl_first) if (args.num_gops <= 0 or len(raw_frames) < total_unique_frames) else args.num_gops
@@ -697,7 +703,9 @@ def main():
 
         # 外层 for 处理序列；这里的内层 for 再逐个处理这个序列的 GOP。
         for g in range(actual_gops):
-            print(f"\n  --- {seq_name} GOP {g}/{actual_gops-1}  ({datetime.now().strftime('%H:%M:%S')}) ---")
+            source_gop = args.start_gop + g
+            print(f"\n  --- {seq_name} GOP {source_gop} "
+                  f"(local {g}/{actual_gops-1})  ({datetime.now().strftime('%H:%M:%S')}) ---")
             gop_frames_gt = gops_gt[g]
             # gop_frames_gt 是干净评估目标；gop_frames 是攻防后的编码输入。
             gop_frames = gops_codec[g]
@@ -715,7 +723,7 @@ def main():
                 guidance_scale=1.0, g_scale=args.g_scale, num_frames=FPG,
                 height=HEIGHT, width=WIDTH, seed=args.seed,
             )
-            gop_dir = seq_dir / f"gop{g}"
+            gop_dir = seq_dir / f"gop{source_gop}"
             gop_dir.mkdir(parents=True, exist_ok=True)
             
             # 将解压后的两张边界 RGB 帧变成 FLF2V 条件。
@@ -888,7 +896,7 @@ def main():
             # result 是字典；键如 "PSNR_dB" 供 JSON、汇总脚本读取。
             result = {
                 "sequence": seq_name,
-                "gop": g,
+                "gop": source_gop,
                 "attack": args.attack,
                 "defense": args.defense,
                 "epsilon": args.epsilon,

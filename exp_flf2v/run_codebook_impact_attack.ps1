@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('single','joint')]
+    [ValidateSet('single','joint','dose')]
     [string]$Mode = 'single',
     [string]$CondaExe = 'D:\anaconda\Scripts\conda.exe',
     [string]$Data = 'D:\yzb and lmk\dataset-720P\UVG\Jockey_720p.yuv',
@@ -26,13 +26,32 @@ if($Mode -eq 'single'){
         [pscustomobject]@{Name='sensitivity_step1_frame4_sign16'; Attack='sign-bitflip'; Count=16; Frames=@(4)},
         [pscustomobject]@{Name='impact_frame4_ranked16'; Attack='sign-impact-bitflip'; Count=16; Frames=@(4)}
     )
-} else {
+} elseif($Mode -eq 'joint') {
     $experiments = @(
         [pscustomobject]@{Name='impact_frames3_4_random8'; Attack='sign-bitflip'; Count=8; Frames=@(3,4)},
         [pscustomobject]@{Name='impact_frames3_4_ranked8'; Attack='sign-impact-bitflip'; Count=8; Frames=@(3,4)},
         [pscustomobject]@{Name='impact_frames3_4_random16'; Attack='sign-bitflip'; Count=16; Frames=@(3,4)},
         [pscustomobject]@{Name='impact_frames3_4_ranked16'; Attack='sign-impact-bitflip'; Count=16; Frames=@(3,4)}
     )
+} else {
+    # Frame 3 is the most vulnerable latent temporal position in the earlier
+    # sweep.  This dose curve compares random and geometry-ranked corruption
+    # under exactly the same physical sign-bit budget.  The wider range is
+    # intended to expose a possible nonlinear failure threshold.
+    $experiments = foreach($count in @(4,8,12,16,24,32,48,64)){
+        [pscustomobject]@{
+            Name="impact_frame3_random$count"
+            Attack='sign-bitflip'
+            Count=$count
+            Frames=@(3)
+        }
+        [pscustomobject]@{
+            Name="impact_frame3_ranked$count"
+            Attack='sign-impact-bitflip'
+            Count=$count
+            Frames=@(3)
+        }
+    }
 }
 
 foreach($experiment in $experiments){
@@ -70,6 +89,8 @@ foreach($experiment in $experiments){
 Write-Host ('=' * 78)
 Write-Host "Random versus impact-ranked sign flips: $Mode"
 Write-Host ('=' * 78)
+$cleanPSNR = 33.47
+$cleanLPIPS = 0.0757
 $summary = foreach($experiment in $experiments){
     $metricsPath = Join-Path 'exp_flf2v/results_720p' "$($experiment.Name)/Jockey/gop0/metrics.json"
     $metrics = Get-Content -LiteralPath $metricsPath -Raw | ConvertFrom-Json
@@ -82,7 +103,14 @@ $summary = foreach($experiment in $experiments){
         NoiseMSE = if($null -ne $selection){$selection.final_noise_mse}else{$null}
         NoiseCosine = if($null -ne $selection){$selection.final_noise_cosine}else{$null}
         PSNR = $metrics.PSNR_dB
+        DeltaPSNR = [math]::Round([double]$metrics.PSNR_dB - $cleanPSNR, 4)
         LPIPS = $metrics.LPIPS
+        DeltaLPIPS = [math]::Round([double]$metrics.LPIPS - $cleanLPIPS, 4)
+        Allocation = if($null -ne $selection){
+            (($selection.allocation_by_frame.psobject.Properties | ForEach-Object {
+                "$($_.Name):$($_.Value)"
+            }) -join ',')
+        }else{$null}
     }
 }
 $summary | Format-Table -AutoSize

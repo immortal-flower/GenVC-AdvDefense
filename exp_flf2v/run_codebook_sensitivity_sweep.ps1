@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('step','dose','frame')]
+    [ValidateSet('step','dose','frame','frame-seed')]
     [string]$Mode = 'step',
     [string]$CondaExe = 'D:\anaconda\Scripts\conda.exe',
     [string]$Data = 'D:\yzb and lmk\dataset-720P\UVG\Jockey_720p.yuv',
@@ -11,6 +11,7 @@ param(
 #   step  : six representative SDE steps, 49 sign errors each
 #   dose  : five error counts at SDE step 1
 #   frame : nine latent-time positions at SDE step 1, 16 errors each
+#   frame-seed: positions 0/3/4/8 with seeds 7/42/123; seed 42 is reused
 Set-Location (Split-Path -Parent $PSScriptRoot)
 $env:CUDA_VISIBLE_DEVICES = '0,1'
 
@@ -23,21 +24,35 @@ if($Mode -eq 'step'){
     foreach($step in @(1,2,4,8,12,17)){
         $experiments += [pscustomobject]@{
             Name = "sensitivity_step$($step)_sign49"
-            Step = $step; Frame = $null; Count = 49
+            Step = $step; Frame = $null; Count = 49; Seed = 42
         }
     }
 } elseif($Mode -eq 'dose'){
     foreach($count in @(12,25,49,98,196)){
         $experiments += [pscustomobject]@{
             Name = "sensitivity_step1_sign$($count)"
-            Step = 1; Frame = $null; Count = $count
+            Step = 1; Frame = $null; Count = $count; Seed = 42
         }
     }
-} else {
+} elseif($Mode -eq 'frame') {
     foreach($frame in 0..8){
         $experiments += [pscustomobject]@{
             Name = "sensitivity_step1_frame$($frame)_sign16"
-            Step = 1; Frame = $frame; Count = 16
+            Step = 1; Frame = $frame; Count = 16; Seed = 42
+        }
+    }
+} else {
+    foreach($frame in @(0,3,4,8)){
+        foreach($seed in @(7,42,123)){
+            $name = if($seed -eq 42){
+                "sensitivity_step1_frame$($frame)_sign16"
+            } else {
+                "sensitivity_step1_frame$($frame)_sign16_seed$($seed)"
+            }
+            $experiments += [pscustomobject]@{
+                Name = $name
+                Step = 1; Frame = $frame; Count = 16; Seed = $seed
+            }
         }
     }
 }
@@ -66,7 +81,7 @@ foreach($experiment in $experiments){
         '--stream_attack_transport','serialized',
         '--stream_attack_count',[string]$experiment.Count,
         '--stream_attack_target_steps',[string]$experiment.Step,
-        '--stream_attack_seed','42','--run_name',$experiment.Name
+        '--stream_attack_seed',[string]$experiment.Seed,'--run_name',$experiment.Name
     )
     if($null -ne $experiment.Frame){
         $experimentArgs += @('--stream_attack_target_frames',[string]$experiment.Frame)
@@ -85,6 +100,7 @@ $summary = foreach($experiment in $experiments){
         Run = $experiment.Name
         Step = $experiment.Step
         Frame = $experiment.Frame
+        Seed = $experiment.Seed
         FlippedBits = $metrics.stream_attack.changed_bits
         PayloadBER = $metrics.stream_attack.payload_BER
         PSNR = $metrics.PSNR_dB

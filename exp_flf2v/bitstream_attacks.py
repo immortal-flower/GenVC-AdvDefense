@@ -68,7 +68,7 @@ def _parse_tdcm_payload_layout(raw):
                 bits_per_index=max(1, math.ceil(math.log2(K))))
 
 
-def select_impact_sign_slots(step_data, codebook, count, step_idx, frame_idx):
+def select_impact_sign_slots(step_data, codebook, count, step_idx, frame_indices):
     """Greedily choose signs that maximally rotate normalized codebook noise.
 
     The objective is the MSE between the original unit-variance combined noise
@@ -78,40 +78,77 @@ def select_impact_sign_slots(step_data, codebook, count, step_idx, frame_idx):
     """
     import torch
 
-    indices, signs = step_data[step_idx][frame_idx]
-    if count < 1 or count > len(signs):
-        raise ValueError(f'Impact count must be in [1,{len(signs)}]')
+    frame_indices = sorted({int(frame) for frame in frame_indices})
+    if not frame_indices:
+        raise ValueError('At least one impact target frame is required')
+    capacity = sum(len(step_data[step_idx][frame][1]) for frame in frame_indices)
+    if count < 1 or count > capacity:
+        raise ValueError(f'Impact count must be in [1,{capacity}]')
     with torch.no_grad():
-        atoms = codebook.regenerate_selected_atoms(
-            indices, step_idx, frame_idx).float()
-        signs_t = torch.tensor(signs, device=atoms.device, dtype=torch.float32)
-        current_sum = (signs_t.unsqueeze(1) * atoms).sum(0)
-        original = current_sum / current_sum.std().clamp_min(1e-8)
-        remaining = list(range(len(signs)))
+        states = {}
+        for frame_idx in frame_indices:
+            indices, signs = step_data[step_idx][frame_idx]
+            atoms = codebook.regenerate_selected_atoms(
+                indices, step_idx, frame_idx).float()
+            signs_t = torch.tensor(signs, device=atoms.device, dtype=torch.float32)
+            current_sum = (signs_t.unsqueeze(1) * atoms).sum(0)
+            original = current_sum / current_sum.std().clamp_min(1e-8)
+            states[frame_idx] = dict(
+                indices=indices, atoms=atoms, signs=signs_t,
+                current=current_sum, original=original,
+                remaining=list(range(len(signs))), current_mse=0.0,
+            )
         chosen = []
         trajectory = []
         for _ in range(count):
-            rem_t = torch.tensor(remaining, device=atoms.device, dtype=torch.long)
-            candidate_sums = (current_sum.unsqueeze(0)
-                              - 2.0 * signs_t[rem_t].unsqueeze(1) * atoms[rem_t])
-            candidate_std = candidate_sums.std(dim=1, keepdim=True).clamp_min(1e-8)
-            candidate_noise = candidate_sums / candidate_std
-            mse = ((candidate_noise - original.unsqueeze(0)) ** 2).mean(dim=1)
-            best_local = int(mse.argmax().item())
-            atom_position = remaining.pop(best_local)
-            current_sum = current_sum - 2.0 * signs_t[atom_position] * atoms[atom_position]
-            signs_t[atom_position] *= -1.0
-            chosen.append((step_idx, frame_idx, atom_position))
-            trajectory.append(float(mse[best_local].item()))
-        final_noise = current_sum / current_sum.std().clamp_min(1e-8)
-        final_mse = float(((final_noise - original) ** 2).mean().item())
-        final_cosine = float(torch.nn.functional.cosine_similarity(
-            original, final_noise, dim=0).item())
-        selected_indices = [int(indices[position]) for _, _, position in chosen]
-        del atoms, signs_t, current_sum, original, final_noise
+            total_before = sum(state['current_mse'] for state in states.values())
+            best = None
+            for frame_idx, state in states.items():
+                if not state['remaining']:
+                    continue
+                rem_t = torch.tensor(state['remaining'], device=state['atoms'].device,
+                                     dtype=torch.long)
+                candidate_sums = (state['current'].unsqueeze(0)
+                                  - 2.0 * state['signs'][rem_t].unsqueeze(1)
+                                  * state['atoms'][rem_t])
+                candidate_std = candidate_sums.std(
+                    dim=1, keepdim=True).clamp_min(1e-8)
+                candidate_noise = candidate_sums / candidate_std
+                mse = ((candidate_noise - state['original'].unsqueeze(0)) ** 2).mean(dim=1)
+                local = int(mse.argmax().item())
+                candidate_total = total_before - state['current_mse'] + float(mse[local].item())
+                if best is None or candidate_total > best['total']:
+                    best = dict(frame=frame_idx, local=local,
+                                mse=float(mse[local].item()), total=candidate_total)
+                del rem_t, candidate_sums, candidate_std, candidate_noise, mse
+            state = states[best['frame']]
+            atom_position = state['remaining'].pop(best['local'])
+            state['current'] = (state['current']
+                                - 2.0 * state['signs'][atom_position]
+                                * state['atoms'][atom_position])
+            state['signs'][atom_position] *= -1.0
+            state['current_mse'] = best['mse']
+            chosen.append((step_idx, best['frame'], atom_position))
+            trajectory.append(best['total'] / len(states))
+        cosines = []
+        for state in states.values():
+            final_noise = state['current'] / state['current'].std().clamp_min(1e-8)
+            cosines.append(float(torch.nn.functional.cosine_similarity(
+                state['original'], final_noise, dim=0).item()))
+        final_mse = sum(state['current_mse'] for state in states.values()) / len(states)
+        final_cosine = sum(cosines) / len(cosines)
+        selected_indices = [int(states[frame]['indices'][position])
+                            for _, frame, position in chosen]
+        allocation = {str(frame): sum(1 for _, selected_frame, _ in chosen
+                                      if selected_frame == frame)
+                      for frame in frame_indices}
+        del states
     return chosen, dict(
-        objective='greedy normalized-noise MSE',
+        objective='greedy mean normalized-noise MSE across target frames',
+        target_frames=frame_indices,
+        allocation_by_frame=allocation,
         selected_atom_positions=[position for _, _, position in chosen],
+        selected_frame_positions=[frame for _, frame, _ in chosen],
         selected_codebook_indices=selected_indices,
         cumulative_noise_mse=trajectory,
         final_noise_mse=final_mse,

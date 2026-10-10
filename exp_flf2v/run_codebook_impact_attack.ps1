@@ -1,13 +1,15 @@
 param(
+    [ValidateSet('single','joint')]
+    [string]$Mode = 'single',
     [string]$CondaExe = 'D:\anaconda\Scripts\conda.exe',
     [string]$Data = 'D:\yzb and lmk\dataset-720P\UVG\Jockey_720p.yuv',
     [string]$CleanCodebook = 'exp_flf2v/results_720p/codebook_sign_bitflip_rate0p02_step1/Jockey/gop0/codebook_clean.tdcm'
 )
 
-# White-box bitstream attack on the consistently vulnerable location:
-# SDE step 1, latent-time position 4.  Random and atom-impact-ranked flips use
-# exactly the same physical bit budgets.  The existing random-16 result is
-# reused automatically.
+# White-box bitstream robustness test.  ``single`` targets the consistently
+# vulnerable latent position 4; ``joint`` lets the geometric objective allocate
+# one shared budget between positions 3 and 4.  Random and impact-ranked flips
+# always use the same physical bit counts.
 Set-Location (Split-Path -Parent $PSScriptRoot)
 $env:CUDA_VISIBLE_DEVICES = '0,1'
 
@@ -15,14 +17,23 @@ if(-not (Test-Path -LiteralPath $CleanCodebook)){
     throw "Clean codebook not found: $CleanCodebook"
 }
 
-$experiments = @(
-    [pscustomobject]@{Name='impact_frame4_random4'; Attack='sign-bitflip'; Count=4},
-    [pscustomobject]@{Name='impact_frame4_ranked4'; Attack='sign-impact-bitflip'; Count=4},
-    [pscustomobject]@{Name='impact_frame4_random8'; Attack='sign-bitflip'; Count=8},
-    [pscustomobject]@{Name='impact_frame4_ranked8'; Attack='sign-impact-bitflip'; Count=8},
-    [pscustomobject]@{Name='sensitivity_step1_frame4_sign16'; Attack='sign-bitflip'; Count=16},
-    [pscustomobject]@{Name='impact_frame4_ranked16'; Attack='sign-impact-bitflip'; Count=16}
-)
+if($Mode -eq 'single'){
+    $experiments = @(
+        [pscustomobject]@{Name='impact_frame4_random4'; Attack='sign-bitflip'; Count=4; Frames=@(4)},
+        [pscustomobject]@{Name='impact_frame4_ranked4'; Attack='sign-impact-bitflip'; Count=4; Frames=@(4)},
+        [pscustomobject]@{Name='impact_frame4_random8'; Attack='sign-bitflip'; Count=8; Frames=@(4)},
+        [pscustomobject]@{Name='impact_frame4_ranked8'; Attack='sign-impact-bitflip'; Count=8; Frames=@(4)},
+        [pscustomobject]@{Name='sensitivity_step1_frame4_sign16'; Attack='sign-bitflip'; Count=16; Frames=@(4)},
+        [pscustomobject]@{Name='impact_frame4_ranked16'; Attack='sign-impact-bitflip'; Count=16; Frames=@(4)}
+    )
+} else {
+    $experiments = @(
+        [pscustomobject]@{Name='impact_frames3_4_random8'; Attack='sign-bitflip'; Count=8; Frames=@(3,4)},
+        [pscustomobject]@{Name='impact_frames3_4_ranked8'; Attack='sign-impact-bitflip'; Count=8; Frames=@(3,4)},
+        [pscustomobject]@{Name='impact_frames3_4_random16'; Attack='sign-bitflip'; Count=16; Frames=@(3,4)},
+        [pscustomobject]@{Name='impact_frames3_4_ranked16'; Attack='sign-impact-bitflip'; Count=16; Frames=@(3,4)}
+    )
+}
 
 foreach($experiment in $experiments){
     $metricsPath = Join-Path 'exp_flf2v/results_720p' "$($experiment.Name)/Jockey/gop0/metrics.json"
@@ -48,15 +59,16 @@ foreach($experiment in $experiments){
         '--stream_attack_transport','serialized',
         '--stream_attack_count',[string]$experiment.Count,
         '--stream_attack_target_steps','1',
-        '--stream_attack_target_frames','4',
-        '--stream_attack_seed','42','--run_name',$experiment.Name
+        '--stream_attack_target_frames'
     )
+    foreach($frame in $experiment.Frames){$experimentArgs += [string]$frame}
+    $experimentArgs += @('--stream_attack_seed','42','--run_name',$experiment.Name)
     & $CondaExe @experimentArgs
     if($LASTEXITCODE -ne 0){throw "Impact attack failed: $($experiment.Name)"}
 }
 
 Write-Host ('=' * 78)
-Write-Host 'Random versus impact-ranked sign flips (step 1, latent frame 4)'
+Write-Host "Random versus impact-ranked sign flips: $Mode"
 Write-Host ('=' * 78)
 $summary = foreach($experiment in $experiments){
     $metricsPath = Join-Path 'exp_flf2v/results_720p' "$($experiment.Name)/Jockey/gop0/metrics.json"
@@ -65,6 +77,7 @@ $summary = foreach($experiment in $experiments){
     [pscustomobject]@{
         Run = $experiment.Name
         Method = $experiment.Attack
+        Frames = ($experiment.Frames -join ',')
         Bits = $experiment.Count
         NoiseMSE = if($null -ne $selection){$selection.final_noise_mse}else{$null}
         NoiseCosine = if($null -ne $selection){$selection.final_noise_cosine}else{$null}
@@ -73,4 +86,4 @@ $summary = foreach($experiment in $experiments){
     }
 }
 $summary | Format-Table -AutoSize
-$summary | ConvertTo-Json | Set-Content -Encoding UTF8 'exp_flf2v/results_720p/impact_frame4_summary.json'
+$summary | ConvertTo-Json | Set-Content -Encoding UTF8 "exp_flf2v/results_720p/impact_$($Mode)_summary.json"

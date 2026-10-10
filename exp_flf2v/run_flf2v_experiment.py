@@ -403,8 +403,8 @@ def main():
             parser.error("sign-impact-bitflip requires an exact --stream_attack_count")
         if not args.stream_attack_target_steps or len(args.stream_attack_target_steps) != 1:
             parser.error("sign-impact-bitflip currently targets exactly one SDE step")
-        if not args.stream_attack_target_frames or len(args.stream_attack_target_frames) != 1:
-            parser.error("sign-impact-bitflip currently targets exactly one latent frame")
+        if not args.stream_attack_target_frames:
+            parser.error("sign-impact-bitflip requires at least one target latent frame")
 
     # Wan 的时间步偏移随分辨率使用不同默认值；显式传参可覆盖。
     if args.flow_shift is None: args.flow_shift = 3.0 if args.height <= 480 else 5.0
@@ -748,10 +748,11 @@ def main():
                     impact_slots, impact_metadata = select_impact_sign_slots(
                         step_data, pipe.codebook, args.stream_attack_count,
                         args.stream_attack_target_steps[0] - 1,
-                        args.stream_attack_target_frames[0],
+                        args.stream_attack_target_frames,
                     )
                     print(f"  Impact ranking: noise_MSE={impact_metadata['final_noise_mse']:.6f}, "
-                          f"cosine={impact_metadata['final_noise_cosine']:.6f}")
+                          f"cosine={impact_metadata['final_noise_cosine']:.6f}, "
+                          f"allocation={impact_metadata['allocation_by_frame']}")
                 stream_attack_metadata = apply_serialized_codebook_attack(
                     clean_path, attacked_path,
                     attack=args.stream_attack,

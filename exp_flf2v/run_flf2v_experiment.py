@@ -359,6 +359,8 @@ def main():
                         help="Forward-only candidate probes for sign-trajectory-bitflip")
     parser.add_argument("--stream_attack_trajectory_pool_factor", type=float, default=2.0,
                         help="Geometric candidate-pool size relative to the bit budget")
+    parser.add_argument("--stream_attack_trajectory_rollout_steps", type=int, default=1,
+                        help="SDE updates used to score trajectory candidates; 1 uses next velocity")
     parser.add_argument("--stream_attack_target_steps", type=int, nargs="*", default=None,
                         help="Exact 1-based SDE steps to attack, e.g. --stream_attack_target_steps 1 4")
     parser.add_argument("--stream_attack_target_frames", type=int, nargs="*", default=None,
@@ -416,6 +418,8 @@ def main():
         parser.error("--stream_attack_trajectory_trials must be positive")
     if args.stream_attack_trajectory_pool_factor < 1.0:
         parser.error("--stream_attack_trajectory_pool_factor must be at least 1")
+    if not 1 <= args.stream_attack_trajectory_rollout_steps <= args.steps - args.ddim_tail:
+        parser.error("--stream_attack_trajectory_rollout_steps must lie within the SDE steps")
 
     # Wan 的时间步偏移随分辨率使用不同默认值；显式传参可覆盖。
     if args.flow_shift is None: args.flow_shift = 3.0 if args.height <= 480 else 5.0
@@ -773,8 +777,11 @@ def main():
                         trials=args.stream_attack_trajectory_trials,
                         pool_factor=args.stream_attack_trajectory_pool_factor,
                         seed=args.stream_attack_seed,
+                        rollout_steps=args.stream_attack_trajectory_rollout_steps,
                     )
-                    print(f"  Trajectory ranking: velocity_MSE="
+                    print(f"  Trajectory ranking: rollout="
+                          f"{impact_metadata['rollout_steps']}, objective="
+                          f"{impact_metadata['winning_objective_score']:.6f}, velocity_MSE="
                           f"{impact_metadata['winning_velocity_mse']:.6f}, "
                           f"state_MSE={impact_metadata['winning_next_state_mse']:.6f}, "
                           f"allocation={impact_metadata['allocation_by_frame']}, "

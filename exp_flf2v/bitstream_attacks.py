@@ -158,13 +158,16 @@ def select_impact_sign_slots(step_data, codebook, count, step_idx, frame_indices
 
 def select_trajectory_sign_slots(step_data, codebook, count, step_idx,
                                  frame_indices, pipe, model, i2v_cond,
-                                 trials=8, pool_factor=2.0, seed=42):
+                                 trials=8, pool_factor=2.0, seed=42,
+                                 rollout_steps=1):
     """Choose sign flips by probing their effect on the next Wan prediction.
 
     A cheap geometric pass first constructs a candidate pool.  Several exact
     ``count``-bit subsets from that pool are then injected into the first SDE
     update.  The winner maximizes the MSE between the clean and corrupted Wan
-    velocity at the *next* timestep.  This is a forward-only white-box probe:
+    velocity at the *next* timestep (one-step mode), or the latent divergence
+    after a short clean-codebook rollout (multi-step mode).  This is a
+    forward-only white-box probe:
     it uses the public model, bitstream, conditions and shared seed, but no
     source-video pixels, reconstruction labels or backward pass.
 
@@ -178,6 +181,8 @@ def select_trajectory_sign_slots(step_data, codebook, count, step_idx,
         raise ValueError('Trajectory sign ranking currently supports SDE step 1 only')
     if trials < 1:
         raise ValueError('Trajectory trials must be positive')
+    if rollout_steps < 1 or rollout_steps > pipe.num_sde_steps:
+        raise ValueError(f'Rollout steps must be in [1,{pipe.num_sde_steps}]')
     frame_indices = sorted({int(frame) for frame in frame_indices})
     capacity = sum(len(step_data[step_idx][frame][1]) for frame in frame_indices)
     if count < 1 or count > capacity:
@@ -216,13 +221,39 @@ def select_trajectory_sign_slots(step_data, codebook, count, step_idx,
         noise_coeff = g_t * (delta_t ** 0.5)
         drift_state = x_t - f_t * delta_t
 
-        clean_frames = []
-        for frame_idx in range(pipe.num_latent_frames):
-            indices, signs = step_data[0][frame_idx]
-            clean_frames.append(codebook.reconstruct(indices, signs, 0, frame_idx))
-        clean_noise = torch.stack(clean_frames, dim=1).unsqueeze(0)
-        clean_next = drift_state + noise_coeff * clean_noise
+        clean_noises = []
+        for rollout_idx in range(rollout_steps):
+            clean_frames = []
+            for frame_idx in range(pipe.num_latent_frames):
+                indices, signs = step_data[rollout_idx][frame_idx]
+                clean_frames.append(codebook.reconstruct(
+                    indices, signs, rollout_idx, frame_idx))
+            clean_noises.append(torch.stack(clean_frames, dim=1).unsqueeze(0))
+
+        clean_next = drift_state + noise_coeff * clean_noises[0]
+        clean_states = [clean_next]
+        clean_velocities = []
+        # In one-step mode the next velocity itself is the objective.  In a
+        # longer rollout these velocities are also reused as clean references.
         clean_velocity = model_fn(clean_next, t_next)
+        clean_velocities.append(clean_velocity)
+        clean_state = clean_next
+        for rollout_idx in range(1, rollout_steps):
+            step_t = pipe.timesteps[rollout_idx].item()
+            next_t = pipe.timesteps[rollout_idx + 1].item()
+            step_delta = step_t - next_t
+            step_velocity = (clean_velocities[rollout_idx - 1]
+                             if rollout_idx == 1
+                             else model_fn(clean_state, step_t))
+            if rollout_idx > 1:
+                clean_velocities.append(step_velocity)
+            step_score = velocity_to_score(step_velocity, clean_state, step_t)
+            step_g = diffusion_coeff(step_t, pipe.g_scale)
+            step_drift = sde_drift(step_velocity, step_score, step_g)
+            step_noise_coeff = step_g * (step_delta ** 0.5)
+            clean_state = (clean_state - step_drift * step_delta
+                           + step_noise_coeff * clean_noises[rollout_idx])
+            clean_states.append(clean_state)
 
         scores = []
         best_score = -1.0
@@ -233,7 +264,7 @@ def select_trajectory_sign_slots(step_data, codebook, count, step_idx,
             by_frame = {}
             for _, frame_idx, atom_position in selected:
                 by_frame.setdefault(frame_idx, []).append(atom_position)
-            attacked_noise = clean_noise.clone()
+            attacked_noise = clean_noises[0].clone()
             for frame_idx, atom_positions in by_frame.items():
                 indices, signs = step_data[0][frame_idx]
                 attacked_signs = list(signs)
@@ -243,20 +274,49 @@ def select_trajectory_sign_slots(step_data, codebook, count, step_idx,
                     indices, attacked_signs, 0, frame_idx)
             attacked_next = drift_state + noise_coeff * attacked_noise
             attacked_velocity = model_fn(attacked_next, t_next)
-            velocity_mse = float(((attacked_velocity - clean_velocity) ** 2).mean().item())
+            first_velocity_mse = float(
+                ((attacked_velocity - clean_velocity) ** 2).mean().item())
             state_mse = float(((attacked_next - clean_next) ** 2).mean().item())
+            attacked_state = attacked_next
+            velocity_mses = [first_velocity_mse]
+            for rollout_idx in range(1, rollout_steps):
+                step_t = pipe.timesteps[rollout_idx].item()
+                next_t = pipe.timesteps[rollout_idx + 1].item()
+                step_delta = step_t - next_t
+                step_velocity = (attacked_velocity if rollout_idx == 1
+                                 else model_fn(attacked_state, step_t))
+                if rollout_idx > 1:
+                    clean_step_velocity = clean_velocities[rollout_idx - 1]
+                    velocity_mses.append(float(
+                        ((step_velocity - clean_step_velocity) ** 2).mean().item()))
+                step_score = velocity_to_score(step_velocity, attacked_state, step_t)
+                step_g = diffusion_coeff(step_t, pipe.g_scale)
+                step_drift = sde_drift(step_velocity, step_score, step_g)
+                step_noise_coeff = step_g * (step_delta ** 0.5)
+                attacked_state = (attacked_state - step_drift * step_delta
+                                  + step_noise_coeff * clean_noises[rollout_idx])
+            rollout_latent_mse = float(
+                ((attacked_state - clean_states[-1]) ** 2).mean().item())
+            objective_score = (first_velocity_mse if rollout_steps == 1
+                               else rollout_latent_mse)
             scores.append(dict(candidate=candidate_id,
                                pool_positions=list(pool_positions),
-                               velocity_mse=velocity_mse,
-                               next_state_mse=state_mse))
-            if velocity_mse > best_score:
-                best_score = velocity_mse
+                               first_velocity_mse=first_velocity_mse,
+                               mean_velocity_mse=sum(velocity_mses) / len(velocity_mses),
+                               next_state_mse=state_mse,
+                               rollout_latent_mse=rollout_latent_mse,
+                               objective_score=objective_score))
+            if objective_score > best_score:
+                best_score = objective_score
                 best_state_mse = state_mse
                 best_slots = selected
-            del attacked_noise, attacked_next, attacked_velocity
+                best_first_velocity_mse = first_velocity_mse
+                best_rollout_latent_mse = rollout_latent_mse
+            del attacked_noise, attacked_next, attacked_velocity, attacked_state
 
         del embeds, model_fn, x_t, u_t, score, f_t, drift_state
-        del clean_frames, clean_noise, clean_next, clean_velocity
+        del clean_frames, clean_noises, clean_next, clean_velocity
+        del clean_states, clean_velocities, clean_state
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -266,7 +326,8 @@ def select_trajectory_sign_slots(step_data, codebook, count, step_idx,
     selected_indices = [int(step_data[step][frame][0][position])
                         for step, frame, position in best_slots]
     return best_slots, dict(
-        objective='maximum next-timestep Wan velocity MSE',
+        objective=('maximum next-timestep Wan velocity MSE' if rollout_steps == 1
+                   else 'maximum short-rollout latent MSE'),
         target_frames=frame_indices,
         allocation_by_frame=allocation,
         selected_atom_positions=[position for _, _, position in best_slots],
@@ -275,8 +336,11 @@ def select_trajectory_sign_slots(step_data, codebook, count, step_idx,
         candidate_pool_size=pool_size,
         requested_trials=int(trials),
         evaluated_trials=len(candidates),
-        winning_velocity_mse=best_score,
+        rollout_steps=int(rollout_steps),
+        winning_objective_score=best_score,
+        winning_velocity_mse=best_first_velocity_mse,
         winning_next_state_mse=best_state_mse,
+        winning_rollout_latent_mse=best_rollout_latent_mse,
         candidate_scores=scores,
         geometry_pool=pool_metadata,
     )

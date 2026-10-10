@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('single','joint','dose','trajectory')]
+    [ValidateSet('single','joint','dose','trajectory','rollout')]
     [string]$Mode = 'single',
     [string]$CondaExe = 'D:\anaconda\Scripts\conda.exe',
     [string]$Data = 'D:\yzb and lmk\dataset-720P\UVG\Jockey_720p.yuv',
@@ -52,7 +52,7 @@ if($Mode -eq 'single'){
             Frames=@(3)
         }
     }
-} else {
+} elseif($Mode -eq 'trajectory') {
     # Compare three selection policies under identical step/frame/bit budgets:
     # random, codebook-geometry ranking, and forward Wan-trajectory probing.
     $experiments = @(
@@ -63,7 +63,20 @@ if($Mode -eq 'single'){
         [pscustomobject]@{Name='trajectory_frame3_geometry16'; Attack='sign-impact-bitflip'; Count=16; Frames=@(3)},
         [pscustomobject]@{Name='trajectory_frame3_wan16'; Attack='sign-trajectory-bitflip'; Count=16; Frames=@(3)}
     )
+} else {
+    # Reuse completed random/geometry baselines and replace only the Wan probe
+    # with a three-SDE-step latent-divergence objective.
+    $experiments = @(
+        [pscustomobject]@{Name='trajectory_frame3_random8'; Attack='sign-bitflip'; Count=8; Frames=@(3)},
+        [pscustomobject]@{Name='trajectory_frame3_geometry8'; Attack='sign-impact-bitflip'; Count=8; Frames=@(3)},
+        [pscustomobject]@{Name='rollout3_frame3_wan8'; Attack='sign-trajectory-bitflip'; Count=8; Frames=@(3)},
+        [pscustomobject]@{Name='trajectory_frame3_random16'; Attack='sign-bitflip'; Count=16; Frames=@(3)},
+        [pscustomobject]@{Name='trajectory_frame3_geometry16'; Attack='sign-impact-bitflip'; Count=16; Frames=@(3)},
+        [pscustomobject]@{Name='rollout3_frame3_wan16'; Attack='sign-trajectory-bitflip'; Count=16; Frames=@(3)}
+    )
 }
+
+$rolloutSteps = if($Mode -eq 'rollout'){3}else{1}
 
 foreach($experiment in $experiments){
     $metricsPath = Join-Path 'exp_flf2v/results_720p' "$($experiment.Name)/Jockey/gop0/metrics.json"
@@ -96,6 +109,7 @@ foreach($experiment in $experiments){
         '--stream_attack_seed','42',
         '--stream_attack_trajectory_trials','8',
         '--stream_attack_trajectory_pool_factor','2.0',
+        '--stream_attack_trajectory_rollout_steps',[string]$rolloutSteps,
         '--run_name',$experiment.Name
     )
     & $CondaExe @experimentArgs
@@ -119,6 +133,7 @@ $summary = foreach($experiment in $experiments){
         NoiseMSE = if($null -ne $selection){$selection.final_noise_mse}else{$null}
         NoiseCosine = if($null -ne $selection){$selection.final_noise_cosine}else{$null}
         TrajectoryMSE = if($null -ne $selection){$selection.winning_velocity_mse}else{$null}
+        RolloutMSE = if($null -ne $selection){$selection.winning_rollout_latent_mse}else{$null}
         PSNR = $metrics.PSNR_dB
         DeltaPSNR = [math]::Round([double]$metrics.PSNR_dB - $cleanPSNR, 4)
         LPIPS = $metrics.LPIPS

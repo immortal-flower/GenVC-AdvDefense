@@ -6,7 +6,8 @@ from pathlib import Path
 import numpy as np
 
 
-STREAM_ATTACK_CHOICES = ['none', 'index-bitflip', 'sign-bitflip']
+STREAM_ATTACK_CHOICES = ['none', 'index-bitflip', 'sign-bitflip',
+                         'sign-impact-bitflip']
 STREAM_DEFENSE_CHOICES = ['none', 'sign-repetition3']
 STREAM_TRANSPORT_CHOICES = ['logical', 'serialized']
 
@@ -67,9 +68,61 @@ def _parse_tdcm_payload_layout(raw):
                 bits_per_index=max(1, math.ceil(math.log2(K))))
 
 
+def select_impact_sign_slots(step_data, codebook, count, step_idx, frame_idx):
+    """Greedily choose signs that maximally rotate normalized codebook noise.
+
+    The objective is the MSE between the original unit-variance combined noise
+    and the combined noise after a candidate set of sign flips.  It uses only
+    public bitstream indices/signs and the shared codebook seed—not the source
+    video, reconstruction metrics, or Wan gradients.
+    """
+    import torch
+
+    indices, signs = step_data[step_idx][frame_idx]
+    if count < 1 or count > len(signs):
+        raise ValueError(f'Impact count must be in [1,{len(signs)}]')
+    with torch.no_grad():
+        atoms = codebook.regenerate_selected_atoms(
+            indices, step_idx, frame_idx).float()
+        signs_t = torch.tensor(signs, device=atoms.device, dtype=torch.float32)
+        current_sum = (signs_t.unsqueeze(1) * atoms).sum(0)
+        original = current_sum / current_sum.std().clamp_min(1e-8)
+        remaining = list(range(len(signs)))
+        chosen = []
+        trajectory = []
+        for _ in range(count):
+            rem_t = torch.tensor(remaining, device=atoms.device, dtype=torch.long)
+            candidate_sums = (current_sum.unsqueeze(0)
+                              - 2.0 * signs_t[rem_t].unsqueeze(1) * atoms[rem_t])
+            candidate_std = candidate_sums.std(dim=1, keepdim=True).clamp_min(1e-8)
+            candidate_noise = candidate_sums / candidate_std
+            mse = ((candidate_noise - original.unsqueeze(0)) ** 2).mean(dim=1)
+            best_local = int(mse.argmax().item())
+            atom_position = remaining.pop(best_local)
+            current_sum = current_sum - 2.0 * signs_t[atom_position] * atoms[atom_position]
+            signs_t[atom_position] *= -1.0
+            chosen.append((step_idx, frame_idx, atom_position))
+            trajectory.append(float(mse[best_local].item()))
+        final_noise = current_sum / current_sum.std().clamp_min(1e-8)
+        final_mse = float(((final_noise - original) ** 2).mean().item())
+        final_cosine = float(torch.nn.functional.cosine_similarity(
+            original, final_noise, dim=0).item())
+        selected_indices = [int(indices[position]) for _, _, position in chosen]
+        del atoms, signs_t, current_sum, original, final_noise
+    return chosen, dict(
+        objective='greedy normalized-noise MSE',
+        selected_atom_positions=[position for _, _, position in chosen],
+        selected_codebook_indices=selected_indices,
+        cumulative_noise_mse=trajectory,
+        final_noise_mse=final_mse,
+        final_noise_cosine=final_cosine,
+    )
+
+
 def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
                                      seed=42, early_steps=0, count=0,
-                                     target_steps=None, target_frames=None):
+                                     target_steps=None, target_frames=None,
+                                     selected_slots=None, selection_metadata=None):
     """Flip real bits in a serialized ``.tdcm`` payload and write a new file.
 
     Only index bytes or packed sign bytes are eligible.  Header fields,
@@ -77,7 +130,7 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
     experiment measures codebook-trajectory sensitivity rather than parser
     failure.  Index flips are constrained to valid, unique codebook indices.
     """
-    if attack not in ('index-bitflip', 'sign-bitflip'):
+    if attack not in ('index-bitflip', 'sign-bitflip', 'sign-impact-bitflip'):
         raise ValueError('Serialized attack requires index-bitflip or sign-bitflip')
     if count < 0:
         raise ValueError('Serialized stream attack count cannot be negative')
@@ -111,13 +164,22 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
     if requested > len(eligible):
         raise ValueError(f'Requested {requested} flips but only {len(eligible)} symbols are eligible')
     rng = np.random.default_rng(seed)
-    chosen = rng.choice(len(eligible), size=requested, replace=False)
+    if selected_slots is not None:
+        if attack != 'sign-impact-bitflip':
+            raise ValueError('Explicit selected_slots are reserved for sign-impact-bitflip')
+        selected_set = {tuple(slot) for slot in selected_slots}
+        chosen = [i for i, slot in enumerate(eligible)
+                  if (slot['step'], slot['frame'], slot['atom']) in selected_set]
+        if len(chosen) != len(selected_set) or len(chosen) != requested:
+            raise ValueError('Impact-selected slots do not match eligible serialized slots/count')
+    else:
+        chosen = rng.choice(len(eligible), size=requested, replace=False)
     examples = []
     occupied = {key: set(values) for key, values in layout['frame_indices'].items()}
     for slot_id in chosen:
         slot = eligible[int(slot_id)]
         detail = dict(step=slot['step'], frame=slot['frame'], atom=slot['atom'])
-        if attack == 'sign-bitflip':
+        if attack in ('sign-bitflip', 'sign-impact-bitflip'):
             old_positive = bool(raw[slot['sign_offset']] & slot['sign_mask'])
             raw[slot['sign_offset']] ^= slot['sign_mask']
             detail.update(old_sign=1 if old_positive else -1,
@@ -162,7 +224,7 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
         requested_symbol_rate=requested / total_symbols,
         eligible_symbols=len(eligible), examples=examples,
         input_path=str(input_path), output_path=str(output_path),
-        defense_model='none',
+        defense_model='none', selection_metadata=selection_metadata,
     )
 
 

@@ -152,20 +152,7 @@ class TurboPerFrameCodebook:
         signs_t: torch.Tensor,
     ) -> torch.Tensor:
         """Regenerate selected atoms from seed, combine with signs, normalize."""
-        gen = torch.Generator(device=self.device).manual_seed(seed_sf)
-        target = set(indices)
-        found: Dict[int, torch.Tensor] = {}
-
-        for gi in range(self.K):
-            atom = torch.randn(self.D, generator=gen, device=self.device)
-            if gi in target:
-                found[gi] = atom
-            del atom
-            if len(found) >= len(indices):
-                break
-
-        # Stack in index order and combine
-        stacked = torch.stack([found[i] for i in indices])   # (M, D)
+        stacked = self.regenerate_selected_atoms_from_seed(seed_sf, indices)
         combined = (signs_t.unsqueeze(1) * stacked).sum(0)    # (D,)
 
         # Normalize to unit variance (Eq.10)
@@ -174,6 +161,40 @@ class TurboPerFrameCodebook:
             combined = combined / std
 
         return combined.view(self.frame_shape)
+
+    def regenerate_selected_atoms(
+        self,
+        indices: List[int],
+        step_idx: int,
+        frame_idx: int,
+    ) -> torch.Tensor:
+        """Return selected raw atoms in bitstream order as an ``(M,D)`` tensor.
+
+        This is primarily useful for robustness analysis: a receiver or
+        white-box channel attacker can regenerate these public pseudo-random
+        atoms from the transmitted indices and shared seed without knowing the
+        original video or running the Wan model.
+        """
+        return self.regenerate_selected_atoms_from_seed(
+            self._sf_seed(step_idx, frame_idx), indices)
+
+    def regenerate_selected_atoms_from_seed(
+        self,
+        seed_sf: int,
+        indices: List[int],
+    ) -> torch.Tensor:
+        """Regenerate raw Gaussian atoms for known indices and a derived seed."""
+        gen = torch.Generator(device=self.device).manual_seed(seed_sf)
+        target = set(indices)
+        found: Dict[int, torch.Tensor] = {}
+        for gi in range(self.K):
+            atom = torch.randn(self.D, generator=gen, device=self.device)
+            if gi in target:
+                found[gi] = atom
+            del atom
+            if len(found) >= len(indices):
+                break
+        return torch.stack([found[i] for i in indices])
 
 
 # ==================================================================

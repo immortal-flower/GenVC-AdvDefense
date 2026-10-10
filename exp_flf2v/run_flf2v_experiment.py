@@ -156,7 +156,8 @@ from defenses import DEFENSE_CHOICES, apply_defense
 from bitstream_attacks import (STREAM_ATTACK_CHOICES, STREAM_DEFENSE_CHOICES,
                                STREAM_TRANSPORT_CHOICES,
                                apply_codebook_stream_attack,
-                               apply_serialized_codebook_attack)
+                               apply_serialized_codebook_attack,
+                               select_impact_sign_slots)
 # ==================================================================
 # FLF2V 编解码核心：两端共享模型、随机种子、首尾帧条件和时间步。
 # 编码端额外拥有原视频，可计算 x0_true 并挑选码本索引；解码端只有索引。
@@ -395,6 +396,15 @@ def main():
         parser.error("--stream_defense_steps must be positive")
     if args.stream_attack_transport == "serialized" and args.stream_defense != "none":
         parser.error("Serialized transport currently supports unprotected .tdcm only; use logical mode for the repetition pilot")
+    if args.stream_attack == "sign-impact-bitflip":
+        if args.stream_attack_transport != "serialized":
+            parser.error("sign-impact-bitflip requires --stream_attack_transport serialized")
+        if args.stream_attack_count <= 0:
+            parser.error("sign-impact-bitflip requires an exact --stream_attack_count")
+        if not args.stream_attack_target_steps or len(args.stream_attack_target_steps) != 1:
+            parser.error("sign-impact-bitflip currently targets exactly one SDE step")
+        if not args.stream_attack_target_frames or len(args.stream_attack_target_frames) != 1:
+            parser.error("sign-impact-bitflip currently targets exactly one latent frame")
 
     # Wan 的时间步偏移随分辨率使用不同默认值；显式传参可覆盖。
     if args.flow_shift is None: args.flow_shift = 3.0 if args.height <= 480 else 5.0
@@ -732,6 +742,16 @@ def main():
                 clean_path = gop_dir / "codebook_clean.tdcm"
                 attacked_path = gop_dir / "codebook.tdcm"
                 pipe.save_compressed(step_data, str(clean_path))
+                impact_slots = None
+                impact_metadata = None
+                if args.stream_attack == "sign-impact-bitflip":
+                    impact_slots, impact_metadata = select_impact_sign_slots(
+                        step_data, pipe.codebook, args.stream_attack_count,
+                        args.stream_attack_target_steps[0] - 1,
+                        args.stream_attack_target_frames[0],
+                    )
+                    print(f"  Impact ranking: noise_MSE={impact_metadata['final_noise_mse']:.6f}, "
+                          f"cosine={impact_metadata['final_noise_cosine']:.6f}")
                 stream_attack_metadata = apply_serialized_codebook_attack(
                     clean_path, attacked_path,
                     attack=args.stream_attack,
@@ -742,6 +762,8 @@ def main():
                     target_steps=([v - 1 for v in args.stream_attack_target_steps]
                                   if args.stream_attack_target_steps else None),
                     target_frames=args.stream_attack_target_frames,
+                    selected_slots=impact_slots,
+                    selection_metadata=impact_metadata,
                 )
                 # 重新走正式反序列化器；解码器看到的内容完全来自受损文件。
                 decode_step_data = TurboBitstream.load(str(attacked_path))["step_data"]

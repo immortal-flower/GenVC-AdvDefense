@@ -1,5 +1,6 @@
 param(
-    [string[]]$Sequences = @('Beauty','YachtRide'),
+    [string[]]$Sequences = @('Beauty','Bosphorus','HoneyBee','ReadySteadyGo','ShakeNDry','YachtRide'),
+    [int]$MaxSequences = 2,
     [string]$CondaExe = 'D:\anaconda\Scripts\conda.exe',
     [string]$DataDir = 'D:\yzb and lmk\dataset-720P\UVG',
     [string]$CleanRun = 'crossseq_clean',
@@ -12,6 +13,28 @@ param(
 Set-Location (Split-Path -Parent $PSScriptRoot)
 $env:CUDA_VISIBLE_DEVICES = '0,1'
 
+if($MaxSequences -lt 1){throw 'MaxSequences must be positive'}
+$discoveryText = & $CondaExe run -n GVCC-5090 python `
+    'exp_flf2v/list_uvg_sequences.py' --data_dir $DataDir --json
+if($LASTEXITCODE -ne 0){throw "Could not inspect UVG dataset: $DataDir"}
+try{
+    $discovered = $discoveryText | ConvertFrom-Json
+}catch{
+    throw "Could not parse UVG discovery output: $discoveryText"
+}
+$availableNames = @($discovered | ForEach-Object {$_.name})
+Write-Host "Discovered UVG sequences: $($availableNames -join ', ')"
+$selectedSequences = @($Sequences | Where-Object {$availableNames -contains $_} |
+                       Select-Object -First $MaxSequences)
+$missingSequences = @($Sequences | Where-Object {$availableNames -notcontains $_})
+if($missingSequences.Count -gt 0){
+    Write-Warning "Skipping unavailable sequences: $($missingSequences -join ', ')"
+}
+if($selectedSequences.Count -eq 0){
+    throw "None of the requested sequences were found under $DataDir"
+}
+Write-Host "Cross-sequence validation set: $($selectedSequences -join ', ')"
+
 $commonArgs = @(
     '--wan_ckpt','exp_flf2v/Wan2.1-FLF2V-14B-720P',
     '--data_dir',$DataDir,'--output_dir','exp_flf2v/results_720p',
@@ -22,7 +45,7 @@ $commonArgs = @(
     '--attack','none','--defense','none'
 )
 
-foreach($sequence in $Sequences){
+foreach($sequence in $selectedSequences){
     $cleanDir = "exp_flf2v/results_720p/$CleanRun/$sequence/gop0"
     $cleanCodebook = Join-Path $cleanDir 'codebook.tdcm'
     $cleanMetrics = Join-Path $cleanDir 'metrics.json'
@@ -77,7 +100,7 @@ foreach($sequence in $Sequences){
 Write-Host ('=' * 78)
 Write-Host 'Cross-sequence structured sign-inversion summary'
 Write-Host ('=' * 78)
-$summary = foreach($sequence in $Sequences){
+$summary = foreach($sequence in $selectedSequences){
     $cleanPath = "exp_flf2v/results_720p/$CleanRun/$sequence/gop0/metrics.json"
     $attackPath = "exp_flf2v/results_720p/$AttackRun/$sequence/gop0/metrics.json"
     if(-not (Test-Path -LiteralPath $cleanPath)){

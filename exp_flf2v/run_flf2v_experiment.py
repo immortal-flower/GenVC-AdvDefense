@@ -154,6 +154,7 @@ def save_video_mp4(frames, path, fps=16):
 from attacks import ATTACK_CHOICES, apply_attack, split_attack_paths
 from defenses import DEFENSE_CHOICES, apply_defense
 from bitstream_attacks import (STREAM_ATTACK_CHOICES, STREAM_DEFENSE_CHOICES,
+                               STREAM_DEFENSE_ATTACK_MODE_CHOICES,
                                STREAM_TRANSPORT_CHOICES,
                                apply_codebook_stream_attack,
                                apply_serialized_codebook_attack,
@@ -376,6 +377,11 @@ def main():
                         help="Unequal error protection applied to sensitive codebook fields")
     parser.add_argument("--stream_defense_steps", type=int, default=1,
                         help="Number of leading SDE steps protected by the stream defense")
+    parser.add_argument("--stream_defense_frames", type=int, nargs="*", default=None,
+                        help="0-based latent frames protected by repetition; default protects all")
+    parser.add_argument("--stream_defense_attack_mode",
+                        choices=STREAM_DEFENSE_ATTACK_MODE_CHOICES, default="random",
+                        help="Physical-channel attacker: random flips or repetition-aware pairs")
     parser.add_argument("--jpeg_quality", type=int, default=85)
     parser.add_argument("--median_size", type=int, default=3)
     # 之前只是在“声明”可接受哪些选项；这一行才解析实际命令行。
@@ -403,6 +409,10 @@ def main():
         parser.error("--stream_attack_target_frames cannot contain negative positions")
     if args.stream_defense_steps < 1:
         parser.error("--stream_defense_steps must be positive")
+    if args.stream_defense_frames is not None and not args.stream_defense_frames:
+        parser.error("--stream_defense_frames requires at least one frame position")
+    if args.stream_defense_frames and any(v < 0 for v in args.stream_defense_frames):
+        parser.error("--stream_defense_frames cannot contain negative positions")
     if args.stream_attack_transport == "serialized" and args.stream_defense != "none":
         parser.error("Serialized transport currently supports unprotected .tdcm only; use logical mode for the repetition pilot")
     if args.stream_attack in ("sign-impact-bitflip", "sign-trajectory-bitflip"):
@@ -823,6 +833,8 @@ def main():
                     target_frames=args.stream_attack_target_frames,
                     defense=args.stream_defense,
                     defense_steps=args.stream_defense_steps,
+                    defense_frames=args.stream_defense_frames,
+                    defense_attack_mode=args.stream_defense_attack_mode,
                 )
                 stream_attack_metadata["transport"] = "logical-memory"
             if args.stream_attack != "none":

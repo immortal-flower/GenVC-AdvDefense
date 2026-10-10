@@ -9,6 +9,7 @@ import numpy as np
 STREAM_ATTACK_CHOICES = ['none', 'index-bitflip', 'sign-bitflip',
                          'sign-impact-bitflip', 'sign-trajectory-bitflip']
 STREAM_DEFENSE_CHOICES = ['none', 'sign-repetition3']
+STREAM_DEFENSE_ATTACK_MODE_CHOICES = ['random', 'adaptive-pairs']
 STREAM_TRANSPORT_CHOICES = ['logical', 'serialized']
 
 
@@ -459,7 +460,9 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
 
 def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
                                  early_steps=0, defense='none', defense_steps=1,
-                                 count=0, target_steps=None, target_frames=None):
+                                 defense_frames=None,
+                                 defense_attack_mode='random', count=0,
+                                 target_steps=None, target_frames=None):
     """Return a copied codebook trajectory with a small number of bit flips.
 
     ``rate`` is the fraction of all transmitted index/sign symbols selected
@@ -474,11 +477,25 @@ def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
     if defense not in STREAM_DEFENSE_CHOICES:raise ValueError(f'Unknown stream defense: {defense}')
     if defense_steps<1:raise ValueError('defense_steps must be positive')
     protected_steps=min(defense_steps,len(copied)) if defense!='none' else 0
-    signs_per_step=(sum(len(signs) for _,signs in copied[0]) if copied else 0)
-    protection_overhead_bits=(2*protected_steps*signs_per_step if defense=='sign-repetition3' else 0)
+    n_frames=len(copied[0]) if copied else 0
+    if defense_frames is None:
+        protected_frame_ids=set(range(n_frames))
+    else:
+        protected_frame_ids={int(v) for v in defense_frames}
+        invalid=sorted(v for v in protected_frame_ids if v<0 or v>=n_frames)
+        if invalid:raise ValueError(f'Invalid protected latent frame positions: {invalid}')
+        if not protected_frame_ids:raise ValueError('defense_frames cannot be empty')
+    protected_sign_bits=sum(
+        len(copied[s][f][1]) for s in range(protected_steps)
+        for f in sorted(protected_frame_ids))
+    protection_overhead_bits=(2*protected_sign_bits if defense=='sign-repetition3' else 0)
+    if defense_attack_mode not in STREAM_DEFENSE_ATTACK_MODE_CHOICES:
+        raise ValueError(f'Unknown defense attack mode: {defense_attack_mode}')
     metadata=dict(attack=attack,rate=rate,requested_count=count,seed=seed,
                   early_steps=early_steps,
                   defense=defense,defense_steps=protected_steps,
+                  defense_frames=sorted(protected_frame_ids),
+                  defense_attack_mode=defense_attack_mode,
                   total_symbols=total_symbols,total_payload_bits=total_payload_bits,
                   protection_overhead_bits=protection_overhead_bits,
                   protected_payload_bits=total_payload_bits+protection_overhead_bits,
@@ -499,7 +516,6 @@ def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
     else:
         max_step=min(early_steps,len(copied)) if early_steps>0 else len(copied)
         step_ids=set(range(max_step))
-    n_frames=len(copied[0]) if copied else 0
     if target_frames:
         frame_ids={int(v) for v in target_frames}
         invalid=sorted(v for v in frame_ids if v<0 or v>=n_frames)
@@ -516,13 +532,43 @@ def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
         if attack!='sign-bitflip':raise ValueError('sign-repetition3 currently protects sign-bitflip attacks only')
         if any(s>=protected_steps for s in step_ids):
             raise ValueError('For this pilot, attacked steps must all be protected by sign-repetition3')
+        if not frame_ids.issubset(protected_frame_ids):
+            missing=sorted(frame_ids-protected_frame_ids)
+            raise ValueError(f'Attacked frames are outside sign-repetition3 protection: {missing}')
         physical_slots=[(s,f,m,copy) for s,f,m in slots for copy in range(3)]
         if requested>len(physical_slots):
             raise ValueError(f'Requested {requested} flips but only {len(physical_slots)} protected bits are eligible')
-        chosen=rng.choice(len(physical_slots),size=requested,replace=False)
         flip_counts={}
-        for physical_id in chosen:
-            s,f,m,copy=physical_slots[int(physical_id)]
+        if defense_attack_mode=='random':
+            chosen=rng.choice(len(physical_slots),size=requested,replace=False)
+            chosen_physical=[physical_slots[int(physical_id)] for physical_id in chosen]
+        else:
+            # Worst-case repetition-aware attacker: spend two physical flips on
+            # a logical sign before touching the next sign.  Thus B channel
+            # flips can corrupt at most floor(B/2) protected logical symbols.
+            ordered=[slots[int(slot_id)] for slot_id in
+                     rng.permutation(len(slots))]
+            chosen_physical=[]
+            remaining=requested
+            for s,f,m in ordered:
+                if remaining<2:break
+                chosen_physical.extend([(s,f,m,0),(s,f,m,1)])
+                remaining-=2
+            if remaining:
+                # All signs already have a corrupt majority only when the
+                # budget exceeds 2*N.  A third copy preserves that majority;
+                # otherwise this is one corrected single-copy error.
+                if len(chosen_physical)//2 < len(ordered):
+                    s,f,m=ordered[len(chosen_physical)//2]
+                else:
+                    s,f,m=ordered[remaining % len(ordered)]
+                chosen_physical.append((s,f,m,2))
+                remaining-=1
+            if remaining:
+                used={(s,f,m,copy) for s,f,m,copy in chosen_physical}
+                extras=[slot for slot in physical_slots if slot not in used]
+                chosen_physical.extend(extras[:remaining])
+        for s,f,m,copy in chosen_physical:
             flip_counts[(s,f,m)]=flip_counts.get((s,f,m),0)+1
             if len(metadata['examples'])<20:
                 metadata['examples'].append(dict(step=s,frame=f,atom=m,copy=copy))

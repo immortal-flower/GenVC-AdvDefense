@@ -382,6 +382,8 @@ def main():
     parser.add_argument("--stream_defense_attack_mode",
                         choices=STREAM_DEFENSE_ATTACK_MODE_CHOICES, default="random",
                         help="Physical-channel attacker: random flips or repetition-aware pairs")
+    parser.add_argument("--stream_defense_repetitions", type=int, default=3,
+                        help="Odd repetition factor used by --stream_defense sign-repetition")
     parser.add_argument("--jpeg_quality", type=int, default=85)
     parser.add_argument("--median_size", type=int, default=3)
     # 之前只是在“声明”可接受哪些选项；这一行才解析实际命令行。
@@ -413,6 +415,10 @@ def main():
         parser.error("--stream_defense_frames requires at least one frame position")
     if args.stream_defense_frames and any(v < 0 for v in args.stream_defense_frames):
         parser.error("--stream_defense_frames cannot contain negative positions")
+    if args.stream_defense_repetitions < 3 or args.stream_defense_repetitions % 2 != 1:
+        parser.error("--stream_defense_repetitions must be an odd integer >= 3")
+    if args.stream_defense == "sign-repetition3" and args.stream_defense_repetitions != 3:
+        parser.error("--stream_defense sign-repetition3 fixes the repetition factor at 3")
     if args.stream_attack_transport == "serialized" and args.stream_defense != "none":
         parser.error("Serialized transport currently supports unprotected .tdcm only; use logical mode for the repetition pilot")
     if args.stream_attack in ("sign-impact-bitflip", "sign-trajectory-bitflip"):
@@ -835,6 +841,7 @@ def main():
                     defense_steps=args.stream_defense_steps,
                     defense_frames=args.stream_defense_frames,
                     defense_attack_mode=args.stream_defense_attack_mode,
+                    defense_repetitions=args.stream_defense_repetitions,
                 )
                 stream_attack_metadata["transport"] = "logical-memory"
             if args.stream_attack != "none":

@@ -8,7 +8,7 @@ import numpy as np
 
 STREAM_ATTACK_CHOICES = ['none', 'index-bitflip', 'sign-bitflip',
                          'sign-impact-bitflip', 'sign-trajectory-bitflip']
-STREAM_DEFENSE_CHOICES = ['none', 'sign-repetition3']
+STREAM_DEFENSE_CHOICES = ['none', 'sign-repetition3', 'sign-repetition']
 STREAM_DEFENSE_ATTACK_MODE_CHOICES = ['random', 'adaptive-pairs']
 STREAM_TRANSPORT_CHOICES = ['logical', 'serialized']
 
@@ -461,7 +461,8 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
 def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
                                  early_steps=0, defense='none', defense_steps=1,
                                  defense_frames=None,
-                                 defense_attack_mode='random', count=0,
+                                 defense_attack_mode='random',
+                                 defense_repetitions=3, count=0,
                                  target_steps=None, target_frames=None):
     """Return a copied codebook trajectory with a small number of bit flips.
 
@@ -476,6 +477,11 @@ def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
     total_payload_bits=total_symbols*(bits_per_index+1)
     if defense not in STREAM_DEFENSE_CHOICES:raise ValueError(f'Unknown stream defense: {defense}')
     if defense_steps<1:raise ValueError('defense_steps must be positive')
+    if defense_repetitions<3 or defense_repetitions%2!=1:
+        raise ValueError('defense_repetitions must be an odd integer >= 3')
+    if defense=='sign-repetition3' and defense_repetitions!=3:
+        raise ValueError('sign-repetition3 requires defense_repetitions=3')
+    repetition=(defense_repetitions if defense=='sign-repetition' else 3)
     protected_steps=min(defense_steps,len(copied)) if defense!='none' else 0
     n_frames=len(copied[0]) if copied else 0
     if defense_frames is None:
@@ -488,7 +494,8 @@ def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
     protected_sign_bits=sum(
         len(copied[s][f][1]) for s in range(protected_steps)
         for f in sorted(protected_frame_ids))
-    protection_overhead_bits=(2*protected_sign_bits if defense=='sign-repetition3' else 0)
+    protection_overhead_bits=((repetition-1)*protected_sign_bits
+                              if defense in ('sign-repetition3','sign-repetition') else 0)
     if defense_attack_mode not in STREAM_DEFENSE_ATTACK_MODE_CHOICES:
         raise ValueError(f'Unknown defense attack mode: {defense_attack_mode}')
     metadata=dict(attack=attack,rate=rate,requested_count=count,seed=seed,
@@ -496,6 +503,7 @@ def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
                   defense=defense,defense_steps=protected_steps,
                   defense_frames=sorted(protected_frame_ids),
                   defense_attack_mode=defense_attack_mode,
+                  defense_repetitions=(repetition if defense!='none' else 1),
                   total_symbols=total_symbols,total_payload_bits=total_payload_bits,
                   protection_overhead_bits=protection_overhead_bits,
                   protected_payload_bits=total_payload_bits+protection_overhead_bits,
@@ -528,14 +536,14 @@ def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
     metadata['target_frames']=sorted(frame_ids)
     requested=int(count) if count>0 else max(1,int(round(total_symbols*rate)))
     rng=np.random.default_rng(seed)
-    if defense=='sign-repetition3':
-        if attack!='sign-bitflip':raise ValueError('sign-repetition3 currently protects sign-bitflip attacks only')
+    if defense in ('sign-repetition3','sign-repetition'):
+        if attack!='sign-bitflip':raise ValueError('sign repetition currently protects sign-bitflip attacks only')
         if any(s>=protected_steps for s in step_ids):
             raise ValueError('For this pilot, attacked steps must all be protected by sign-repetition3')
         if not frame_ids.issubset(protected_frame_ids):
             missing=sorted(frame_ids-protected_frame_ids)
             raise ValueError(f'Attacked frames are outside sign-repetition3 protection: {missing}')
-        physical_slots=[(s,f,m,copy) for s,f,m in slots for copy in range(3)]
+        physical_slots=[(s,f,m,copy) for s,f,m in slots for copy in range(repetition)]
         if requested>len(physical_slots):
             raise ValueError(f'Requested {requested} flips but only {len(physical_slots)} protected bits are eligible')
         flip_counts={}
@@ -543,31 +551,34 @@ def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
             chosen=rng.choice(len(physical_slots),size=requested,replace=False)
             chosen_physical=[physical_slots[int(physical_id)] for physical_id in chosen]
         else:
-            # Worst-case repetition-aware attacker: spend two physical flips on
-            # a logical sign before touching the next sign.  Thus B channel
-            # flips can corrupt at most floor(B/2) protected logical symbols.
+            # Worst-case repetition-aware attacker spends the minimum majority
+            # on one logical sign before touching the next.  With R replicas,
+            # B channel flips corrupt at most floor(B/(R//2+1)) symbols.
             ordered=[slots[int(slot_id)] for slot_id in
                      rng.permutation(len(slots))]
             chosen_physical=[]
             remaining=requested
+            majority=repetition//2+1
             for s,f,m in ordered:
-                if remaining<2:break
-                chosen_physical.extend([(s,f,m,0),(s,f,m,1)])
-                remaining-=2
+                if remaining<majority:break
+                chosen_physical.extend((s,f,m,copy) for copy in range(majority))
+                remaining-=majority
             if remaining:
-                # All signs already have a corrupt majority only when the
-                # budget exceeds 2*N.  A third copy preserves that majority;
-                # otherwise this is one corrected single-copy error.
-                if len(chosen_physical)//2 < len(ordered):
-                    s,f,m=ordered[len(chosen_physical)//2]
+                completed=len(chosen_physical)//majority
+                # Spend a sub-majority remainder on a fresh sign when one is
+                # available; majority voting corrects these physical errors.
+                if completed<len(ordered):
+                    s,f,m=ordered[completed]
+                    chosen_physical.extend((s,f,m,copy)
+                                           for copy in range(remaining))
+                    remaining=0
                 else:
-                    s,f,m=ordered[remaining % len(ordered)]
-                chosen_physical.append((s,f,m,2))
-                remaining-=1
-            if remaining:
-                used={(s,f,m,copy) for s,f,m,copy in chosen_physical}
-                extras=[slot for slot in physical_slots if slot not in used]
-                chosen_physical.extend(extras[:remaining])
+                    # Every logical sign already has a corrupt majority. Extra
+                    # flips cannot repair it until all replicas are inverted.
+                    used={(s,f,m,copy) for s,f,m,copy in chosen_physical}
+                    extras=[slot for slot in physical_slots if slot not in used]
+                    chosen_physical.extend(extras[:remaining])
+                    remaining=0
         for s,f,m,copy in chosen_physical:
             flip_counts[(s,f,m)]=flip_counts.get((s,f,m),0)+1
             if len(metadata['examples'])<20:
@@ -575,7 +586,7 @@ def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
         residual=0
         touched=len(flip_counts)
         for (s,f,m),count in flip_counts.items():
-            if count>=2:
+            if count>=repetition//2+1:
                 copied[s][f][1][m]=-int(copied[s][f][1][m]);residual+=1
         metadata['channel_flipped_bits']=requested
         metadata['changed_bits']=requested

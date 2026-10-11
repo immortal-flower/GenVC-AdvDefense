@@ -386,6 +386,10 @@ def main():
                         help="Physical-channel attacker: random flips or repetition-aware pairs")
     parser.add_argument("--stream_defense_repetitions", type=int, default=3,
                         help="Odd repetition factor used by --stream_defense sign-repetition")
+    parser.add_argument("--stream_defense_interleave_seed", type=int, default=0,
+                        help="Shared seed for serialized redundancy interleaving; 0 disables it")
+    parser.add_argument("--stream_disturbance_burst_start", type=int, default=0,
+                        help="Bit offset of a contiguous burst inside serialized redundancy")
     parser.add_argument("--jpeg_quality", type=int, default=85)
     parser.add_argument("--median_size", type=int, default=3)
     # 之前只是在“声明”可接受哪些选项；这一行才解析实际命令行。
@@ -419,6 +423,10 @@ def main():
         parser.error("--stream_defense_frames cannot contain negative positions")
     if args.stream_defense_repetitions < 3 or args.stream_defense_repetitions % 2 != 1:
         parser.error("--stream_defense_repetitions must be an odd integer >= 3")
+    if args.stream_defense_interleave_seed < 0:
+        parser.error("--stream_defense_interleave_seed cannot be negative")
+    if args.stream_disturbance_burst_start < 0:
+        parser.error("--stream_disturbance_burst_start cannot be negative")
     if args.stream_defense == "sign-repetition3" and args.stream_defense_repetitions != 3:
         parser.error("--stream_defense sign-repetition3 fixes the repetition factor at 3")
     if args.stream_attack_transport == "serialized" and args.stream_defense != "none":
@@ -856,6 +864,8 @@ def main():
                                   if args.stream_attack_target_steps else None),
                     target_frames=args.stream_attack_target_frames,
                     disturbance_mode=args.stream_defense_attack_mode,
+                    interleave_seed=args.stream_defense_interleave_seed,
+                    burst_start=args.stream_disturbance_burst_start,
                 )
                 # Recovery returns an ordinary TDCM, so the production parser
                 # and decoder remain unchanged.

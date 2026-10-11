@@ -9,7 +9,8 @@ import numpy as np
 STREAM_ATTACK_CHOICES = ['none', 'index-bitflip', 'sign-bitflip',
                          'sign-impact-bitflip', 'sign-trajectory-bitflip']
 STREAM_DEFENSE_CHOICES = ['none', 'sign-repetition3', 'sign-repetition']
-STREAM_DEFENSE_ATTACK_MODE_CHOICES = ['random', 'adaptive-pairs']
+STREAM_DEFENSE_ATTACK_MODE_CHOICES = ['random', 'adaptive-pairs',
+                                      'contiguous-burst']
 STREAM_TRANSPORT_CHOICES = ['logical', 'serialized', 'protected-serialized']
 
 _REPETITION_MAGIC = b'TDRP'
@@ -468,7 +469,8 @@ def apply_serialized_repetition_disturbance(
         recovered_path, repetitions=5, protected_steps=1,
         protected_frames=None, count=0, rate=0.0, seed=42,
         target_steps=None, target_frames=None,
-        disturbance_mode='adaptive-pairs'):
+        disturbance_mode='adaptive-pairs', interleave_seed=0,
+        burst_start=0):
     """Exercise majority protection on an actual serialized transport file.
 
     ``.tdcmr`` stores the original TDCM payload plus ``R-1`` physical copies
@@ -505,13 +507,22 @@ def apply_serialized_repetition_disturbance(
                        if slot['step'] < protected_steps
                        and slot['frame'] in protected_frame_ids]
     redundancy_bits = len(protected_slots) * (repetitions - 1)
+    if interleave_seed:
+        interleave = np.random.default_rng(interleave_seed).permutation(
+            redundancy_bits)
+    else:
+        interleave = np.arange(redundancy_bits, dtype=np.int64)
+    inverse_interleave = np.empty(redundancy_bits, dtype=np.int64)
+    inverse_interleave[interleave] = np.arange(redundancy_bits,
+                                               dtype=np.int64)
     redundancy = bytearray((redundancy_bits + 7) // 8)
     for ordinal, slot in enumerate(protected_slots):
         value = 1 if payload[slot['sign_offset']] & slot['sign_mask'] else 0
         if value:
             for copy in range(1, repetitions):
                 bit_index = ordinal * (repetitions - 1) + copy - 1
-                redundancy[bit_index // 8] |= 1 << (bit_index % 8)
+                physical_bit = int(interleave[bit_index])
+                redundancy[physical_bit // 8] |= 1 << (physical_bit % 8)
     header = struct.pack(
         _REPETITION_HEADER_FORMAT, _REPETITION_MAGIC,
         _REPETITION_VERSION, repetitions, protected_steps,
@@ -544,11 +555,24 @@ def apply_serialized_repetition_disturbance(
             return (_REPETITION_HEADER_SIZE + slot['sign_offset'],
                     slot['sign_mask'])
         bit_index = ordinal * (repetitions - 1) + copy - 1
-        return (_REPETITION_HEADER_SIZE + len(payload) + bit_index // 8,
-                1 << (bit_index % 8))
+        physical_bit = int(interleave[bit_index])
+        return (_REPETITION_HEADER_SIZE + len(payload) + physical_bit // 8,
+                1 << (physical_bit % 8))
 
     rng = np.random.default_rng(seed)
-    if disturbance_mode == 'random':
+    if disturbance_mode == 'contiguous-burst':
+        if step_ids != set(range(protected_steps)) or frame_ids != protected_frame_ids:
+            raise ValueError('A physical burst spans the full protected redundancy region; '
+                             'do not set narrower target steps/frames')
+        if burst_start < 0 or burst_start + requested > redundancy_bits:
+            raise ValueError('Contiguous burst lies outside the redundancy region')
+        chosen=[]
+        for physical_bit in range(burst_start, burst_start + requested):
+            raw_bit=int(inverse_interleave[physical_bit])
+            ordinal=raw_bit//(repetitions-1)
+            copy=raw_bit%(repetitions-1)+1
+            chosen.append((ordinal, protected_slots[ordinal], copy))
+    elif disturbance_mode == 'random':
         domain = [(ordinal, slot, copy) for ordinal, slot in eligible
                   for copy in range(repetitions)]
         chosen = [domain[int(v)] for v in
@@ -623,6 +647,7 @@ def apply_serialized_repetition_disturbance(
         defense_frames=sorted(protected_frame_ids),
         defense_repetitions=repetitions,
         defense_attack_mode=disturbance_mode,
+        interleave_seed=int(interleave_seed), burst_start=int(burst_start),
         transport='protected-serialized-tdcmr',
         total_symbols=total_symbols, total_payload_bits=total_payload_bits,
         protection_overhead_bits=redundancy_bits,
@@ -681,6 +706,8 @@ def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
                               if defense in ('sign-repetition3','sign-repetition') else 0)
     if defense_attack_mode not in STREAM_DEFENSE_ATTACK_MODE_CHOICES:
         raise ValueError(f'Unknown defense attack mode: {defense_attack_mode}')
+    if defense_attack_mode=='contiguous-burst':
+        raise ValueError('contiguous-burst requires protected-serialized transport')
     metadata=dict(attack=attack,rate=rate,requested_count=count,seed=seed,
                   early_steps=early_steps,
                   defense=defense,defense_steps=protected_steps,

@@ -10,7 +10,12 @@ STREAM_ATTACK_CHOICES = ['none', 'index-bitflip', 'sign-bitflip',
                          'sign-impact-bitflip', 'sign-trajectory-bitflip']
 STREAM_DEFENSE_CHOICES = ['none', 'sign-repetition3', 'sign-repetition']
 STREAM_DEFENSE_ATTACK_MODE_CHOICES = ['random', 'adaptive-pairs']
-STREAM_TRANSPORT_CHOICES = ['logical', 'serialized']
+STREAM_TRANSPORT_CHOICES = ['logical', 'serialized', 'protected-serialized']
+
+_REPETITION_MAGIC = b'TDRP'
+_REPETITION_VERSION = 1
+_REPETITION_HEADER_FORMAT = '<4sIIIIQ'
+_REPETITION_HEADER_SIZE = struct.calcsize(_REPETITION_HEADER_FORMAT)
 
 
 def _parse_tdcm_payload_layout(raw):
@@ -455,6 +460,184 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
         eligible_symbols=len(eligible), examples=examples,
         input_path=str(input_path), output_path=str(output_path),
         defense_model='none', selection_metadata=selection_metadata,
+    )
+
+
+def apply_serialized_repetition_disturbance(
+        input_path, protected_clean_path, protected_disturbed_path,
+        recovered_path, repetitions=5, protected_steps=1,
+        protected_frames=None, count=0, rate=0.0, seed=42,
+        target_steps=None, target_frames=None,
+        disturbance_mode='adaptive-pairs'):
+    """Exercise majority protection on an actual serialized transport file.
+
+    ``.tdcmr`` stores the original TDCM payload plus ``R-1`` physical copies
+    of selected sign bits.  Channel changes are made in this file, after which
+    majority voting produces a conventional recovered ``.tdcm`` consumed by
+    the existing decoder.  Container metadata is deliberately excluded from
+    the disturbance domain so the experiment measures payload robustness, not
+    parser/header failure.
+    """
+    if repetitions < 3 or repetitions % 2 != 1:
+        raise ValueError('repetitions must be an odd integer >= 3')
+    if protected_steps < 1:
+        raise ValueError('protected_steps must be positive')
+    if disturbance_mode not in STREAM_DEFENSE_ATTACK_MODE_CHOICES:
+        raise ValueError(f'Unknown disturbance mode: {disturbance_mode}')
+    if count < 0 or (count == 0 and not 0 < rate <= 1):
+        raise ValueError('A positive count or rate in (0,1] is required')
+
+    payload = bytearray(Path(input_path).read_bytes())
+    layout = _parse_tdcm_payload_layout(payload)
+    protected_steps = min(int(protected_steps), layout['n_sde'])
+    if protected_frames is None:
+        protected_frame_ids = set(range(layout['n_lat']))
+    else:
+        protected_frame_ids = {int(v) for v in protected_frames}
+    invalid = sorted(v for v in protected_frame_ids
+                     if v < 0 or v >= layout['n_lat'])
+    if invalid or not protected_frame_ids:
+        raise ValueError(f'Invalid protected latent frames: {invalid}')
+    if layout['n_lat'] > 64:
+        raise ValueError('The repetition container supports at most 64 latent frames')
+    frame_mask = sum(1 << frame for frame in protected_frame_ids)
+    protected_slots = [slot for slot in layout['slots']
+                       if slot['step'] < protected_steps
+                       and slot['frame'] in protected_frame_ids]
+    redundancy_bits = len(protected_slots) * (repetitions - 1)
+    redundancy = bytearray((redundancy_bits + 7) // 8)
+    for ordinal, slot in enumerate(protected_slots):
+        value = 1 if payload[slot['sign_offset']] & slot['sign_mask'] else 0
+        if value:
+            for copy in range(1, repetitions):
+                bit_index = ordinal * (repetitions - 1) + copy - 1
+                redundancy[bit_index // 8] |= 1 << (bit_index % 8)
+    header = struct.pack(
+        _REPETITION_HEADER_FORMAT, _REPETITION_MAGIC,
+        _REPETITION_VERSION, repetitions, protected_steps,
+        len(payload), frame_mask)
+    clean_container = bytearray(header + payload + redundancy)
+    Path(protected_clean_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(protected_clean_path).write_bytes(clean_container)
+
+    if target_steps is None:
+        step_ids = set(range(protected_steps))
+    else:
+        step_ids = {int(v) for v in target_steps}
+    if target_frames is None:
+        frame_ids = set(protected_frame_ids)
+    else:
+        frame_ids = {int(v) for v in target_frames}
+    if not step_ids.issubset(set(range(protected_steps))):
+        raise ValueError('Target steps must lie inside the protected leading steps')
+    if not frame_ids.issubset(protected_frame_ids):
+        raise ValueError('Target frames must lie inside the protected frame set')
+    eligible = [(ordinal, slot) for ordinal, slot in enumerate(protected_slots)
+                if slot['step'] in step_ids and slot['frame'] in frame_ids]
+    requested = int(count) if count > 0 else max(
+        1, int(round(len(layout['slots']) * rate)))
+    if requested > len(eligible) * repetitions:
+        raise ValueError('Requested changes exceed eligible protected physical bits')
+
+    def physical_location(ordinal, slot, copy):
+        if copy == 0:
+            return (_REPETITION_HEADER_SIZE + slot['sign_offset'],
+                    slot['sign_mask'])
+        bit_index = ordinal * (repetitions - 1) + copy - 1
+        return (_REPETITION_HEADER_SIZE + len(payload) + bit_index // 8,
+                1 << (bit_index % 8))
+
+    rng = np.random.default_rng(seed)
+    if disturbance_mode == 'random':
+        domain = [(ordinal, slot, copy) for ordinal, slot in eligible
+                  for copy in range(repetitions)]
+        chosen = [domain[int(v)] for v in
+                  rng.choice(len(domain), size=requested, replace=False)]
+    else:
+        majority = repetitions // 2 + 1
+        order = [eligible[int(v)] for v in rng.permutation(len(eligible))]
+        chosen = []
+        remaining = requested
+        for ordinal, slot in order:
+            if remaining < majority:
+                break
+            chosen.extend((ordinal, slot, copy) for copy in range(majority))
+            remaining -= majority
+        completed = len(chosen) // majority
+        if remaining and completed < len(order):
+            ordinal, slot = order[completed]
+            chosen.extend((ordinal, slot, copy) for copy in range(remaining))
+            remaining = 0
+        if remaining:
+            used={(ordinal, copy) for ordinal, _, copy in chosen}
+            extras=[(ordinal, slot, copy) for ordinal, slot in eligible
+                    for copy in range(repetitions)
+                    if (ordinal, copy) not in used]
+            chosen.extend(extras[:remaining])
+
+    disturbed = bytearray(clean_container)
+    flip_counts = {}
+    examples = []
+    for ordinal, slot, copy in chosen:
+        byte_offset, bit_mask = physical_location(ordinal, slot, copy)
+        disturbed[byte_offset] ^= bit_mask
+        flip_counts[ordinal] = flip_counts.get(ordinal, 0) + 1
+        if len(examples) < 20:
+            examples.append(dict(step=slot['step'], frame=slot['frame'],
+                                 atom=slot['atom'], copy=copy,
+                                 byte_offset=byte_offset))
+    Path(protected_disturbed_path).write_bytes(disturbed)
+
+    recovered = bytearray(
+        disturbed[_REPETITION_HEADER_SIZE:
+                  _REPETITION_HEADER_SIZE + len(payload)])
+    changed = 0
+    corrected = 0
+    majority = repetitions // 2 + 1
+    for ordinal, slot in enumerate(protected_slots):
+        votes = 0
+        for copy in range(repetitions):
+            byte_offset, bit_mask = physical_location(ordinal, slot, copy)
+            votes += 1 if disturbed[byte_offset] & bit_mask else 0
+        old_value = 1 if payload[slot['sign_offset']] & slot['sign_mask'] else 0
+        new_value = 1 if votes >= majority else 0
+        if new_value:
+            recovered[slot['sign_offset']] |= slot['sign_mask']
+        else:
+            recovered[slot['sign_offset']] &= ~slot['sign_mask'] & 0xff
+        if new_value != old_value:
+            changed += 1
+        elif ordinal in flip_counts:
+            corrected += 1
+    Path(recovered_path).write_bytes(recovered)
+    # A final parse guarantees that recovery produced a valid standard TDCM.
+    _parse_tdcm_payload_layout(recovered)
+
+    total_symbols = len(layout['slots'])
+    total_payload_bits = total_symbols * (layout['bits_per_index'] + 1)
+    protected_payload_bits = total_payload_bits + redundancy_bits
+    return dict(
+        attack='sign-bitflip', rate=rate, requested_count=count, seed=seed,
+        target_steps_zero_based=sorted(step_ids), target_frames=sorted(frame_ids),
+        defense='sign-repetition', defense_steps=protected_steps,
+        defense_frames=sorted(protected_frame_ids),
+        defense_repetitions=repetitions,
+        defense_attack_mode=disturbance_mode,
+        transport='protected-serialized-tdcmr',
+        total_symbols=total_symbols, total_payload_bits=total_payload_bits,
+        protection_overhead_bits=redundancy_bits,
+        protected_payload_bits=protected_payload_bits,
+        container_header_bits=_REPETITION_HEADER_SIZE * 8,
+        channel_flipped_bits=requested, changed_symbols=changed,
+        changed_bits=requested, corrected_logical_symbols=corrected,
+        payload_BER=requested / protected_payload_bits,
+        requested_symbol_rate=requested / total_symbols,
+        eligible_symbols=len(eligible), eligible_physical_bits=len(eligible)*repetitions,
+        examples=examples, input_path=str(input_path),
+        protected_clean_path=str(protected_clean_path),
+        protected_disturbed_path=str(protected_disturbed_path),
+        recovered_path=str(recovered_path),
+        defense_model='serialized odd-repetition majority protection',
     )
 
 

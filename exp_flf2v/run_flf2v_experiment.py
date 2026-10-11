@@ -158,6 +158,7 @@ from bitstream_attacks import (STREAM_ATTACK_CHOICES, STREAM_DEFENSE_CHOICES,
                                STREAM_TRANSPORT_CHOICES,
                                apply_codebook_stream_attack,
                                apply_serialized_codebook_attack,
+                               apply_serialized_repetition_disturbance,
                                select_impact_sign_slots,
                                select_trajectory_sign_slots)
 # ==================================================================
@@ -370,7 +371,8 @@ def main():
                         help="Exact 0-based latent frame positions to attack (0..8 for a 33-frame GOP)")
     parser.add_argument("--stream_attack_transport", choices=STREAM_TRANSPORT_CHOICES,
                         default="logical",
-                        help="logical edits Python data; serialized flips actual .tdcm payload bits")
+                        help=("logical edits Python data; serialized edits .tdcm; "
+                              "protected-serialized uses a physical .tdcmr container"))
     parser.add_argument("--reuse_codebook", default=None,
                         help="Decode an existing clean .tdcm instead of repeating codebook search; single GOP only")
     parser.add_argument("--stream_defense", choices=STREAM_DEFENSE_CHOICES, default="none",
@@ -421,6 +423,13 @@ def main():
         parser.error("--stream_defense sign-repetition3 fixes the repetition factor at 3")
     if args.stream_attack_transport == "serialized" and args.stream_defense != "none":
         parser.error("Serialized transport currently supports unprotected .tdcm only; use logical mode for the repetition pilot")
+    if args.stream_attack_transport == "protected-serialized":
+        if args.stream_attack == "none":
+            parser.error("Protected serialized transport requires a stream disturbance")
+        if args.stream_defense not in ("sign-repetition", "sign-repetition3"):
+            parser.error("Protected serialized transport requires a sign-repetition defense")
+        if args.stream_attack != "sign-bitflip":
+            parser.error("Protected serialized transport currently supports sign-bitflip only")
     if args.stream_attack in ("sign-impact-bitflip", "sign-trajectory-bitflip"):
         if args.stream_attack_transport != "serialized":
             parser.error("Ranked sign attacks require --stream_attack_transport serialized")
@@ -825,6 +834,32 @@ def main():
                 )
                 # 重新走正式反序列化器；解码器看到的内容完全来自受损文件。
                 decode_step_data = TurboBitstream.load(str(attacked_path))["step_data"]
+            elif (args.stream_attack != "none" and
+                  args.stream_attack_transport == "protected-serialized"):
+                clean_path = gop_dir / "codebook_clean.tdcm"
+                protected_clean_path = gop_dir / "codebook_protected_clean.tdcmr"
+                protected_disturbed_path = gop_dir / "codebook_protected_disturbed.tdcmr"
+                recovered_path = gop_dir / "codebook.tdcm"
+                pipe.save_compressed(step_data, str(clean_path))
+                repetitions = (3 if args.stream_defense == "sign-repetition3"
+                               else args.stream_defense_repetitions)
+                stream_attack_metadata = apply_serialized_repetition_disturbance(
+                    clean_path, protected_clean_path, protected_disturbed_path,
+                    recovered_path,
+                    repetitions=repetitions,
+                    protected_steps=args.stream_defense_steps,
+                    protected_frames=args.stream_defense_frames,
+                    count=args.stream_attack_count,
+                    rate=args.stream_attack_rate,
+                    seed=args.stream_attack_seed,
+                    target_steps=([v - 1 for v in args.stream_attack_target_steps]
+                                  if args.stream_attack_target_steps else None),
+                    target_frames=args.stream_attack_target_frames,
+                    disturbance_mode=args.stream_defense_attack_mode,
+                )
+                # Recovery returns an ordinary TDCM, so the production parser
+                # and decoder remain unchanged.
+                decode_step_data = TurboBitstream.load(str(recovered_path))["step_data"]
             else:
                 decode_step_data, stream_attack_metadata = apply_codebook_stream_attack(
                     step_data,
@@ -874,7 +909,7 @@ def main():
             # 指标使用内存里的 frames_recon，不使用 MP4 重新解码后的帧。
             save_video_mp4(frames_recon, gop_dir / "reconstructed.mp4")
             if args.stream_attack != "none":
-                if args.stream_attack_transport != "serialized":
+                if args.stream_attack_transport == "logical":
                     pipe.save_compressed(step_data, str(gop_dir / "codebook_clean.tdcm"))
                     # Keep the conventional filename for the payload actually
                     # consumed by the decoder; the pristine payload is retained

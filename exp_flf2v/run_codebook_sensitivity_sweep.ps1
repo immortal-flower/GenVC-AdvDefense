@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('step','dose','frame','frame-seed')]
+    [ValidateSet('step','step-all','dose','frame','frame-seed')]
     [string]$Mode = 'step',
     [string]$CondaExe = 'D:\anaconda\Scripts\conda.exe',
     [string]$Data = 'D:\yzb and lmk\dataset-720P\UVG\Jockey_720p.yuv',
@@ -9,6 +9,7 @@ param(
 # Serialized-codebook sensitivity experiments.  Every run loads the same clean
 # .tdcm and skips encoding.  Run one mode at a time to keep turnaround bounded:
 #   step  : six representative SDE steps, 49 sign errors each
+#   step-all: all 17 SDE steps, 49 sign errors each; completed runs are skipped
 #   dose  : five error counts at SDE step 1
 #   frame : nine latent-time positions at SDE step 1, 16 errors each
 #   frame-seed: positions 0/3/4/8 with seeds 7/42/123; seed 42 is reused
@@ -20,8 +21,9 @@ if(-not (Test-Path -LiteralPath $CleanCodebook)){
 }
 
 $experiments = @()
-if($Mode -eq 'step'){
-    foreach($step in @(1,2,4,8,12,17)){
+if($Mode -in @('step','step-all')){
+    $targetSteps = if($Mode -eq 'step-all'){ 1..17 } else { @(1,2,4,8,12,17) }
+    foreach($step in $targetSteps){
         $experiments += [pscustomobject]@{
             Name = "sensitivity_step$($step)_sign49"
             Step = $step; Frame = $null; Count = 49; Seed = 42

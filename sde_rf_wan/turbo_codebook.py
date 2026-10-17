@@ -5,10 +5,11 @@ Implements Turbo-DDCM (arXiv:2511.06424) adapted for Wan2.1 video latents:
   - Per-step, per-frame Gaussian codebook (K atoms of shape C×H×W)
   - Thresholding: top-M atoms by |⟨z_i, residual⟩| (Eq.13)
   - Signed combination + unit variance normalization (Eq.10)
-  - Bitstream: M indices + M sign bits per frame per SDE step
+  - Bitstream: combinatorial rank of M indices + M sign bits per frame/SDE step
 
-Bitrate example (K=1024, M=32, T_sde=17, F=21):
-  17 × 21 × (32 × 10 + 32) = 125,664 bits ≈ 15.7 KB
+The selected indices are an unordered subset.  Ranking that subset among the
+``C(K, M)`` possible subsets removes the redundant permutation bits without
+changing atom selection or reconstruction quality.
 
 IMPORTANT: Atoms are generated one-at-a-time via randn(D) to ensure the
 random sequence is deterministic regardless of batch size. This guarantees
@@ -22,6 +23,45 @@ import math
 import struct
 from typing import Tuple, List, Dict
 from pathlib import Path
+
+
+def combinatorial_index_bits(K: int, M: int) -> int:
+    """Minimum fixed-width bits needed for an unordered M-subset of K."""
+    if K < 0 or M < 0 or M > K:
+        raise ValueError(f"Expected 0 <= M <= K, got K={K}, M={M}")
+    combinations = math.comb(K, M)
+    return (combinations - 1).bit_length()
+
+
+def rank_combination(indices: List[int], K: int) -> int:
+    """Rank a sorted subset using the colex combinatorial number system."""
+    if indices != sorted(indices) or len(set(indices)) != len(indices):
+        raise ValueError("Combination indices must be strictly increasing")
+    if indices and (indices[0] < 0 or indices[-1] >= K):
+        raise ValueError(f"Combination index outside [0, {K})")
+    return sum(math.comb(value, order) for order, value in enumerate(indices, 1))
+
+
+def unrank_combination(rank: int, K: int, M: int) -> List[int]:
+    """Inverse of :func:`rank_combination` for an M-subset of ``range(K)``."""
+    total = math.comb(K, M)
+    if rank < 0 or rank >= total:
+        raise ValueError(f"Combination rank {rank} outside [0, {total})")
+    result = [0] * M
+    upper = K
+    remainder = rank
+    for order in range(M, 0, -1):
+        lo, hi = order - 1, upper - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if math.comb(mid, order) <= remainder:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        result[order - 1] = hi
+        remainder -= math.comb(hi, order)
+        upper = hi
+    return result
 
 
 class TurboPerFrameCodebook:
@@ -62,7 +102,7 @@ class TurboPerFrameCodebook:
             self.gen_batch = gen_batch
 
         self.bits_per_index = math.ceil(math.log2(K)) if K > 1 else 1
-        self.bits_per_frame_step = M * (self.bits_per_index + 1)  # +1 for sign bit
+        self.bits_per_frame_step = combinatorial_index_bits(K, M) + M
 
     def _sf_seed(self, step: int, frame: int) -> int:
         """Deterministic seed for (step, frame) pair."""
@@ -204,11 +244,8 @@ class TurboPerFrameCodebook:
 class TurboBitstream:
     """Binary I/O for Turbo-DDCM multi-atom indices + signs.
 
-    Format:
-      Header: magic(4) + 10×uint32 + prompt_len(uint32) + frame_shape + prompt
-      Data:   for each SDE step, for each frame:
-                M indices (uint16 if K≤65536, else uint32)
-                ceil(M/8) bytes of sign bits
+    ``TDC2`` stores each sorted index set as one combinatorial rank. ``TDCM``
+    (the original fixed-width per-index format) remains readable.
     """
 
     @staticmethod
@@ -227,7 +264,7 @@ class TurboBitstream:
         Args:
             step_data: [sde_step][frame] = (indices, signs)
         """
-        data = bytearray(b"TDCM")  # magic
+        data = bytearray(b"TDC2")  # combinatorial-index format
         prompt_b = prompt.encode("utf-8")
 
         # Header: 10 uint32 values
@@ -240,17 +277,17 @@ class TurboBitstream:
             data.extend(struct.pack("<I", d))
         data.extend(prompt_b)
 
-        # Index format
-        idx_fmt = "<H" if K <= 65536 else "<I"
-
-        # Data: indices + sign bits per frame per step
+        # Data: combination rank + sign bits per frame per step
         # Each frame entry stores its own M_actual (uint16) to support M_tail
         for step in step_data:
             for indices, signs in step:
                 m_actual = len(indices)
+                if len(signs) != m_actual:
+                    raise ValueError("Each selected index must have one sign")
                 data.extend(struct.pack("<H", m_actual))
-                for idx in indices:
-                    data.extend(struct.pack(idx_fmt, idx))
+                rank = rank_combination(indices, K)
+                rank_bytes = (combinatorial_index_bits(K, m_actual) + 7) // 8
+                data.extend(rank.to_bytes(rank_bytes, "little"))
                 sb = bytearray((m_actual + 7) // 8)
                 for j, s in enumerate(signs):
                     if s > 0:
@@ -264,7 +301,9 @@ class TurboBitstream:
     def load(filepath: str) -> dict:
         """Load Turbo-DDCM bitstream."""
         raw = Path(filepath).read_bytes()
-        assert raw[:4] == b"TDCM", f"Invalid magic: {raw[:4]}"
+        magic = raw[:4]
+        if magic not in (b"TDCM", b"TDC2"):
+            raise ValueError(f"Invalid magic: {magic!r}")
         off = 4
 
         vals = struct.unpack_from("<10I", raw, off)
@@ -291,12 +330,22 @@ class TurboBitstream:
             for _ in range(n_lat):
                 m_actual = struct.unpack_from("<H", raw, off)[0]
                 off += 2
-                indices = []
-                for _ in range(m_actual):
-                    indices.append(struct.unpack_from(idx_fmt, raw, off)[0])
-                    off += idx_sz
+                if magic == b"TDC2":
+                    rank_bytes = (combinatorial_index_bits(K, m_actual) + 7) // 8
+                    if off + rank_bytes > len(raw):
+                        raise ValueError("Truncated combinatorial index rank")
+                    rank = int.from_bytes(raw[off:off + rank_bytes], "little")
+                    off += rank_bytes
+                    indices = unrank_combination(rank, K, m_actual)
+                else:
+                    indices = []
+                    for _ in range(m_actual):
+                        indices.append(struct.unpack_from(idx_fmt, raw, off)[0])
+                        off += idx_sz
                 sign_bytes_len = (m_actual + 7) // 8
                 sr = raw[off:off + sign_bytes_len]
+                if len(sr) != sign_bytes_len:
+                    raise ValueError("Truncated sign payload")
                 off += sign_bytes_len
                 signs = []
                 for j in range(m_actual):
@@ -305,6 +354,9 @@ class TurboBitstream:
                 frame_data.append((indices, signs))
             step_data.append(frame_data)
 
+        if off != len(raw):
+            raise ValueError(f"Unexpected {len(raw) - off} trailing bytes")
+
         return dict(
             K=K, M=M,
             num_sde_steps=n_sde, num_ddim_steps=n_ddim,
@@ -312,4 +364,5 @@ class TurboBitstream:
             frame_shape=tuple(shape), prompt=prompt,
             num_frames=n_fr, height=h, width=w,
             step_data=step_data,
+            index_coding="combinatorial" if magic == b"TDC2" else "fixed-width",
         )

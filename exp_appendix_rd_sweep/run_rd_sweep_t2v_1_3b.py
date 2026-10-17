@@ -26,6 +26,7 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _project_root)
 from sde_rf_wan.wan_t2v_wrapper import WanT2VDiffusersWrapper
 from sde_rf_wan.turbo_pipeline import TurboDDCMWanPipeline
+from sde_rf_wan.turbo_codebook import combinatorial_index_bits
 
 
 # ==================================================================
@@ -136,7 +137,7 @@ def main():
 
     # ================================================================
     # R-D operating points: (M, K) proportional joint scaling
-    # bits_per_atom = ceil(log2(K)) + 1 (index + sign)
+    # bits/frame-step = ceil(log2(C(K,M))) + M sign bits
     # T2V has no boundary frames, bitrate = codebook only
     # ================================================================
     operating_points = [
@@ -163,13 +164,13 @@ def main():
     print(f"  Resolution: {WIDTH}x{HEIGHT}, {args.num_gops} GOPs, {FPG} frames/GOP")
     print(f"  T_sde={T_sde}, F_lat={F_lat}")
     print(f"  Model: {args.wan_ckpt}")
-    print(f"\n  {'M':>4} {'K':>6} {'bit/atom':>9} {'CB bits':>10} {'CB BPP':>10}")
+    print(f"\n  {'M':>4} {'K':>6} {'bit/frame':>10} {'CB bits':>10} {'CB BPP':>10}")
     print("  " + "-" * 46)
     for M, K in operating_points:
-        bpa = math.ceil(math.log2(K)) + 1
-        cb_bits = T_sde * F_lat * M * bpa
+        bits_per_frame_step = combinatorial_index_bits(K, M) + M
+        cb_bits = T_sde * F_lat * bits_per_frame_step
         cb_bpp = cb_bits / total_pixels
-        print(f"  {M:>4} {K:>6} {bpa:>9} {cb_bits:>10} {cb_bpp:>10.6f}")
+        print(f"  {M:>4} {K:>6} {bits_per_frame_step:>10} {cb_bits:>10} {cb_bpp:>10.6f}")
     print("=" * 70)
 
     # ================================================================
@@ -188,9 +189,10 @@ def main():
     all_results = []
 
     for M, K in operating_points:
-        bpa = math.ceil(math.log2(K)) + 1
+        bits_per_frame_step = combinatorial_index_bits(K, M) + M
+        bpa = bits_per_frame_step / M
         print(f"\n{'='*70}")
-        print(f"  Config: M={M}, K={K} ({bpa} bits/atom)")
+        print(f"  Config: M={M}, K={K} ({bits_per_frame_step} bits/frame-step, {bpa:.3f} effective bits/atom)")
         print(f"  {datetime.now().strftime('%H:%M:%S')}")
         print(f"{'='*70}")
 

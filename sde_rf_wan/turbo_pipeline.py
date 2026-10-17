@@ -23,7 +23,11 @@ from .sde_convert import (
     ode_sample_loop,
     shifted_timesteps,
 )
-from .turbo_codebook import TurboPerFrameCodebook, TurboBitstream
+from .turbo_codebook import (
+    TurboPerFrameCodebook,
+    TurboBitstream,
+    combinatorial_index_bits,
+)
 from .wan_wrapper import WanWrapper
 
 
@@ -85,9 +89,9 @@ class TurboDDCMWanPipeline:
 
         # Print stats
         bits_per_index = self.codebook.bits_per_index
-        bits_normal = M * (bits_per_index + 1)
+        bits_normal = combinatorial_index_bits(K, M) + M
         if M_tail:
-            bits_tail = M_tail * (bits_per_index + 1)
+            bits_tail = combinatorial_index_bits(K, M_tail) + M_tail
             n_tail = min(tail_latent_frames, self.num_latent_frames)
             n_normal = self.num_latent_frames - n_tail
             total_bits = self.num_sde_steps * (n_normal * bits_normal + n_tail * bits_tail)
@@ -107,6 +111,7 @@ class TurboDDCMWanPipeline:
         else:
             print(f"  K={K}, M={M}")
         print(f"  T_sde={self.num_sde_steps}, DDIM_tail={num_ddim_tail}, gen_batch={self.codebook.gen_batch}")
+        print(f"  Index coding: combinatorial ({combinatorial_index_bits(K, M)} index bits + {M} sign bits/frame-step; legacy {M * bits_per_index + M})")
         print(f"  Total: {total_bits} bits ({total_bits/8:.0f} bytes)")
         print(f"  BPP: {bpp:.6f}, Bitrate: {bitrate_kbps:.2f} kbps")
 

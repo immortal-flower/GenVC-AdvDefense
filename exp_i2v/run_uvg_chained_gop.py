@@ -396,13 +396,10 @@ def main():
             last_psnr = per_frame_psnr[-1].item()
 
             # Bitrate: codebook + ref (GOP 0 only) + tail residual
-            T_sde = pipe.num_sde_steps
-            F_lat = pipe.num_latent_frames
-            bits_per_fs = pipe.codebook.bits_per_frame_step
-            codebook_bits = T_sde * F_lat * bits_per_fs
-            codebook_bytes = codebook_bits // 8
-            gop_total_bytes = codebook_bytes + ref_bytes + tail_res_bytes
-            gop_total_bits = gop_total_bytes * 8
+            codebook_bits = pipe._total_codebook_bits
+            codebook_bytes = (codebook_bits + 7) // 8
+            gop_total_bits = codebook_bits + (ref_bytes + tail_res_bytes) * 8
+            gop_total_bytes = (gop_total_bits + 7) // 8
             total_pixels = len(gop_frames) * HEIGHT * WIDTH
             bpp = gop_total_bits / total_pixels
             duration_s = len(gop_frames) / 16.0
@@ -417,6 +414,7 @@ def main():
                 "LPIPS": round(mean_lpips, 4),
                 "last_frame_PSNR": round(last_psnr, 2),
                 "BPP": round(bpp, 6),
+                "codebook_bits": codebook_bits,
                 "codebook_bytes": codebook_bytes,
                 "ref_bytes": ref_bytes,
                 "tail_residual_bytes": tail_res_bytes,

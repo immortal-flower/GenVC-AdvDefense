@@ -2,7 +2,7 @@
 run_rd_sweep.py — FLF2V Rate-Distortion Sweep (M × K joint)
 
 Sweeps (M, K) combinations on UVG 720p (3 GOPs) to trace an R-D curve.
-Bits per atom = ceil(log2(K)) + 1 (index + sign).
+Index subsets use combinatorial coding; signs use one bit per selected atom.
 Model loaded once, all configs share the same decoded boundary frames.
 
 Usage:
@@ -27,6 +27,7 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _project_root)
 from sde_rf_wan.wan_flf2v_wrapper import WanFLF2VWrapper
 from sde_rf_wan.turbo_pipeline import TurboDDCMWanPipeline
+from sde_rf_wan.turbo_codebook import combinatorial_index_bits
 from sde_rf_wan.sde_convert import velocity_to_score, diffusion_coeff, sde_drift
 from sde_rf_wan.ref_codec import compress_ref
 from uvg_data import find_uvg_sequences as find_uvg_sequences_shared
@@ -285,13 +286,13 @@ def main():
     print(f"  Resolution: {WIDTH}x{HEIGHT}, {args.num_gops} GOPs")
     print(f"  T_sde={T_sde}, F_lat={F_lat}, steps={args.steps}")
     print(f"\n  Operating points (M, K, ref_quality jointly scaled):")
-    print(f"  {'M':>4} {'K':>6} {'ref_q':>6} {'bit/atom':>9} {'CB bits':>10} {'CB BPP':>10}")
+    print(f"  {'M':>4} {'K':>6} {'ref_q':>6} {'bit/frame':>10} {'CB bits':>10} {'CB BPP':>10}")
     print("  " + "-" * 52)
     for M, K, rq in operating_points:
-        bpa = math.ceil(math.log2(K)) + 1
-        cb_bits = T_sde * F_lat * M * bpa
+        bits_per_frame_step = combinatorial_index_bits(K, M) + M
+        cb_bits = T_sde * F_lat * bits_per_frame_step
         cb_bpp = cb_bits / total_pixels
-        print(f"  {M:>4} {K:>6} {rq:>6} {bpa:>9} {cb_bits:>10} {cb_bpp:>10.6f}")
+        print(f"  {M:>4} {K:>6} {rq:>6} {bits_per_frame_step:>10} {cb_bits:>10} {cb_bpp:>10.6f}")
     print("=" * 70)
 
     # ================================================================
@@ -311,9 +312,10 @@ def main():
 
     for M, K, ref_q in operating_points:
         tag = f"M{M}_K{K}_q{ref_q}"
-        bpa = math.ceil(math.log2(K)) + 1
+        bits_per_frame_step = combinatorial_index_bits(K, M) + M
+        bpa = bits_per_frame_step / M
         print(f"\n{'='*70}")
-        print(f"  Config: M={M}, K={K} ({bpa} bits/atom), ref_quality={ref_q}")
+        print(f"  Config: M={M}, K={K} ({bits_per_frame_step} bits/frame-step, {bpa:.3f} effective bits/atom), ref_quality={ref_q}")
         print(f"  {datetime.now().strftime('%H:%M:%S')}")
         print(f"{'='*70}")
 
@@ -399,10 +401,11 @@ def main():
                 psnr = compute_psnr(t_gt, t_rec)
 
                 # Bitrate
-                codebook_bytes = pipe._total_codebook_bits // 8
+                codebook_bits = pipe._total_codebook_bits
+                codebook_bytes = (codebook_bits + 7) // 8
                 boundary_bytes = gop_first_bytes + last_bytes
                 gop_total_bytes = codebook_bytes + boundary_bytes
-                gop_total_bits = gop_total_bytes * 8
+                gop_total_bits = codebook_bits + boundary_bytes * 8
                 gop_pixels = n * HEIGHT * WIDTH
                 bpp = gop_total_bits / gop_pixels
                 duration_s = n / 16.0

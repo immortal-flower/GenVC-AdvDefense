@@ -54,9 +54,16 @@ All three experiments share the same compression backbone, differing only in how
 
 **Bitstream format.** Each GOP produces a `.tdcm` file with:
 - Header: magic bytes, K, M, step/frame counts, seed, video dimensions, optional prompt
-- Data: for each SDE step, for each latent frame: M indices (uint16 if K <= 65536) + ceil(M/8) sign bytes
+- Data: for each SDE step and latent frame: combinatorial rank of the M-index subset + ceil(M/8) sign bytes
 
-The bitrate per GOP is exactly `T_sde * F_lat * M * (ceil(log2(K)) + 1)` bits, where `T_sde` is the number of SDE steps (total steps minus DDIM tail).
+The selected atom indices are a sorted, unordered subset, so the current `TDC2`
+format transmits their combinatorial rank in `ceil(log2(C(K,M)))` bits instead
+of transmitting `M` independent fixed-width indices. The original `TDCM`
+format remains readable. The theoretical bitrate per GOP is exactly
+`T_sde * F_lat * (ceil(log2(C(K,M))) + M)` bits, where the final `M` bits are
+the signs and `T_sde` is the number of SDE steps (total steps minus DDIM tail).
+For `K=16384, M=64`, this is 664 rather than 960 bits per frame-step (30.83%
+less) with identical selected atoms and reconstruction.
 
 ### 1.3 DDIM Tail
 
@@ -131,7 +138,7 @@ GOP 2: frames [66, 99)  ref = next_ref (decoded last frame from GOP 1, 0 bytes)
 
 **Purpose.** Temporal frames near the end of the GOP (farthest from the conditioned first frame) tend to have higher reconstruction error. The `M_tail` parameter allocates more codebook atoms to the last `tail_latent_frames` latent frames (default: last 2), boosting quality where the model prior is weakest.
 
-**Implementation.** `_get_M_for_frame(f)` returns `M_tail` for frame indices `>= num_latent_frames - tail_latent_frames`, and `M` for all others. This requires variable-length bitstream entries — each frame's contribution to the bitstream is `M_f * (bits_per_index + 1)` bits, where `M_f` varies by frame position.
+**Implementation.** `_get_M_for_frame(f)` returns `M_tail` for frame indices `>= num_latent_frames - tail_latent_frames`, and `M` for all others. This requires variable-length bitstream entries — each frame's contribution is `ceil(log2(C(K,M_f))) + M_f` bits, where `M_f` varies by frame position.
 
 **Default values:** `M=64, M_tail=128` at 720p; `M=80, M_tail=160` at 1080p.
 
@@ -169,7 +176,7 @@ The timestep convention is `[0, 1000]` scale (Wan native), converted from the pi
 
 ```
 Per-GOP bitrate:
-  codebook: T_sde * F_lat * M * (ceil(log2(K)) + 1) bits
+  codebook: T_sde * F_lat * (ceil(log2(C(K,M))) + M) bits
   + tail residual: zlib(quantize(residual)) bytes * 8 bits  (default on)
   GOP 0 ref: GT first frame (free, 0 bits)
   GOP k>0 ref: decoded last frame (free, 0 bits)
@@ -240,7 +247,7 @@ This can reduce visual discontinuities at GOP boundaries but increases the bitra
 
 ```
 Per-GOP bitrate:
-  codebook: T_sde * F_lat * M * (ceil(log2(K)) + 1) bits
+  codebook: T_sde * F_lat * (ceil(log2(C(K,M))) + M) bits
   ref frame: 0 bits
   BPP = codebook_bits / total_pixels
 ```
@@ -332,7 +339,7 @@ The SDE loop logic is identical to `TurboDDCMWanPipeline.encode()` but uses the 
 
 ```
 Per-GOP bitrate:
-  codebook: T_sde * F_lat * M * (ceil(log2(K)) + 1) bits
+  codebook: T_sde * F_lat * (ceil(log2(C(K,M))) + M) bits
   GOP 0: first_frame_bytes + last_frame_bytes
   GOP k>0: last_frame_bytes only (first reused)
 

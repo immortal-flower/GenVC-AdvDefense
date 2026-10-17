@@ -355,7 +355,7 @@ def main():
 
             # Bitrate: codebook only (no reference frame)
             codebook_bits = pipe._total_codebook_bits
-            codebook_bytes = codebook_bits // 8
+            codebook_bytes = (codebook_bits + 7) // 8
             total_pixels = len(gop_frames) * HEIGHT * WIDTH
             bpp = codebook_bits / total_pixels
             duration_s = len(gop_frames) / 16.0
@@ -368,6 +368,7 @@ def main():
                 "MS_SSIM": round(mean_msssim, 4) if mean_msssim else None,
                 "LPIPS": round(mean_lpips, 4),
                 "BPP": round(bpp, 6),
+                "codebook_bits": codebook_bits,
                 "codebook_bytes": codebook_bytes,
                 "ref_bytes": 0,
                 "total_bytes": codebook_bytes,
@@ -407,7 +408,7 @@ def main():
             print(f"  Stitched PSNR={full_psnr:.2f} dB, MS-SSIM={ms_str}, LPIPS={full_lpips:.4f}")
 
             # Total bitrate for stitched video
-            total_cb_bits = sum(r["codebook_bytes"] for r in gop_results) * 8
+            total_cb_bits = sum(r["codebook_bits"] for r in gop_results)
             total_pixels_full = len(all_recon_frames) * HEIGHT * WIDTH
             full_bpp = total_cb_bits / total_pixels_full
             full_dur = len(all_recon_frames) / 16.0

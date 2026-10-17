@@ -5,6 +5,11 @@ from pathlib import Path
 
 import numpy as np
 
+from sde_rf_wan.turbo_codebook import (
+    combinatorial_index_bits,
+    unrank_combination,
+)
+
 
 STREAM_ATTACK_CHOICES = ['none', 'index-bitflip', 'sign-bitflip',
                          'sign-impact-bitflip', 'sign-trajectory-bitflip']
@@ -26,7 +31,8 @@ def _parse_tdcm_payload_layout(raw):
     this parser here (rather than estimating fixed offsets) also supports a
     variable ``M_actual`` in future tail steps.
     """
-    if raw[:4] != b'TDCM':
+    magic = bytes(raw[:4])
+    if magic not in (b'TDCM', b'TDC2'):
         raise ValueError(f'Invalid TDCM magic: {bytes(raw[:4])!r}')
     if len(raw) < 48:
         raise ValueError('Truncated TDCM header')
@@ -39,6 +45,7 @@ def _parse_tdcm_payload_layout(raw):
     idx_fmt = '<H' if idx_size == 2 else '<I'
     slots = []
     frame_indices = {}
+    payload_bits = 0
     for step in range(n_sde):
         for frame in range(n_lat):
             if off + 2 > len(raw):
@@ -46,16 +53,29 @@ def _parse_tdcm_payload_layout(raw):
             m_actual = struct.unpack_from('<H', raw, off)[0]
             off += 2
             indices_offset = off
-            indices_bytes = m_actual * idx_size
+            if magic == b'TDC2':
+                index_bits = combinatorial_index_bits(K, m_actual)
+                indices_bytes = (index_bits + 7) // 8
+            else:
+                index_bits = m_actual * max(1, math.ceil(math.log2(K)))
+                indices_bytes = m_actual * idx_size
+            if off + indices_bytes > len(raw):
+                raise ValueError('Truncated TDCM index payload')
+            if magic == b'TDC2':
+                rank = int.from_bytes(raw[off:off + indices_bytes], 'little')
+                indices = unrank_combination(rank, K, m_actual)
+            else:
+                indices = [struct.unpack_from(idx_fmt, raw, off + atom * idx_size)[0]
+                           for atom in range(m_actual)]
             signs_offset = indices_offset + indices_bytes
             signs_bytes = (m_actual + 7) // 8
             if signs_offset + signs_bytes > len(raw):
                 raise ValueError('Truncated TDCM index/sign payload')
             key = (step, frame)
             values = []
-            for atom in range(m_actual):
-                index_offset = indices_offset + atom * idx_size
-                index = struct.unpack_from(idx_fmt, raw, index_offset)[0]
+            for atom, index in enumerate(indices):
+                index_offset = (indices_offset + atom * idx_size
+                                if magic == b'TDCM' else None)
                 if index >= K:
                     raise ValueError(f'Invalid codebook index {index} >= K={K}')
                 values.append(index)
@@ -66,13 +86,16 @@ def _parse_tdcm_payload_layout(raw):
                     sign_mask=1 << (atom % 8), frame_key=key,
                 ))
             frame_indices[key] = set(values)
+            payload_bits += index_bits + m_actual
             off = signs_offset + signs_bytes
     if off != len(raw):
         raise ValueError(f'Unexpected {len(raw) - off} trailing TDCM bytes')
     return dict(K=K, M=M, n_sde=n_sde, n_ddim=n_ddim, n_lat=n_lat,
                 seed=seed, num_frames=n_fr, height=height, width=width,
                 slots=slots, frame_indices=frame_indices,
-                bits_per_index=max(1, math.ceil(math.log2(K))))
+                bits_per_index=max(1, math.ceil(math.log2(K))),
+                index_coding=('combinatorial' if magic == b'TDC2' else 'fixed-width'),
+                payload_bits=payload_bits)
 
 
 def select_impact_sign_slots(step_data, codebook, count, step_idx, frame_indices):
@@ -373,9 +396,11 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
         raise ValueError('Serialized stream attack requires count > 0 or rate in (0,1]')
     raw = bytearray(Path(input_path).read_bytes())
     layout = _parse_tdcm_payload_layout(raw)
+    if attack == 'index-bitflip' and layout['index_coding'] == 'combinatorial':
+        raise ValueError('Per-atom index-bitflip is undefined for TDC2 combination ranks; use a sign attack or a legacy TDCM stream')
     slots = layout['slots']
     total_symbols = len(slots)
-    total_payload_bits = total_symbols * (layout['bits_per_index'] + 1)
+    total_payload_bits = layout['payload_bits']
     if early_steps > 0 and target_steps:
         raise ValueError('early_steps and target_steps are mutually exclusive')
     if target_steps:
@@ -638,7 +663,7 @@ def apply_serialized_repetition_disturbance(
     _parse_tdcm_payload_layout(recovered)
 
     total_symbols = len(layout['slots'])
-    total_payload_bits = total_symbols * (layout['bits_per_index'] + 1)
+    total_payload_bits = layout['payload_bits']
     protected_payload_bits = total_payload_bits + redundancy_bits
     return dict(
         attack='sign-bitflip', rate=rate, requested_count=count, seed=seed,
@@ -682,7 +707,9 @@ def apply_codebook_stream_attack(step_data, attack, K, rate=0.0, seed=42,
             for step in step_data]
     total_symbols=sum(len(indices) for step in copied for indices,_ in step)
     bits_per_index=max(1,math.ceil(math.log2(K)))
-    total_payload_bits=total_symbols*(bits_per_index+1)
+    total_payload_bits=sum(
+        combinatorial_index_bits(K, len(indices)) + len(signs)
+        for step in copied for indices, signs in step)
     if defense not in STREAM_DEFENSE_CHOICES:raise ValueError(f'Unknown stream defense: {defense}')
     if defense_steps<1:raise ValueError('defense_steps must be positive')
     if defense_repetitions<3 or defense_repetitions%2!=1:

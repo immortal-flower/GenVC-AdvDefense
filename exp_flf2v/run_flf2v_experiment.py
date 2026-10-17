@@ -946,12 +946,13 @@ def main():
             # BPP 用理论码本比特数 + 两侧边界帧压缩字节数计算。
             # 例如 20 步、尾部 3 步、33 帧时：17 个 SDE 步 × 9 个潜在时间帧。
             # 这里不直接用 .tdcm 文件大小；文件头等封装开销可能使实际文件更大。
-            # K=16384 时索引需 14 bit，另加 1 bit 符号；M=64 时每潜在帧/步=960 bit。
+            # K=16384、M=64 时组合索引需 600 bit，加 64 bit 符号，共 664 bit。
             T_sde, F_lat = pipe.num_sde_steps, pipe.num_latent_frames
-            codebook_bytes = (T_sde * F_lat * pipe.codebook.bits_per_frame_step) // 8
+            codebook_bits = T_sde * F_lat * pipe.codebook.bits_per_frame_step
+            codebook_bytes = (codebook_bits + 7) // 8
             gop_boundary_bytes = gop_first_bytes + last_bytes
             protection_overhead_bits = stream_attack_metadata["protection_overhead_bits"]
-            gop_total_bits = (codebook_bytes + gop_boundary_bytes) * 8 + protection_overhead_bits
+            gop_total_bits = codebook_bits + gop_boundary_bytes * 8 + protection_overhead_bits
             gop_total_bytes = (gop_total_bits + 7) // 8
             # bit / (原 RGB 视频的总像素数)，分母是 33×720×1280，不是潜空间大小。
             bpp = gop_total_bits / (FPG * HEIGHT * WIDTH)
@@ -974,6 +975,7 @@ def main():
                 "MS_SSIM": None if mean_msssim is None else round(mean_msssim, 6),
                 "BPP": round(bpp, 6),
                 "gop_total_bytes": gop_total_bytes,
+                "codebook_bits": codebook_bits,
                 "codebook_bytes": codebook_bytes,
                 "boundary_bytes": gop_boundary_bytes,
                 "protection_overhead_bits": protection_overhead_bits,

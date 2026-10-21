@@ -76,7 +76,7 @@ Write-Host "Jobs: $($jobs.Count); complete: $(($jobs | Where-Object Status -eq '
 
 if($PlanOnly){
     Write-Host '[PLAN ONLY] No model inference was started.'
-    exit 0
+    return
 }
 
 foreach($job in $jobs){
@@ -110,6 +110,11 @@ foreach($job in $jobs){
     if($LASTEXITCODE -ne 0){
         throw "Sensitivity-grid job failed: $($job.RunName)"
     }
+    if(-not (Test-Path -LiteralPath $job.MetricsPath)){
+        throw "Sensitivity-grid job exited without metrics: $($job.RunName)"
+    }
+    $job.Status = 'complete'
+    $jobs | Export-Csv -LiteralPath $manifestPath -NoTypeInformation -Encoding UTF8
 }
 
 & $CondaExe run --no-capture-output -n GVCC-5090 python `

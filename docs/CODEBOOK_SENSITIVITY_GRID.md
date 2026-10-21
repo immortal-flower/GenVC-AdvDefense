@@ -20,11 +20,18 @@ encoded clean codebooks and belongs to the next validation stage.
 
 ## Inspect the job plan
 
+Run the script directly from PowerShell so that list-valued parameters such as
+`Steps` and `Frames` are bound as arrays. If local policy blocks `.ps1` files,
+enable them only for the current terminal first:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+```
+
 The following command creates a 153-row manifest without starting inference:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File ".\exp_flf2v\run_codebook_sensitivity_grid.ps1" `
+& ".\exp_flf2v\run_codebook_sensitivity_grid.ps1" `
   -Field sign -Count 16 -AttackSeeds 42 -PlanOnly
 ```
 
@@ -34,25 +41,22 @@ The manifest is saved under `exp_flf2v/results_720p` and marks each job as
 ## Run the uniform sign-bit grid
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File ".\exp_flf2v\run_codebook_sensitivity_grid.ps1" `
+& ".\exp_flf2v\run_codebook_sensitivity_grid.ps1" `
   -Field sign -Count 16 -AttackSeeds 42
 ```
 
 To test both fields under the same budget:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File ".\exp_flf2v\run_codebook_sensitivity_grid.ps1" `
+& ".\exp_flf2v\run_codebook_sensitivity_grid.ps1" `
   -Field both -Count 16 -AttackSeeds 42
 ```
 
 For a short pipeline check before the full sweep:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File ".\exp_flf2v\run_codebook_sensitivity_grid.ps1" `
-  -Field sign -Count 16 -Steps 1,17 -Frames 0,3,4,8 -AttackSeeds 42
+& ".\exp_flf2v\run_codebook_sensitivity_grid.ps1" `
+  -Field sign -Count 16 -Steps @(1,17) -Frames @(0,3,4,8) -AttackSeeds @(42)
 ```
 
 ## Outputs

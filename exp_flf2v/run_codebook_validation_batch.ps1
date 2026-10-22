@@ -37,3 +37,14 @@ if($PlanOnly){ $runnerArgs += '--plan_only' }
 if($LASTEXITCODE -ne 0){
     throw "Persistent validation batch failed with exit code $LASTEXITCODE"
 }
+
+if(-not $PlanOnly){
+    & $CondaExe run --no-capture-output -n GVCC-5090 python `
+        'exp_flf2v/summarize_codebook_sensitivity_grid.py' `
+        '--results_root' $ResultsRoot `
+        '--sequence' $Sequence `
+        '--clean_metrics' $CleanMetrics
+    if($LASTEXITCODE -ne 0){
+        throw "Validation summary failed with exit code $LASTEXITCODE"
+    }
+}

@@ -89,3 +89,37 @@ The sign and index grids provide an equal-physical-bit comparison. They do not
 yet provide an equal-semantic-change comparison because one index identifies a
 14-bit atom number while one sign contains one bit. A later experiment should
 also compare the fields under an equal number of affected atoms.
+
+## Persistent targeted validation
+
+After the full grid identifies candidate hotspots, use the persistent batch
+runner instead of launching one Python process per cell. It loads Wan2.1 once
+and reuses the reference compression, boundary condition, empty-prompt
+embedding and clean codebook for all validation jobs.
+
+Inspect the default 8-cell x 3-seed plan without loading the model:
+
+```powershell
+& ".\exp_flf2v\run_codebook_validation_batch.ps1" -PlanOnly
+```
+
+Run the 16-bit repeatability validation. Existing seed-42 grid results are
+recognized by their run names and skipped:
+
+```powershell
+& ".\exp_flf2v\run_codebook_validation_batch.ps1" `
+  -Counts @(16) -AttackSeeds @(42,123,2026)
+```
+
+Once repeatability is established, add the 8-bit and 32-bit budgets:
+
+```powershell
+& ".\exp_flf2v\run_codebook_validation_batch.ps1" `
+  -Counts @(8,16,32) -AttackSeeds @(42,123,2026)
+```
+
+The default run omits reconstructed MP4 files because metrics are computed
+from in-memory frames. Add `-SaveVideo` only when qualitative examples are
+needed. Progress is written to
+`validation_batch_manifest_jockey.csv`, and rerunning the same command resumes
+only missing jobs.

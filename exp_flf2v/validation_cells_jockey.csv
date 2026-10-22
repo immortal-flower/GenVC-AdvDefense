@@ -1,0 +1,9 @@
+role,sde_step,latent_position,observed_psnr_drop_db,observed_delta_lpips,rationale
+sensitive,1,3,2.14,0.0305,largest observed degradation
+sensitive,1,4,1.89,0.0350,second-largest and largest LPIPS increase
+sensitive,2,1,1.32,0.0325,independent early-step hotspot
+same-step-control,1,0,-0.19,-0.0015,same SDE step as hotspots but insensitive position
+same-step-control,2,0,-0.23,-0.0017,same SDE step as hotspot but insensitive position
+same-position-control,9,3,-0.04,-0.0007,same latent position as top hotspot at a late step
+same-position-control,9,4,-0.08,-0.0008,same latent position as second hotspot at a late step
+same-position-control,9,1,-0.04,-0.0004,same latent position as third hotspot at a late step

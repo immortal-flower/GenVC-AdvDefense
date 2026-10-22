@@ -250,11 +250,15 @@ def flf2v_encode(pipe, model, gop_frames, flf2v_cond, height, width):
     # 返回两个对象给 main()：码本索引/符号，以及仅编码端使用的真值潜变量。
     return step_data, x0_true
 
-def flf2v_decode(pipe, model, step_data, flf2v_cond):
+def flf2v_decode(pipe, model, step_data, flf2v_cond, prompt_embeds=None):
     # 解码端不调用 encode_video(gop_frames)，也不计算真实残差。
     # step_data 是编码端得到的 [SDE步][潜在时间帧] 列表；每格是一对 (idx,sgn)。
     # 注意本实验函数直接复用内存里的 step_data，没有从 .tdcm 文件再读取一次。
-    embeds = model.encode_prompt("")
+    # Batch validation can reuse the empty-prompt embedding across many
+    # attacked bitstreams. Ordinary callers omit prompt_embeds and preserve
+    # the original one-run behavior.
+    owns_embeds = prompt_embeds is None
+    embeds = model.encode_prompt("") if owns_embeds else prompt_embeds
     model_fn = pipe._model_fn(embeds, flf2v_cond)
     gen = torch.Generator(device="cpu").manual_seed(pipe.seed)
     x_t = torch.randn(1, *pipe.latent_shape, generator=gen).to(pipe.device)
@@ -297,7 +301,9 @@ def flf2v_decode(pipe, model, step_data, flf2v_cond):
     # 采样已结束：把潜变量转到 CPU，为随后占显存较多的 VAE 解码腾空间。
     # 这里的 x_t 是重建出的潜变量，不是 RGB 图片。
     x_t_cpu = x_t.cpu() 
-    del x_t, model_fn, embeds, noise_3d, noise_frames
+    del x_t, model_fn, noise_3d, noise_frames
+    if owns_embeds:
+        del embeds
     gc.collect()
     torch.cuda.empty_cache() 
     

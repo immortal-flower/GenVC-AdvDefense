@@ -126,11 +126,16 @@ def compute_msssim(orig, recon):
     except ImportError:
         return None
 
-def compute_lpips(orig, recon, device="cuda:1"):
+def compute_lpips(orig, recon, device="cuda:1", loss_fn=None):
     # LPIPS-Alex 接受 [-1, 1] 图像，逐帧计算后对整个 GOP 取平均。
     # device="cuda:1" 仅指定此项指标使用 GPU 1，不代表主 DiT 在 GPU 1。
-    import lpips
-    loss_fn = lpips.LPIPS(net='alex').to(device)
+    # 批处理可以传入复用的 CPU loss_fn，避免每个任务都从磁盘重载权重；
+    # 单次实验不传时仍保持原来的独立创建与释放行为。
+    owns_loss_fn = loss_fn is None
+    if owns_loss_fn:
+        import lpips
+        loss_fn = lpips.LPIPS(net='alex')
+    loss_fn = loss_fn.to(device)
     orig_lp = (2.0 * orig - 1.0).to(device)
     recon_lp = (2.0 * recon - 1.0).to(device)
     vals = []
@@ -138,7 +143,10 @@ def compute_lpips(orig, recon, device="cuda:1"):
         with torch.no_grad():
             d = loss_fn(orig_lp[i:i+4], recon_lp[i:i+4])
         vals.extend(d.flatten().cpu().tolist())
-    del loss_fn
+    if owns_loss_fn:
+        del loss_fn
+    else:
+        loss_fn.to("cpu")
     torch.cuda.empty_cache()
     return sum(vals) / len(vals)
 

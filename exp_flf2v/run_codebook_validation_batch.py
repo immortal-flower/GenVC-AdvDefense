@@ -146,6 +146,9 @@ def main():
         first_decoded, last_decoded, args.num_frames, args.height, args.width)
     print("[GVCC-BATCH] Encoding shared empty prompt once...")
     prompt_embeds = model.encode_prompt("")
+    print("[GVCC-BATCH] Loading shared LPIPS metric once on CPU...")
+    import lpips
+    lpips_metric = lpips.LPIPS(net="alex").eval()
 
     cache_dir = output_dir / "_validation_batch_cache" / args.sequence / "gop0"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -184,7 +187,8 @@ def main():
             target_tensor[:n], reconstructed_tensor)
         mean_msssim = compute_msssim(target_tensor[:n], reconstructed_tensor)
         mean_lpips = compute_lpips(
-            target_tensor[:n], reconstructed_tensor, device="cuda:1")
+            target_tensor[:n], reconstructed_tensor, device="cuda:1",
+            loss_fn=lpips_metric)
         codebook_bits = (pipe.num_sde_steps * pipe.num_latent_frames *
                          pipe.codebook.bits_per_frame_step)
         total_bits = codebook_bits + boundary_bytes * 8

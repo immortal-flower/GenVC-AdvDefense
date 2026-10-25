@@ -13,7 +13,15 @@ def test_run_name_parser():
         "sensitivity_grid_sign16_step17_frame8_aseed123_jockey"
     )
     assert match is not None
-    assert match.groups() == ("sign", "16", "17", "8", "123", "jockey")
+    assert match.groups() == ("sign", "16", "17", "8", "123", None, "jockey")
+
+
+def test_run_name_parser_with_gop():
+    match = MODULE.RUN_RE.fullmatch(
+        "sensitivity_grid_sign16_step1_frame3_aseed42_gop2_jockey"
+    )
+    assert match is not None
+    assert match.groups() == ("sign", "16", "1", "3", "42", "2", "jockey")
 
 
 def test_run_name_parser_rejects_old_one_dimensional_sweep():

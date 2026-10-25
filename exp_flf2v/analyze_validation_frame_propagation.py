@@ -52,7 +52,8 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def collect_runs(results_root: Path, sequence: str, plan: Path, count: int,
-                 attack_seeds: list[int], clean_metrics: Path):
+                 attack_seeds: list[int], clean_metrics: Path,
+                 gop_index: int = 0):
     clean = load_json(clean_metrics)
     clean_frames = clean.get("per_frame_PSNR_dB")
     if not clean_frames:
@@ -63,8 +64,8 @@ def collect_runs(results_root: Path, sequence: str, plan: Path, count: int,
     detail = []
     missing = []
     for job in jobs:
-        metrics_path = (results_root / job.run_name(sequence) / sequence /
-                        "gop0" / "metrics.json")
+        metrics_path = (results_root / job.run_name(sequence, gop_index) /
+                        sequence / f"gop{gop_index}" / "metrics.json")
         if not metrics_path.exists():
             missing.append(str(metrics_path))
             continue
@@ -89,7 +90,7 @@ def collect_runs(results_root: Path, sequence: str, plan: Path, count: int,
                 "clean_psnr_db": clean_psnr,
                 "attacked_psnr_db": float(attacked_psnr),
                 "psnr_loss_db": clean_psnr - float(attacked_psnr),
-                "run_name": job.run_name(sequence),
+                "run_name": job.run_name(sequence, gop_index),
             })
     return detail, missing, len(clean_frames)
 
@@ -229,6 +230,7 @@ def main() -> None:
                         default=Path("exp_flf2v/results_720p/"
                                      "sensitivity_clean_redecode/Jockey/gop0/metrics.json"))
     parser.add_argument("--count", type=int, default=16)
+    parser.add_argument("--gop_index", type=int, default=0)
     parser.add_argument("--attack_seeds", type=int, nargs="+",
                         default=[42, 123, 2026])
     parser.add_argument("--output_prefix", default="validation_propagation")
@@ -236,13 +238,14 @@ def main() -> None:
 
     detail, missing, num_frames = collect_runs(
         args.results_root, args.sequence, args.plan, args.count,
-        args.attack_seeds, args.clean_metrics)
+        args.attack_seeds, args.clean_metrics, args.gop_index)
     if not detail:
         raise FileNotFoundError("No complete validation runs were found")
     frame_rows = aggregate_frames(detail)
     cell_rows = summarize_cells(detail, num_frames)
     sequence_tag = args.sequence.lower()
-    prefix = args.results_root / f"{args.output_prefix}_{sequence_tag}"
+    gop_tag = "" if args.gop_index == 0 else f"_gop{args.gop_index}"
+    prefix = args.results_root / f"{args.output_prefix}_{sequence_tag}{gop_tag}"
     detail_path = Path(f"{prefix}_detail.csv")
     frames_path = Path(f"{prefix}_per_frame.csv")
     cells_path = Path(f"{prefix}_cells.csv")
@@ -253,7 +256,8 @@ def main() -> None:
     write_csv(cells_path, cell_rows)
     plotted = plot_pairs(frame_rows, plot_path, num_frames)
     with summary_path.open("w", encoding="utf-8") as handle:
-        json.dump({"sequence": args.sequence, "requested_bits": args.count,
+        json.dump({"sequence": args.sequence, "gop": args.gop_index,
+                   "requested_bits": args.count,
                    "attack_seeds": args.attack_seeds, "num_output_frames": num_frames,
                    "missing": missing, "cells": cell_rows}, handle, indent=2)
 

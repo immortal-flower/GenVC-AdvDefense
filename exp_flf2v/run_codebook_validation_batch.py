@@ -56,6 +56,8 @@ def parse_args():
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--num_frames", type=int, default=33)
+    parser.add_argument("--gop_index", type=int, default=0,
+                        help="Zero-based source GOP; adjacent GOPs overlap by one frame")
     parser.add_argument("--K", type=int, default=16384)
     parser.add_argument("--M", type=int, default=64)
     parser.add_argument("--steps", type=int, default=20)
@@ -71,13 +73,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def write_manifest(path, jobs, sequence, output_dir):
+def write_manifest(path, jobs, sequence, output_dir, gop_index=0):
     fields = ["run_name", "role", "count", "sde_step", "latent_position",
               "attack_seed", "status", "metrics_path"]
     rows = []
     for job in jobs:
-        name = job.run_name(sequence)
-        metrics = output_dir / name / sequence / "gop0" / "metrics.json"
+        name = job.run_name(sequence, gop_index)
+        metrics = (output_dir / name / sequence / f"gop{gop_index}" /
+                   "metrics.json")
         rows.append({
             "run_name": name, "role": job.role, "count": job.count,
             "sde_step": job.step, "latent_position": job.frame,
@@ -95,12 +98,17 @@ def write_manifest(path, jobs, sequence, output_dir):
 
 def main():
     args = parse_args()
+    if args.gop_index < 0:
+        raise ValueError("--gop_index must be non-negative")
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
     output_dir = Path(args.output_dir)
     cells = load_cells(args.plan)
     jobs = expand_jobs(cells, args.counts, args.attack_seeds)
-    manifest_path = output_dir / f"validation_batch_manifest_{args.sequence.lower()}.csv"
-    manifest_rows = write_manifest(manifest_path, jobs, args.sequence, output_dir)
+    gop_tag = "" if args.gop_index == 0 else f"_gop{args.gop_index}"
+    manifest_path = output_dir / (
+        f"validation_batch_manifest_{args.sequence.lower()}{gop_tag}.csv")
+    manifest_rows = write_manifest(
+        manifest_path, jobs, args.sequence, output_dir, args.gop_index)
     complete = sum(row["status"] == "complete" for row in manifest_rows)
     print(f"Validation jobs: {len(jobs)}; complete: {complete}; "
           f"pending: {len(jobs) - complete}")
@@ -115,8 +123,11 @@ def main():
     with clean_metrics_path.open(encoding="utf-8") as handle:
         clean_metrics = json.load(handle)
 
+    source_start_frame = args.gop_index * (args.num_frames - 1)
     frames = resize_frames(
-        load_yuv420_frames(args.data, args.num_frames), args.width, args.height)
+        load_yuv420_frames(args.data, args.num_frames,
+                           start_frame=source_start_frame),
+        args.width, args.height)
     if len(frames) != args.num_frames:
         raise ValueError(f"Expected {args.num_frames} frames, found {len(frames)}")
     first_decoded, first_bytes = compress_boundary_frame(
@@ -150,7 +161,8 @@ def main():
     import lpips
     lpips_metric = lpips.LPIPS(net="alex").eval()
 
-    cache_dir = output_dir / "_validation_batch_cache" / args.sequence / "gop0"
+    cache_dir = (output_dir / "_validation_batch_cache" / args.sequence /
+                 f"gop{args.gop_index}")
     cache_dir.mkdir(parents=True, exist_ok=True)
     canonical_clean = cache_dir / "codebook_clean.tdcm"
     pipe.save_compressed(clean_step_data, str(canonical_clean))
@@ -162,7 +174,8 @@ def main():
         print("=" * 88)
         print(f"[RUN {index}/{len(jobs)}] role={job.role} step={job.step} "
               f"latent={job.frame} count={job.count} attack_seed={job.attack_seed}")
-        run_dir = output_dir / row["run_name"] / args.sequence / "gop0"
+        run_dir = (output_dir / row["run_name"] / args.sequence /
+                   f"gop{args.gop_index}")
         run_dir.mkdir(parents=True, exist_ok=True)
         clean_path = run_dir / "codebook_clean.tdcm"
         attacked_path = run_dir / "codebook.tdcm"
@@ -194,7 +207,7 @@ def main():
         total_bits = codebook_bits + boundary_bytes * 8
         result = {
             "sequence": args.sequence,
-            "gop": 0,
+            "gop": args.gop_index,
             "batch_role": job.role,
             "stream_attack": attack_metadata,
             "PSNR_dB": round(mean_psnr, 2),
@@ -216,7 +229,8 @@ def main():
         with (run_dir / "metrics.json").open("w", encoding="utf-8") as handle:
             json.dump(result, handle, indent=2)
         row["status"] = "complete"
-        write_manifest(manifest_path, jobs, args.sequence, output_dir)
+        write_manifest(manifest_path, jobs, args.sequence, output_dir,
+                       args.gop_index)
         print(f"[DONE] PSNR={mean_psnr:.2f} dB, LPIPS={mean_lpips:.4f}, "
               f"decode={decode_seconds:.1f}s")
         del reconstructed, reconstructed_tensor, attacked_step_data

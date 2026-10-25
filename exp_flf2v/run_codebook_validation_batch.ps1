@@ -8,6 +8,7 @@ param(
     [string]$CleanCodebook = 'exp_flf2v/results_720p/codebook_sign_bitflip_rate0p02_step1/Jockey/gop0/codebook_clean.tdcm',
     [string]$CleanMetrics = 'exp_flf2v/results_720p/sensitivity_clean_redecode/Jockey/gop0/metrics.json',
     [string]$Plan = 'exp_flf2v/validation_cells_jockey.csv',
+    [int]$SourceGop = 0,
     [switch]$SaveVideo,
     [switch]$PlanOnly
 )
@@ -25,6 +26,7 @@ $runnerArgs = @(
     '--output_dir',$ResultsRoot,
     '--clean_codebook',$CleanCodebook,
     '--clean_metrics',$CleanMetrics,
+    '--gop_index',[string]$SourceGop,
     '--counts'
 )
 $runnerArgs += $Counts | ForEach-Object { [string]$_ }
@@ -43,6 +45,7 @@ if(-not $PlanOnly){
         'exp_flf2v/summarize_codebook_sensitivity_grid.py' `
         '--results_root' $ResultsRoot `
         '--sequence' $Sequence `
+        '--gop_index' $SourceGop `
         '--clean_metrics' $CleanMetrics
     if($LASTEXITCODE -ne 0){
         throw "Validation summary failed with exit code $LASTEXITCODE"

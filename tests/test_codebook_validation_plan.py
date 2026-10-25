@@ -25,6 +25,9 @@ class ValidationPlanTests(unittest.TestCase):
         self.assertEqual(jobs[0].run_name("Jockey"),
                          "sensitivity_grid_sign16_step1_frame3_aseed42_jockey")
         self.assertEqual(jobs[-1].attack_seed, 2026)
+        self.assertEqual(
+            jobs[0].run_name("Jockey", 2),
+            "sensitivity_grid_sign16_step1_frame3_aseed42_gop2_jockey")
 
     def test_duplicate_cells_are_rejected(self):
         with self.temporary_directory() as directory:

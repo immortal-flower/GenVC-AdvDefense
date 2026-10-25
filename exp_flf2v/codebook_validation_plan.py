@@ -13,11 +13,12 @@ class ValidationJob:
     count: int
     attack_seed: int
 
-    def run_name(self, sequence: str) -> str:
+    def run_name(self, sequence: str, gop_index: int = 0) -> str:
         tag = "".join(ch.lower() if ch.isalnum() or ch in "_-" else "_"
                       for ch in sequence)
+        gop_tag = "" if gop_index == 0 else f"_gop{gop_index}"
         return (f"sensitivity_grid_sign{self.count}_step{self.step}_"
-                f"frame{self.frame}_aseed{self.attack_seed}_{tag}")
+                f"frame{self.frame}_aseed{self.attack_seed}{gop_tag}_{tag}")
 
 
 def load_cells(path):

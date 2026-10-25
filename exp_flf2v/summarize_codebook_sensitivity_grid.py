@@ -17,7 +17,8 @@ from pathlib import Path
 
 
 RUN_RE = re.compile(
-    r"sensitivity_grid_(sign|index)(\d+)_step(\d+)_frame(\d+)_aseed(\d+)_([a-z0-9_-]+)$"
+    r"sensitivity_grid_(sign|index)(\d+)_step(\d+)_frame(\d+)_aseed(\d+)"
+    r"(?:_gop(\d+))?_([a-z0-9_-]+)$"
 )
 
 
@@ -45,6 +46,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results_root", type=Path, default=Path("exp_flf2v/results_720p"))
     parser.add_argument("--sequence", default="Jockey")
+    parser.add_argument("--gop_index", type=int, default=0)
     parser.add_argument("--clean_metrics", type=Path, required=True)
     parser.add_argument("--output_prefix", default="sensitivity_grid")
     args = parser.parse_args()
@@ -61,10 +63,14 @@ def main() -> None:
         if not run_dir.is_dir():
             continue
         match = RUN_RE.fullmatch(run_dir.name)
-        if not match or match.group(6) != sequence_tag:
+        if not match:
             continue
-        field, count, step, frame, attack_seed, _ = match.groups()
-        metrics_path = run_dir / args.sequence / "gop0" / "metrics.json"
+        field, count, step, frame, attack_seed, encoded_gop, encoded_sequence = match.groups()
+        run_gop = int(encoded_gop or 0)
+        if encoded_sequence != sequence_tag or run_gop != args.gop_index:
+            continue
+        metrics_path = (run_dir / args.sequence / f"gop{run_gop}" /
+                        "metrics.json")
         if not metrics_path.exists():
             continue
         metrics = load_json(metrics_path)
@@ -76,7 +82,7 @@ def main() -> None:
         rows.append(
             {
                 "sequence": args.sequence,
-                "gop": 0,
+                "gop": run_gop,
                 "field": field,
                 "sde_step": int(step),
                 "latent_position": int(frame),
@@ -104,7 +110,9 @@ def main() -> None:
     rows.sort(key=lambda row: (row["field"], row["requested_bits"], row["attack_seed"],
                                row["sde_step"], row["latent_position"]))
 
-    tidy_path = args.results_root / f"{args.output_prefix}_{sequence_tag}_tidy.csv"
+    gop_tag = "" if args.gop_index == 0 else f"_gop{args.gop_index}"
+    output_stem = f"{args.output_prefix}_{sequence_tag}{gop_tag}"
+    tidy_path = args.results_root / f"{output_stem}_tidy.csv"
     write_csv(tidy_path, rows, list(rows[0]))
 
     grouped: dict[tuple, list[dict]] = defaultdict(list)
@@ -128,7 +136,7 @@ def main() -> None:
                 "delta_lpips_std": statistics.pstdev(lpips_delta),
             }
         )
-    aggregate_path = args.results_root / f"{args.output_prefix}_{sequence_tag}_aggregate.csv"
+    aggregate_path = args.results_root / f"{output_stem}_aggregate.csv"
     write_csv(aggregate_path, aggregate, list(aggregate[0]))
 
     for (field, count, attack_seed), seed_rows in sorted(
@@ -139,11 +147,11 @@ def main() -> None:
         values = {(row["sde_step"], row["latent_position"]): round(row["psnr_drop_db"], 6)
                   for row in seed_rows}
         matrix_path = args.results_root / (
-            f"{args.output_prefix}_{sequence_tag}_{field}{count}_aseed{attack_seed}_psnr_drop.csv"
+            f"{output_stem}_{field}{count}_aseed{attack_seed}_psnr_drop.csv"
         )
         write_matrix(matrix_path, values)
 
-    json_path = args.results_root / f"{args.output_prefix}_{sequence_tag}_summary.json"
+    json_path = args.results_root / f"{output_stem}_summary.json"
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(
             {

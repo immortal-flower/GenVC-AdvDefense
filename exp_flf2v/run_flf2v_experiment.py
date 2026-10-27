@@ -373,6 +373,11 @@ def main():
     parser.add_argument("--stream_attack_early_steps", type=int, default=0,
                         help="Restrict corruption to the first N SDE steps; 0 means all")
     parser.add_argument("--stream_attack_seed", type=int, default=42)
+    parser.add_argument("--stream_attack_rank_region",
+                        choices=["all", "low", "middle", "high"], default="all",
+                        help="Eligible third of a TDC2 combination rank for rank-bitflip")
+    parser.add_argument("--stream_attack_rank_bits", type=int, nargs="*", default=None,
+                        help="Exact zero-based TDC2 rank bits; requires one target step/frame")
     parser.add_argument("--stream_attack_trajectory_trials", type=int, default=8,
                         help="Forward-only candidate probes for sign-trajectory-bitflip")
     parser.add_argument("--stream_attack_trajectory_pool_factor", type=float, default=2.0,
@@ -463,6 +468,18 @@ def main():
             parser.error("Ranked sign attacks require at least one target latent frame")
     if args.stream_attack == "sign-trajectory-bitflip" and args.stream_attack_target_steps != [1]:
         parser.error("sign-trajectory-bitflip currently supports only --stream_attack_target_steps 1")
+    if args.stream_attack == "rank-bitflip":
+        if args.stream_attack_transport != "serialized":
+            parser.error("rank-bitflip requires --stream_attack_transport serialized")
+        if args.stream_defense != "none":
+            parser.error("rank-bitflip currently requires --stream_defense none")
+        if args.stream_attack_rank_bits is not None:
+            if len(args.stream_attack_rank_bits) == 0:
+                parser.error("--stream_attack_rank_bits requires at least one bit")
+            if not args.stream_attack_target_steps or len(args.stream_attack_target_steps) != 1:
+                parser.error("Explicit rank bits require one target SDE step")
+            if not args.stream_attack_target_frames or len(args.stream_attack_target_frames) != 1:
+                parser.error("Explicit rank bits require one target latent position")
     if args.stream_attack_trajectory_trials < 1:
         parser.error("--stream_attack_trajectory_trials must be positive")
     if args.stream_attack_trajectory_pool_factor < 1.0:
@@ -853,6 +870,8 @@ def main():
                     target_frames=args.stream_attack_target_frames,
                     selected_slots=impact_slots,
                     selection_metadata=impact_metadata,
+                    rank_region=args.stream_attack_rank_region,
+                    rank_bits=args.stream_attack_rank_bits,
                 )
                 # 重新走正式反序列化器；解码器看到的内容完全来自受损文件。
                 decode_step_data = TurboBitstream.load(str(attacked_path))["step_data"]

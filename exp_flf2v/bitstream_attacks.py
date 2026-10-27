@@ -11,7 +11,7 @@ from sde_rf_wan.turbo_codebook import (
 )
 
 
-STREAM_ATTACK_CHOICES = ['none', 'index-bitflip', 'sign-bitflip',
+STREAM_ATTACK_CHOICES = ['none', 'index-bitflip', 'rank-bitflip', 'sign-bitflip',
                          'sign-impact-bitflip', 'sign-trajectory-bitflip']
 STREAM_DEFENSE_CHOICES = ['none', 'sign-repetition3', 'sign-repetition']
 STREAM_DEFENSE_ATTACK_MODE_CHOICES = ['random', 'adaptive-pairs',
@@ -44,6 +44,7 @@ def _parse_tdcm_payload_layout(raw):
     idx_size = 2 if K <= 65536 else 4
     idx_fmt = '<H' if idx_size == 2 else '<I'
     slots = []
+    rank_entries = []
     frame_indices = {}
     payload_bits = 0
     for step in range(n_sde):
@@ -64,6 +65,12 @@ def _parse_tdcm_payload_layout(raw):
             if magic == b'TDC2':
                 rank = int.from_bytes(raw[off:off + indices_bytes], 'little')
                 indices = unrank_combination(rank, K, m_actual)
+                rank_entries.append(dict(
+                    step=step, frame=frame, m_actual=m_actual,
+                    rank=rank, rank_offset=indices_offset,
+                    rank_bits=index_bits, rank_bytes=indices_bytes,
+                    indices=list(indices),
+                ))
             else:
                 indices = [struct.unpack_from(idx_fmt, raw, off + atom * idx_size)[0]
                            for atom in range(m_actual)]
@@ -93,6 +100,7 @@ def _parse_tdcm_payload_layout(raw):
     return dict(K=K, M=M, n_sde=n_sde, n_ddim=n_ddim, n_lat=n_lat,
                 seed=seed, num_frames=n_fr, height=height, width=width,
                 slots=slots, frame_indices=frame_indices,
+                rank_entries=rank_entries,
                 bits_per_index=max(1, math.ceil(math.log2(K))),
                 index_coding=('combinatorial' if magic == b'TDC2' else 'fixed-width'),
                 payload_bits=payload_bits)
@@ -379,7 +387,8 @@ def select_trajectory_sign_slots(step_data, codebook, count, step_idx,
 def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
                                      seed=42, early_steps=0, count=0,
                                      target_steps=None, target_frames=None,
-                                     selected_slots=None, selection_metadata=None):
+                                     selected_slots=None, selection_metadata=None,
+                                     rank_region='all', rank_bits=None):
     """Flip real bits in a serialized ``.tdcm`` payload and write a new file.
 
     Only index bytes or packed sign bytes are eligible.  Header fields,
@@ -387,9 +396,9 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
     experiment measures codebook-trajectory sensitivity rather than parser
     failure.  Index flips are constrained to valid, unique codebook indices.
     """
-    if attack not in ('index-bitflip', 'sign-bitflip', 'sign-impact-bitflip',
+    if attack not in ('index-bitflip', 'rank-bitflip', 'sign-bitflip', 'sign-impact-bitflip',
                       'sign-trajectory-bitflip'):
-        raise ValueError('Serialized attack requires index-bitflip or sign-bitflip')
+        raise ValueError('Unknown serialized codebook attack')
     if count < 0:
         raise ValueError('Serialized stream attack count cannot be negative')
     if count == 0 and not 0 < rate <= 1:
@@ -398,6 +407,10 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
     layout = _parse_tdcm_payload_layout(raw)
     if attack == 'index-bitflip' and layout['index_coding'] == 'combinatorial':
         raise ValueError('Per-atom index-bitflip is undefined for TDC2 combination ranks; use a sign attack or a legacy TDCM stream')
+    if attack == 'rank-bitflip' and layout['index_coding'] != 'combinatorial':
+        raise ValueError('rank-bitflip requires a TDC2 combinatorial stream')
+    if rank_region not in ('all', 'low', 'middle', 'high'):
+        raise ValueError(f'Unknown rank bit region: {rank_region}')
     slots = layout['slots']
     total_symbols = len(slots)
     total_payload_bits = layout['payload_bits']
@@ -420,11 +433,49 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
         frame_ids = set(range(layout['n_lat']))
     eligible = [slot for slot in slots
                 if slot['step'] in step_ids and slot['frame'] in frame_ids]
-    requested = int(count) if count > 0 else max(1, int(round(total_symbols * rate)))
-    if requested > len(eligible):
-        raise ValueError(f'Requested {requested} flips but only {len(eligible)} symbols are eligible')
     rng = np.random.default_rng(seed)
-    if selected_slots is not None:
+    if attack == 'rank-bitflip':
+        eligible_entries = [entry for entry in layout['rank_entries']
+                            if entry['step'] in step_ids and entry['frame'] in frame_ids]
+        candidates = []
+        for entry in eligible_entries:
+            width = entry['rank_bits']
+            boundaries = (0, width // 3, 2 * width // 3, width)
+            regions = dict(low=(boundaries[0], boundaries[1]),
+                           middle=(boundaries[1], boundaries[2]),
+                           high=(boundaries[2], boundaries[3]),
+                           all=(0, width))
+            lo, hi = regions[rank_region]
+            for bit in range(lo, hi):
+                changed_rank = entry['rank'] ^ (1 << bit)
+                if changed_rank < math.comb(layout['K'], entry['m_actual']):
+                    candidates.append((entry, bit, changed_rank))
+        if rank_bits is not None:
+            explicit = sorted({int(bit) for bit in rank_bits})
+            if len(eligible_entries) != 1:
+                raise ValueError('Explicit rank bits require exactly one target step/frame entry')
+            candidate_by_bit = {bit: (item, bit, changed_rank)
+                                for item, bit, changed_rank in candidates}
+            missing = [bit for bit in explicit if bit not in candidate_by_bit]
+            if missing:
+                raise ValueError(f'Explicit rank bits are outside the selected region or produce invalid ranks: {missing}')
+            chosen_rank = [candidate_by_bit[bit] for bit in explicit]
+            requested = len(chosen_rank)
+            if count > 0 and count != requested:
+                raise ValueError('stream_attack_count must equal the number of explicit rank bits')
+        else:
+            requested = int(count) if count > 0 else max(1, int(round(len(candidates) * rate)))
+            if requested > len(candidates):
+                raise ValueError(f'Requested {requested} flips but only {len(candidates)} valid rank bits are eligible')
+            chosen_ids = rng.choice(len(candidates), size=requested, replace=False)
+            chosen_rank = [candidates[int(i)] for i in chosen_ids]
+        chosen = []
+    else:
+        requested = int(count) if count > 0 else max(1, int(round(total_symbols * rate)))
+        if requested > len(eligible):
+            raise ValueError(f'Requested {requested} flips but only {len(eligible)} symbols are eligible')
+        chosen_rank = []
+    if attack != 'rank-bitflip' and selected_slots is not None:
         if attack not in ('sign-impact-bitflip', 'sign-trajectory-bitflip'):
             raise ValueError('Explicit selected_slots require a ranked sign attack')
         selected_set = {tuple(slot) for slot in selected_slots}
@@ -432,10 +483,28 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
                   if (slot['step'], slot['frame'], slot['atom']) in selected_set]
         if len(chosen) != len(selected_set) or len(chosen) != requested:
             raise ValueError('Impact-selected slots do not match eligible serialized slots/count')
-    else:
+    elif attack != 'rank-bitflip':
         chosen = rng.choice(len(eligible), size=requested, replace=False)
     examples = []
     occupied = {key: set(values) for key, values in layout['frame_indices'].items()}
+    changed_symbols = 0
+    for entry, bit, new_rank in chosen_rank:
+        old_indices = entry['indices']
+        new_indices = unrank_combination(new_rank, layout['K'], entry['m_actual'])
+        removed = sorted(set(old_indices) - set(new_indices))
+        added = sorted(set(new_indices) - set(old_indices))
+        replaced = len(removed)
+        changed_symbols += replaced
+        byte_offset = entry['rank_offset'] + bit // 8
+        raw[byte_offset] ^= 1 << (bit % 8)
+        if len(examples) < 20:
+            examples.append(dict(
+                step=entry['step'], frame=entry['frame'], flipped_bit=bit,
+                rank_region=rank_region, old_rank=entry['rank'], new_rank=new_rank,
+                replaced_atoms=replaced, shared_atoms=entry['m_actual'] - replaced,
+                removed_indices=removed, added_indices=added,
+                byte_offset=byte_offset, bit_in_byte=bit % 8,
+            ))
     for slot_id in chosen:
         slot = eligible[int(slot_id)]
         detail = dict(step=slot['step'], frame=slot['frame'], atom=slot['atom'])
@@ -470,6 +539,7 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
                           bit_in_byte=flipped_bit % 8)
         if len(examples) < 20:
             examples.append(detail)
+        changed_symbols += 1
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_bytes(bytes(raw))
     return dict(
@@ -479,13 +549,15 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
         defense='none', defense_steps=0, transport='serialized-tdcm',
         total_symbols=total_symbols, total_payload_bits=total_payload_bits,
         protection_overhead_bits=0, protected_payload_bits=total_payload_bits,
-        channel_flipped_bits=requested, changed_symbols=requested,
+        channel_flipped_bits=requested, changed_symbols=changed_symbols,
         changed_bits=requested, corrected_logical_symbols=0,
         payload_BER=requested / total_payload_bits,
         requested_symbol_rate=requested / total_symbols,
         eligible_symbols=len(eligible), examples=examples,
         input_path=str(input_path), output_path=str(output_path),
         defense_model='none', selection_metadata=selection_metadata,
+        rank_region=(rank_region if attack == 'rank-bitflip' else None),
+        explicit_rank_bits=(list(rank_bits) if rank_bits is not None else None),
     )
 
 

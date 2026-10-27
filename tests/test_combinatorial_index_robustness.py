@@ -1,4 +1,5 @@
 import importlib.util
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +38,29 @@ class CombinatorialIndexRobustnessTest(unittest.TestCase):
             path = Path(tmp) / "result.csv"
             MODULE.write_csv(path, [{"a": 1, "b": 2}])
             self.assertIn("a,b", path.read_text(encoding="utf-8-sig"))
+
+    def test_legacy_tdcm_indices_can_be_analyzed_as_tdc2_subset(self):
+        indices = [1, 4, 8]
+        signs = [1, -1, 1]
+        data = bytearray(b"TDCM")
+        data.extend(struct.pack("<10I", 10, 3, 1, 0, 1, 42, 3,
+                                9, 16, 24))
+        data.extend(struct.pack("<I", 0))
+        data.extend(struct.pack("<3I", 2, 3, 4))
+        data.extend(struct.pack("<H", len(indices)))
+        for index in indices:
+            data.extend(struct.pack("<H", index))
+        packed_signs = sum((sign > 0) << bit
+                           for bit, sign in enumerate(signs))
+        data.append(packed_signs)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.tdcm"
+            path.write_bytes(data)
+            K, M, source_format, records = MODULE.read_codebook_records(path)
+        self.assertEqual((K, M, source_format), (10, 3, "TDCM"))
+        self.assertEqual(records[0]["indices"], indices)
+        self.assertEqual(records[0]["rank"],
+                         MODULE.rank_combination(indices, K))
 
 
 if __name__ == "__main__":

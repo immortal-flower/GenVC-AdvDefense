@@ -59,10 +59,17 @@ def unrank_combination(rank: int, K: int, M: int) -> List[int]:
     return result
 
 
-def read_tdc2_records(path: Path) -> Tuple[int, int, List[Dict[str, object]]]:
+def read_codebook_records(
+        path: Path) -> Tuple[int, int, str, List[Dict[str, object]]]:
+    """Read real index subsets from either legacy TDCM or current TDC2.
+
+    A legacy stream is still useful here: its selected index subsets are
+    ranked exactly as TDC2 would rank them, so no GPU re-encode is required.
+    """
     raw = path.read_bytes()
-    if raw[:4] != b"TDC2":
-        raise ValueError(f"Expected a TDC2 stream, got {raw[:4]!r}")
+    magic = raw[:4]
+    if magic not in (b"TDCM", b"TDC2"):
+        raise ValueError(f"Expected a TDCM/TDC2 stream, got {magic!r}")
     if len(raw) < 48:
         raise ValueError("Truncated TDC2 header")
     K, M, n_sde, _n_ddim, n_lat, _seed, ndim, *_ = \
@@ -77,15 +84,32 @@ def read_tdc2_records(path: Path) -> Tuple[int, int, List[Dict[str, object]]]:
                 raise ValueError("Truncated TDC2 payload before M_actual")
             m_actual = struct.unpack_from("<H", raw, off)[0]
             off += 2
-            rank_bits = combinatorial_index_bits(K, m_actual)
-            rank_bytes = (rank_bits + 7) // 8
-            if off + rank_bytes > len(raw):
-                raise ValueError("Truncated TDC2 combination rank")
-            rank = int.from_bytes(raw[off:off + rank_bytes], "little")
-            off += rank_bytes
-            if rank >= math.comb(K, m_actual):
-                raise ValueError(f"Invalid clean rank at step={step}, latent={latent}")
-            indices = unrank_combination(rank, K, m_actual)
+            if magic == b"TDC2":
+                rank_bits = combinatorial_index_bits(K, m_actual)
+                rank_bytes = (rank_bits + 7) // 8
+                if off + rank_bytes > len(raw):
+                    raise ValueError("Truncated TDC2 combination rank")
+                rank = int.from_bytes(raw[off:off + rank_bytes], "little")
+                off += rank_bytes
+                if rank >= math.comb(K, m_actual):
+                    raise ValueError(
+                        f"Invalid clean rank at step={step}, latent={latent}")
+                indices = unrank_combination(rank, K, m_actual)
+            else:
+                index_bytes = 2 if K <= 65536 else 4
+                payload_bytes = m_actual * index_bytes
+                if off + payload_bytes > len(raw):
+                    raise ValueError("Truncated TDCM independent indices")
+                indices = [int.from_bytes(
+                    raw[off + atom * index_bytes:
+                        off + (atom + 1) * index_bytes], "little")
+                    for atom in range(m_actual)]
+                off += payload_bytes
+                if indices != sorted(indices) or len(set(indices)) != len(indices):
+                    raise ValueError(
+                        f"Legacy indices are not a sorted subset at "
+                        f"step={step}, latent={latent}")
+                rank = rank_combination(indices, K)
             sign_bytes = (m_actual + 7) // 8
             if off + sign_bytes > len(raw):
                 raise ValueError("Truncated TDC2 sign payload")
@@ -94,7 +118,7 @@ def read_tdc2_records(path: Path) -> Tuple[int, int, List[Dict[str, object]]]:
                                 rank=rank, indices=indices))
     if off != len(raw):
         raise ValueError(f"Unexpected {len(raw) - off} trailing bytes")
-    return K, M, records
+    return K, M, magic.decode("ascii"), records
 
 
 def choose_bits(width: int, per_region: int, rng: random.Random) -> List[Tuple[str, int]]:
@@ -216,7 +240,8 @@ def main() -> None:
     args = parser.parse_args()
     rng = random.Random(args.seed)
     if args.bitstream:
-        K, _header_m, all_records = read_tdc2_records(args.bitstream)
+        K, _header_m, source_format, all_records = \
+            read_codebook_records(args.bitstream)
         if args.samples < len(all_records):
             records = rng.sample(all_records, args.samples)
         else:
@@ -231,6 +256,7 @@ def main() -> None:
                                 rank=rank_combination(indices, K),
                                 indices=indices))
         source = "synthetic"
+        source_format = "synthetic"
     rows = analyze(records, K, args.bits_per_region, args.seed)
     region_summary = aggregate(rows, "region")
     bit_summary = aggregate(rows, "bit")
@@ -244,6 +270,7 @@ def main() -> None:
     write_csv(bit_path, bit_summary)
     summary = {
         "source": source,
+        "source_format": source_format,
         "K": K,
         "samples": len(records),
         "bits_per_region": args.bits_per_region,
@@ -260,7 +287,8 @@ def main() -> None:
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print("Combinatorial rank single-bit error propagation")
-    print(f"Source: {source}; K={K}; samples={len(records)}; attempts={len(rows)}")
+    print(f"Source: {source} ({source_format}); K={K}; "
+          f"samples={len(records)}; attempts={len(rows)}")
     print("Region  InvalidRank  MeanReplaced  P95Replaced  MaxReplaced  MeanJaccard")
     for item in region_summary:
         mean = item["replaced_atoms_mean"]

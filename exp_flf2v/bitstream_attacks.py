@@ -13,7 +13,8 @@ from sde_rf_wan.turbo_codebook import (
 
 STREAM_ATTACK_CHOICES = ['none', 'index-bitflip', 'rank-bitflip', 'sign-bitflip',
                          'sign-impact-bitflip', 'sign-trajectory-bitflip']
-STREAM_DEFENSE_CHOICES = ['none', 'sign-repetition3', 'sign-repetition']
+STREAM_DEFENSE_CHOICES = ['none', 'sign-repetition3', 'sign-repetition',
+                          'rank-repetition']
 STREAM_DEFENSE_ATTACK_MODE_CHOICES = ['random', 'adaptive-pairs',
                                       'contiguous-burst']
 STREAM_TRANSPORT_CHOICES = ['logical', 'serialized', 'protected-serialized']
@@ -22,6 +23,12 @@ _REPETITION_MAGIC = b'TDRP'
 _REPETITION_VERSION = 1
 _REPETITION_HEADER_FORMAT = '<4sIIIIQ'
 _REPETITION_HEADER_SIZE = struct.calcsize(_REPETITION_HEADER_FORMAT)
+
+_RANK_REPETITION_MAGIC = b'TDR2'
+_RANK_REPETITION_VERSION = 1
+_RANK_REPETITION_HEADER_FORMAT = '<4sBBBBIII'
+_RANK_REPETITION_HEADER_SIZE = struct.calcsize(
+    _RANK_REPETITION_HEADER_FORMAT)
 
 
 def _parse_tdcm_payload_layout(raw):
@@ -760,6 +767,234 @@ def apply_serialized_repetition_disturbance(
         protected_disturbed_path=str(protected_disturbed_path),
         recovered_path=str(recovered_path),
         defense_model='serialized odd-repetition majority protection',
+    )
+
+
+def apply_serialized_rank_repetition_disturbance(
+        input_path, protected_clean_path, protected_disturbed_path,
+        recovered_path, repetitions=3, protected_cells=None,
+        rank_region='high', rank_bits=None, count=0, rate=0.0, seed=42,
+        target_steps=None, target_frames=None, disturbance_mode='random',
+        interleave_seed=0, burst_start=0):
+    """Protect selected TDC2 rank bits with serialized odd repetition.
+
+    The protected container stores a conventional TDC2 payload, a compact
+    list of protected ``(step, latent-position)`` cells, and ``R-1`` extra
+    copies of the selected rank-bit region. Majority recovery writes an
+    ordinary TDC2 stream consumed by the production decoder.
+    """
+    if repetitions < 3 or repetitions % 2 != 1:
+        raise ValueError('repetitions must be an odd integer >= 3')
+    if rank_region not in ('low', 'middle', 'high'):
+        raise ValueError('rank repetition requires low, middle or high region')
+    if disturbance_mode not in STREAM_DEFENSE_ATTACK_MODE_CHOICES:
+        raise ValueError(f'Unknown disturbance mode: {disturbance_mode}')
+    if count < 0 or (count == 0 and not 0 < rate <= 1):
+        raise ValueError('A positive count or rate in (0,1] is required')
+
+    payload = bytearray(Path(input_path).read_bytes())
+    layout = _parse_tdcm_payload_layout(payload)
+    if layout['index_coding'] != 'combinatorial':
+        raise ValueError('rank repetition requires a TDC2 stream')
+    if not protected_cells:
+        raise ValueError('At least one protected rank cell is required')
+    cells = sorted({(int(step), int(frame)) for step, frame in protected_cells})
+    invalid = [(step, frame) for step, frame in cells
+               if step < 0 or step >= layout['n_sde']
+               or frame < 0 or frame >= layout['n_lat']]
+    if invalid:
+        raise ValueError(f'Invalid protected rank cells: {invalid}')
+    if len(cells) > 255:
+        raise ValueError('Rank repetition supports at most 255 protected cells')
+
+    protected_entries = [entry for entry in layout['rank_entries']
+                         if (entry['step'], entry['frame']) in set(cells)]
+    if len(protected_entries) != len(cells):
+        raise ValueError('A protected cell has no TDC2 rank entry')
+
+    protected_slots = []
+    for entry in protected_entries:
+        width = entry['rank_bits']
+        boundaries = (0, width // 3, 2 * width // 3, width)
+        region_id = dict(low=0, middle=1, high=2)[rank_region]
+        lo, hi = boundaries[region_id], boundaries[region_id + 1]
+        for bit in range(lo, hi):
+            protected_slots.append(dict(
+                step=entry['step'], frame=entry['frame'], bit=bit,
+                byte_offset=entry['rank_offset'] + bit // 8,
+                bit_mask=1 << (bit % 8),
+            ))
+
+    redundancy_bits = len(protected_slots) * (repetitions - 1)
+    if interleave_seed:
+        interleave = np.random.default_rng(interleave_seed).permutation(
+            redundancy_bits)
+    else:
+        interleave = np.arange(redundancy_bits, dtype=np.int64)
+    inverse_interleave = np.empty(redundancy_bits, dtype=np.int64)
+    inverse_interleave[interleave] = np.arange(
+        redundancy_bits, dtype=np.int64)
+
+    redundancy = bytearray((redundancy_bits + 7) // 8)
+    for ordinal, slot in enumerate(protected_slots):
+        value = 1 if payload[slot['byte_offset']] & slot['bit_mask'] else 0
+        if value:
+            for copy in range(1, repetitions):
+                raw_bit = ordinal * (repetitions - 1) + copy - 1
+                physical_bit = int(interleave[raw_bit])
+                redundancy[physical_bit // 8] |= 1 << (physical_bit % 8)
+
+    region_code = dict(low=0, middle=1, high=2)[rank_region]
+    header = struct.pack(
+        _RANK_REPETITION_HEADER_FORMAT,
+        _RANK_REPETITION_MAGIC, _RANK_REPETITION_VERSION,
+        repetitions, region_code, 0, len(payload), len(cells),
+        int(interleave_seed))
+    cell_table = b''.join(struct.pack('<BB', step, frame)
+                          for step, frame in cells)
+    prefix_size = len(header) + len(cell_table)
+    clean_container = bytearray(header + cell_table + payload + redundancy)
+    Path(protected_clean_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(protected_clean_path).write_bytes(clean_container)
+
+    if target_steps is None:
+        step_ids = {step for step, _ in cells}
+    else:
+        step_ids = {int(value) for value in target_steps}
+    if target_frames is None:
+        frame_ids = {frame for _, frame in cells}
+    else:
+        frame_ids = {int(value) for value in target_frames}
+    targeted_cells = {(step, frame) for step, frame in cells
+                      if step in step_ids and frame in frame_ids}
+    if not targeted_cells:
+        raise ValueError('Rank disturbance does not target a protected cell')
+    eligible = [(ordinal, slot) for ordinal, slot in enumerate(protected_slots)
+                if (slot['step'], slot['frame']) in targeted_cells]
+    if rank_bits is not None:
+        explicit = {int(value) for value in rank_bits}
+        eligible = [(ordinal, slot) for ordinal, slot in eligible
+                    if slot['bit'] in explicit]
+        found = {slot['bit'] for _, slot in eligible}
+        if found != explicit:
+            raise ValueError(
+                f'Explicit rank bits are outside protected region: '
+                f'{sorted(explicit - found)}')
+    requested = int(count) if count > 0 else max(
+        1, int(round(len(protected_slots) * repetitions * rate)))
+    if requested > len(eligible) * repetitions:
+        raise ValueError('Requested changes exceed eligible protected rank bits')
+
+    def physical_location(ordinal, slot, copy):
+        if copy == 0:
+            return prefix_size + slot['byte_offset'], slot['bit_mask']
+        raw_bit = ordinal * (repetitions - 1) + copy - 1
+        physical_bit = int(interleave[raw_bit])
+        return (prefix_size + len(payload) + physical_bit // 8,
+                1 << (physical_bit % 8))
+
+    rng = np.random.default_rng(seed)
+    if disturbance_mode == 'contiguous-burst':
+        if rank_bits is not None or targeted_cells != set(cells):
+            raise ValueError(
+                'A physical burst spans the full rank-redundancy region')
+        if burst_start < 0 or burst_start + requested > redundancy_bits:
+            raise ValueError('Contiguous burst lies outside rank redundancy')
+        chosen = []
+        for physical_bit in range(burst_start, burst_start + requested):
+            raw_bit = int(inverse_interleave[physical_bit])
+            ordinal = raw_bit // (repetitions - 1)
+            copy = raw_bit % (repetitions - 1) + 1
+            chosen.append((ordinal, protected_slots[ordinal], copy))
+    elif disturbance_mode == 'random':
+        domain = [(ordinal, slot, copy) for ordinal, slot in eligible
+                  for copy in range(repetitions)]
+        chosen = [domain[int(value)] for value in
+                  rng.choice(len(domain), size=requested, replace=False)]
+    else:
+        majority = repetitions // 2 + 1
+        order = [eligible[int(value)]
+                 for value in rng.permutation(len(eligible))]
+        chosen = []
+        remaining = requested
+        for ordinal, slot in order:
+            if remaining < majority:
+                break
+            chosen.extend((ordinal, slot, copy)
+                          for copy in range(majority))
+            remaining -= majority
+        if remaining:
+            used = {(ordinal, copy) for ordinal, _, copy in chosen}
+            extras = [(ordinal, slot, copy) for ordinal, slot in eligible
+                      for copy in range(repetitions)
+                      if (ordinal, copy) not in used]
+            chosen.extend(extras[:remaining])
+
+    disturbed = bytearray(clean_container)
+    flip_counts = {}
+    examples = []
+    for ordinal, slot, copy in chosen:
+        byte_offset, bit_mask = physical_location(ordinal, slot, copy)
+        disturbed[byte_offset] ^= bit_mask
+        flip_counts[ordinal] = flip_counts.get(ordinal, 0) + 1
+        if len(examples) < 20:
+            examples.append(dict(
+                step=slot['step'], frame=slot['frame'],
+                flipped_bit=slot['bit'], rank_region=rank_region,
+                copy=copy, byte_offset=byte_offset,
+            ))
+    Path(protected_disturbed_path).write_bytes(disturbed)
+
+    recovered = bytearray(
+        disturbed[prefix_size:prefix_size + len(payload)])
+    majority = repetitions // 2 + 1
+    changed = 0
+    corrected = 0
+    for ordinal, slot in enumerate(protected_slots):
+        votes = 0
+        for copy in range(repetitions):
+            byte_offset, bit_mask = physical_location(ordinal, slot, copy)
+            votes += 1 if disturbed[byte_offset] & bit_mask else 0
+        old_value = 1 if payload[slot['byte_offset']] & slot['bit_mask'] else 0
+        new_value = 1 if votes >= majority else 0
+        if new_value:
+            recovered[slot['byte_offset']] |= slot['bit_mask']
+        else:
+            recovered[slot['byte_offset']] &= ~slot['bit_mask'] & 0xff
+        if new_value != old_value:
+            changed += 1
+        elif ordinal in flip_counts:
+            corrected += 1
+    Path(recovered_path).write_bytes(recovered)
+    _parse_tdcm_payload_layout(recovered)
+
+    total_payload_bits = layout['payload_bits']
+    protected_payload_bits = total_payload_bits + redundancy_bits
+    return dict(
+        attack='rank-bitflip', rate=rate, requested_count=count, seed=seed,
+        target_steps_zero_based=sorted(step_ids),
+        target_frames=sorted(frame_ids), rank_region=rank_region,
+        explicit_rank_bits=(list(rank_bits) if rank_bits is not None else None),
+        defense='rank-repetition', defense_repetitions=repetitions,
+        defense_attack_mode=disturbance_mode,
+        protected_cells=[list(cell) for cell in cells],
+        interleave_seed=int(interleave_seed), burst_start=int(burst_start),
+        transport='protected-serialized-tdr2',
+        total_payload_bits=total_payload_bits,
+        protected_logical_bits=len(protected_slots),
+        protection_overhead_bits=redundancy_bits,
+        protected_payload_bits=protected_payload_bits,
+        container_header_bits=prefix_size * 8,
+        channel_flipped_bits=requested, changed_symbols=changed,
+        changed_bits=requested, corrected_logical_symbols=corrected,
+        payload_BER=requested / protected_payload_bits,
+        eligible_symbols=len(eligible),
+        eligible_physical_bits=len(eligible) * repetitions,
+        examples=examples, input_path=str(input_path),
+        protected_clean_path=str(protected_clean_path),
+        protected_disturbed_path=str(protected_disturbed_path),
+        recovered_path=str(recovered_path),
+        defense_model='localized serialized rank-bit repetition',
     )
 
 

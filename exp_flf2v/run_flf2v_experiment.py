@@ -166,6 +166,7 @@ from bitstream_attacks import (STREAM_ATTACK_CHOICES, STREAM_DEFENSE_CHOICES,
                                STREAM_TRANSPORT_CHOICES,
                                apply_codebook_stream_attack,
                                apply_serialized_codebook_attack,
+                               apply_serialized_rank_repetition_disturbance,
                                apply_serialized_repetition_disturbance,
                                select_impact_sign_slots,
                                select_trajectory_sign_slots)
@@ -400,6 +401,9 @@ def main():
                         help="Number of leading SDE steps protected by the stream defense")
     parser.add_argument("--stream_defense_frames", type=int, nargs="*", default=None,
                         help="0-based latent frames protected by repetition; default protects all")
+    parser.add_argument("--stream_defense_rank_cells", nargs="*", default=None,
+                        help=("Sparse protected rank cells as 1-based-step:0-based-frame, "
+                              "for example 1:3 1:4 2:1"))
     parser.add_argument("--stream_defense_attack_mode",
                         choices=STREAM_DEFENSE_ATTACK_MODE_CHOICES, default="random",
                         help="Physical-channel attacker: random flips or repetition-aware pairs")
@@ -453,10 +457,14 @@ def main():
     if args.stream_attack_transport == "protected-serialized":
         if args.stream_attack == "none":
             parser.error("Protected serialized transport requires a stream disturbance")
-        if args.stream_defense not in ("sign-repetition", "sign-repetition3"):
-            parser.error("Protected serialized transport requires a sign-repetition defense")
-        if args.stream_attack != "sign-bitflip":
-            parser.error("Protected serialized transport currently supports sign-bitflip only")
+        valid_pairs = {
+            ("sign-bitflip", "sign-repetition"),
+            ("sign-bitflip", "sign-repetition3"),
+            ("rank-bitflip", "rank-repetition"),
+        }
+        if (args.stream_attack, args.stream_defense) not in valid_pairs:
+            parser.error(
+                "Protected serialized transport requires matching sign or rank repetition")
     if args.stream_attack in ("sign-impact-bitflip", "sign-trajectory-bitflip"):
         if args.stream_attack_transport != "serialized":
             parser.error("Ranked sign attacks require --stream_attack_transport serialized")
@@ -468,11 +476,32 @@ def main():
             parser.error("Ranked sign attacks require at least one target latent frame")
     if args.stream_attack == "sign-trajectory-bitflip" and args.stream_attack_target_steps != [1]:
         parser.error("sign-trajectory-bitflip currently supports only --stream_attack_target_steps 1")
+    rank_defense_cells = None
+    if args.stream_defense_rank_cells is not None:
+        if not args.stream_defense_rank_cells:
+            parser.error("--stream_defense_rank_cells requires at least one cell")
+        rank_defense_cells = []
+        for token in args.stream_defense_rank_cells:
+            try:
+                step_text, frame_text = token.split(":", 1)
+                step_value, frame_value = int(step_text), int(frame_text)
+            except (ValueError, AttributeError):
+                parser.error(f"Invalid rank cell {token!r}; use STEP:FRAME")
+            if not 1 <= step_value <= args.steps - args.ddim_tail:
+                parser.error(f"Rank defense step is outside SDE range: {step_value}")
+            if frame_value < 0:
+                parser.error(f"Rank defense frame cannot be negative: {frame_value}")
+            rank_defense_cells.append((step_value - 1, frame_value))
     if args.stream_attack == "rank-bitflip":
-        if args.stream_attack_transport != "serialized":
-            parser.error("rank-bitflip requires --stream_attack_transport serialized")
-        if args.stream_defense != "none":
-            parser.error("rank-bitflip currently requires --stream_defense none")
+        allowed_transports = {"serialized", "protected-serialized"}
+        if args.stream_attack_transport not in allowed_transports:
+            parser.error("rank-bitflip requires serialized transport")
+        if (args.stream_attack_transport == "serialized"
+                and args.stream_defense != "none"):
+            parser.error("Unprotected rank-bitflip requires --stream_defense none")
+        if (args.stream_attack_transport == "protected-serialized"
+                and args.stream_defense != "rank-repetition"):
+            parser.error("Protected rank-bitflip requires rank-repetition defense")
         if args.stream_attack_rank_bits is not None:
             if len(args.stream_attack_rank_bits) == 0:
                 parser.error("--stream_attack_rank_bits requires at least one bit")
@@ -488,6 +517,13 @@ def main():
         parser.error("--stream_attack_trajectory_rollout_steps must lie within the SDE steps")
     if args.start_gop < 0:
         parser.error("--start_gop cannot be negative")
+    if args.stream_defense == "rank-repetition":
+        if args.stream_attack != "rank-bitflip":
+            parser.error("rank-repetition protects rank-bitflip only")
+        if args.stream_attack_transport != "protected-serialized":
+            parser.error("rank-repetition requires protected-serialized transport")
+        if not rank_defense_cells:
+            parser.error("rank-repetition requires --stream_defense_rank_cells")
 
     # Wan 的时间步偏移随分辨率使用不同默认值；显式传参可覆盖。
     if args.flow_shift is None: args.flow_shift = 3.0 if args.height <= 480 else 5.0
@@ -884,22 +920,41 @@ def main():
                 pipe.save_compressed(step_data, str(clean_path))
                 repetitions = (3 if args.stream_defense == "sign-repetition3"
                                else args.stream_defense_repetitions)
-                stream_attack_metadata = apply_serialized_repetition_disturbance(
-                    clean_path, protected_clean_path, protected_disturbed_path,
-                    recovered_path,
-                    repetitions=repetitions,
-                    protected_steps=args.stream_defense_steps,
-                    protected_frames=args.stream_defense_frames,
-                    count=args.stream_attack_count,
-                    rate=args.stream_attack_rate,
-                    seed=args.stream_attack_seed,
-                    target_steps=([v - 1 for v in args.stream_attack_target_steps]
-                                  if args.stream_attack_target_steps else None),
-                    target_frames=args.stream_attack_target_frames,
-                    disturbance_mode=args.stream_defense_attack_mode,
-                    interleave_seed=args.stream_defense_interleave_seed,
-                    burst_start=args.stream_disturbance_burst_start,
-                )
+                if args.stream_defense == "rank-repetition":
+                    stream_attack_metadata = apply_serialized_rank_repetition_disturbance(
+                        clean_path, protected_clean_path,
+                        protected_disturbed_path, recovered_path,
+                        repetitions=repetitions,
+                        protected_cells=rank_defense_cells,
+                        rank_region=args.stream_attack_rank_region,
+                        rank_bits=args.stream_attack_rank_bits,
+                        count=args.stream_attack_count,
+                        rate=args.stream_attack_rate,
+                        seed=args.stream_attack_seed,
+                        target_steps=([v - 1 for v in args.stream_attack_target_steps]
+                                      if args.stream_attack_target_steps else None),
+                        target_frames=args.stream_attack_target_frames,
+                        disturbance_mode=args.stream_defense_attack_mode,
+                        interleave_seed=args.stream_defense_interleave_seed,
+                        burst_start=args.stream_disturbance_burst_start,
+                    )
+                else:
+                    stream_attack_metadata = apply_serialized_repetition_disturbance(
+                        clean_path, protected_clean_path, protected_disturbed_path,
+                        recovered_path,
+                        repetitions=repetitions,
+                        protected_steps=args.stream_defense_steps,
+                        protected_frames=args.stream_defense_frames,
+                        count=args.stream_attack_count,
+                        rate=args.stream_attack_rate,
+                        seed=args.stream_attack_seed,
+                        target_steps=([v - 1 for v in args.stream_attack_target_steps]
+                                      if args.stream_attack_target_steps else None),
+                        target_frames=args.stream_attack_target_frames,
+                        disturbance_mode=args.stream_defense_attack_mode,
+                        interleave_seed=args.stream_defense_interleave_seed,
+                        burst_start=args.stream_disturbance_burst_start,
+                    )
                 # Recovery returns an ordinary TDCM, so the production parser
                 # and decoder remain unchanged.
                 decode_step_data = TurboBitstream.load(str(recovered_path))["step_data"]

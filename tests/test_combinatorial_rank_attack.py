@@ -28,7 +28,8 @@ attack_spec.loader.exec_module(attacks)
 
 
 class CombinatorialRankAttackTest(unittest.TestCase):
-    def test_exact_rank_bit_changes_real_tdc2_payload(self):
+    @staticmethod
+    def _tiny_tdc2():
         K, M = 32, 5
         indices = [0, 1, 2, 3, 4]
         rank = analysis.rank_combination(indices, K)
@@ -40,6 +41,10 @@ class CombinatorialRankAttackTest(unittest.TestCase):
         data.extend(struct.pack("<H", M))
         data.extend(rank.to_bytes((rank_bits + 7) // 8, "little"))
         data.append(0b10101)
+        return data, rank_bits
+
+    def test_exact_rank_bit_changes_real_tdc2_payload(self):
+        data, _ = self._tiny_tdc2()
         with tempfile.TemporaryDirectory() as tmp:
             clean = Path(tmp) / "clean.tdcm"
             attacked = Path(tmp) / "attacked.tdcm"
@@ -55,6 +60,30 @@ class CombinatorialRankAttackTest(unittest.TestCase):
         self.assertEqual(metadata["examples"][0]["flipped_bit"], 0)
         self.assertEqual(parsed["rank_entries"][0]["rank"], 1)
         self.assertEqual(parsed["rank_entries"][0]["indices"], [0, 1, 2, 3, 5])
+
+    def test_rank_repetition_corrects_one_physical_error(self):
+        data, rank_bits = self._tiny_tdc2()
+        high_start = 2 * rank_bits // 3
+        with tempfile.TemporaryDirectory() as tmp:
+            clean = Path(tmp) / "clean.tdcm"
+            protected = Path(tmp) / "clean.tdr2"
+            disturbed = Path(tmp) / "disturbed.tdr2"
+            recovered = Path(tmp) / "recovered.tdcm"
+            clean.write_bytes(data)
+            metadata = attacks.apply_serialized_rank_repetition_disturbance(
+                clean, protected, disturbed, recovered,
+                repetitions=3, protected_cells=[(0, 0)],
+                rank_region="high", rank_bits=[high_start], count=1,
+                target_steps=[0], target_frames=[0], seed=42,
+                disturbance_mode="random")
+            recovered_bytes = recovered.read_bytes()
+        self.assertEqual(recovered_bytes, bytes(data))
+        self.assertEqual(metadata["channel_flipped_bits"], 1)
+        self.assertEqual(metadata["changed_symbols"], 0)
+        self.assertEqual(metadata["corrected_logical_symbols"], 1)
+        self.assertEqual(
+            metadata["protection_overhead_bits"],
+            (rank_bits - high_start) * 2)
 
 
 if __name__ == "__main__":

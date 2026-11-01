@@ -49,6 +49,7 @@ class RankJob:
     region: str
     attack_seed: int
     attack_mode: str
+    attack_count: int
 
     def run_name(self, sequence: str, gop_index: int) -> str:
         seq = "".join(
@@ -57,9 +58,9 @@ class RankJob:
         )
         gop_tag = "" if gop_index == 0 else f"_gop{gop_index}"
         if self.attack_mode == "rank-bitflip":
-            prefix = f"tdc2_rank1_{self.region}"
+            prefix = f"tdc2_rank{self.attack_count}_{self.region}"
         else:
-            prefix = "tdcm_index1"
+            prefix = f"tdcm_index{self.attack_count}"
         return (
             f"{prefix}_step{self.step}_frame{self.frame}_"
             f"aseed{self.attack_seed}{gop_tag}_{seq}"
@@ -81,6 +82,7 @@ def parse_args():
         "--attack_mode", default="rank-bitflip",
         choices=["rank-bitflip", "index-bitflip"],
     )
+    parser.add_argument("--attack_count", type=int, default=1)
     parser.add_argument(
         "--rank_regions", nargs="+", default=["low", "middle", "high"],
         choices=["low", "middle", "high"],
@@ -106,11 +108,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def expand_jobs(cells, regions, seeds, attack_mode):
+def expand_jobs(cells, regions, seeds, attack_mode, attack_count):
     if attack_mode == "index-bitflip":
         regions = ["independent"]
     return [
-        RankJob(role, step, frame, region, seed, attack_mode)
+        RankJob(role, step, frame, region, seed, attack_mode, attack_count)
         for seed in seeds
         for role, step, frame in cells
         for region in regions
@@ -191,18 +193,27 @@ def main():
     args = parse_args()
     if args.gop_index < 0:
         raise ValueError("--gop_index must be non-negative")
+    if args.attack_count < 1:
+        raise ValueError("--attack_count must be positive")
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
     output_dir = Path(args.output_dir)
     cells = load_cells(args.plan)
     jobs = expand_jobs(
-        cells, args.rank_regions, args.attack_seeds, args.attack_mode
+        cells, args.rank_regions, args.attack_seeds,
+        args.attack_mode, args.attack_count,
     )
     gop_tag = "" if args.gop_index == 0 else f"_gop{args.gop_index}"
     sequence_tag = args.sequence.lower()
-    experiment_tag = (
-        "tdc2_rank" if args.attack_mode == "rank-bitflip" else "tdcm_index"
-    )
+    if args.attack_mode == "rank-bitflip":
+        experiment_tag = (
+            "tdc2_rank" if args.attack_count == 1
+            else f"tdc2_rank{args.attack_count}"
+        )
+    elif args.attack_count == 1:
+        experiment_tag = "tdcm_index"
+    else:
+        experiment_tag = f"tdcm_index{args.attack_count}"
     manifest_path = output_dir / (
         f"{experiment_tag}_manifest_{sequence_tag}{gop_tag}.csv"
     )
@@ -321,7 +332,7 @@ def main():
             clean_path,
             attacked_path,
             attack=args.attack_mode,
-            count=1,
+            count=job.attack_count,
             seed=job.attack_seed,
             target_steps=[job.step - 1],
             target_frames=[job.frame],

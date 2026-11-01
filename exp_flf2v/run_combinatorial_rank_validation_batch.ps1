@@ -2,6 +2,7 @@ param(
     [string]$Plan = 'exp_flf2v/validation_rank_cells_jockey.csv',
     [ValidateSet('rank-bitflip','index-bitflip')]
     [string]$AttackMode = 'rank-bitflip',
+    [int]$AttackCount = 1,
     [string[]]$RankRegions = @('low','middle','high'),
     [int[]]$AttackSeeds = @(42),
     [string]$Sequence = 'Jockey',
@@ -29,6 +30,7 @@ $runnerArgs = @(
     '--clean_codebook',$CleanCodebook,
     '--clean_metrics',$CleanMetrics,
     '--attack_mode',$AttackMode,
+    '--attack_count',[string]$AttackCount,
     '--gop_index',[string]$SourceGop,
     '--rank_regions'
 )

@@ -1,0 +1,3 @@
+role,sde_step,latent_position,rationale
+sensitive,1,3,strongest validated hotspot
+same-step-control,1,0,same generation step but insensitive latent position

@@ -9,6 +9,7 @@ import argparse
 import csv
 import gc
 import json
+import math
 import os
 import shutil
 import sys
@@ -47,6 +48,7 @@ class RankJob:
     frame: int
     region: str
     attack_seed: int
+    attack_mode: str
 
     def run_name(self, sequence: str, gop_index: int) -> str:
         seq = "".join(
@@ -54,8 +56,12 @@ class RankJob:
             for ch in sequence
         )
         gop_tag = "" if gop_index == 0 else f"_gop{gop_index}"
+        if self.attack_mode == "rank-bitflip":
+            prefix = f"tdc2_rank1_{self.region}"
+        else:
+            prefix = "tdcm_index1"
         return (
-            f"tdc2_rank1_{self.region}_step{self.step}_frame{self.frame}_"
+            f"{prefix}_step{self.step}_frame{self.frame}_"
             f"aseed{self.attack_seed}{gop_tag}_{seq}"
         )
 
@@ -71,6 +77,10 @@ def parse_args():
     parser.add_argument("--output_dir", default="exp_flf2v/results_720p")
     parser.add_argument("--clean_codebook", required=True)
     parser.add_argument("--clean_metrics", required=True)
+    parser.add_argument(
+        "--attack_mode", default="rank-bitflip",
+        choices=["rank-bitflip", "index-bitflip"],
+    )
     parser.add_argument(
         "--rank_regions", nargs="+", default=["low", "middle", "high"],
         choices=["low", "middle", "high"],
@@ -96,9 +106,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def expand_jobs(cells, regions, seeds):
+def expand_jobs(cells, regions, seeds, attack_mode):
+    if attack_mode == "index-bitflip":
+        regions = ["independent"]
     return [
-        RankJob(role, step, frame, region, seed)
+        RankJob(role, step, frame, region, seed, attack_mode)
         for seed in seeds
         for role, step, frame in cells
         for region in regions
@@ -180,17 +192,26 @@ def main():
 
     output_dir = Path(args.output_dir)
     cells = load_cells(args.plan)
-    jobs = expand_jobs(cells, args.rank_regions, args.attack_seeds)
+    jobs = expand_jobs(
+        cells, args.rank_regions, args.attack_seeds, args.attack_mode
+    )
     gop_tag = "" if args.gop_index == 0 else f"_gop{args.gop_index}"
     sequence_tag = args.sequence.lower()
-    manifest_path = output_dir / f"tdc2_rank_manifest_{sequence_tag}{gop_tag}.csv"
-    summary_path = output_dir / f"tdc2_rank_summary_{sequence_tag}{gop_tag}.csv"
+    experiment_tag = (
+        "tdc2_rank" if args.attack_mode == "rank-bitflip" else "tdcm_index"
+    )
+    manifest_path = output_dir / (
+        f"{experiment_tag}_manifest_{sequence_tag}{gop_tag}.csv"
+    )
+    summary_path = output_dir / (
+        f"{experiment_tag}_summary_{sequence_tag}{gop_tag}.csv"
+    )
     manifest_rows = write_manifest(
         manifest_path, jobs, args.sequence, output_dir, args.gop_index
     )
     complete = sum(row["status"] == "complete" for row in manifest_rows)
     print(
-        f"TDC2 rank jobs: {len(jobs)}; complete: {complete}; "
+        f"{args.attack_mode} jobs: {len(jobs)}; complete: {complete}; "
         f"pending: {len(jobs) - complete}"
     )
     print(f"Manifest: {manifest_path}")
@@ -262,12 +283,22 @@ def main():
     import lpips
     lpips_metric = lpips.LPIPS(net="alex").eval()
 
-    cache_dir = output_dir / "_tdc2_rank_batch_cache" / args.sequence / f"gop{args.gop_index}"
+    cache_dir = (
+        output_dir / f"_{experiment_tag}_batch_cache" /
+        args.sequence / f"gop{args.gop_index}"
+    )
     cache_dir.mkdir(parents=True, exist_ok=True)
     canonical_clean = cache_dir / "codebook_clean.tdcm"
-    # save_compressed always writes the current TDC2 combinatorial format, so
-    # a legacy TDCM input can be converted without repeating codebook search.
-    pipe.save_compressed(clean_step_data, str(canonical_clean))
+    if args.attack_mode == "rank-bitflip":
+        # save_compressed writes current TDC2, so a legacy TDCM input can be
+        # converted without repeating codebook search.
+        pipe.save_compressed(clean_step_data, str(canonical_clean))
+    else:
+        if clean_codebook.read_bytes()[:4] != b"TDCM":
+            raise ValueError(
+                "index-bitflip baseline requires a legacy TDCM clean stream"
+            )
+        shutil.copy2(clean_codebook, canonical_clean)
 
     for index, (job, row) in enumerate(zip(jobs, manifest_rows), start=1):
         if row["status"] == "complete":
@@ -286,12 +317,12 @@ def main():
         attack_metadata = apply_serialized_codebook_attack(
             clean_path,
             attacked_path,
-            attack="rank-bitflip",
+            attack=args.attack_mode,
             count=1,
             seed=job.attack_seed,
             target_steps=[job.step - 1],
             target_frames=[job.frame],
-            rank_region=job.region,
+            rank_region=(job.region if args.attack_mode == "rank-bitflip" else "all"),
         )
         attacked_step_data = TurboBitstream.load(str(attacked_path))["step_data"]
 
@@ -313,9 +344,15 @@ def main():
             target_tensor[:n], reconstructed_tensor,
             device="cuda:1", loss_fn=lpips_metric,
         )
+        if args.attack_mode == "rank-bitflip":
+            bits_per_frame_step = pipe.codebook.bits_per_frame_step
+        else:
+            bits_per_frame_step = (
+                pipe.M * math.ceil(math.log2(pipe.K)) + pipe.M
+            )
         codebook_bits = (
             pipe.num_sde_steps * pipe.num_latent_frames
-            * pipe.codebook.bits_per_frame_step
+            * bits_per_frame_step
         )
         total_bits = codebook_bits + boundary_bytes * 8
         result = {

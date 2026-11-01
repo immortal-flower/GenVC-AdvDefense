@@ -24,6 +24,12 @@ _REPETITION_VERSION = 1
 _REPETITION_HEADER_FORMAT = '<4sIIIIQ'
 _REPETITION_HEADER_SIZE = struct.calcsize(_REPETITION_HEADER_FORMAT)
 
+_SPARSE_SIGN_REPETITION_MAGIC = b'TDS2'
+_SPARSE_SIGN_REPETITION_VERSION = 1
+_SPARSE_SIGN_REPETITION_HEADER_FORMAT = '<4sBBBBIII'
+_SPARSE_SIGN_REPETITION_HEADER_SIZE = struct.calcsize(
+    _SPARSE_SIGN_REPETITION_HEADER_FORMAT)
+
 _RANK_REPETITION_MAGIC = b'TDR2'
 _RANK_REPETITION_VERSION = 1
 _RANK_REPETITION_HEADER_FORMAT = '<4sBBBBIII'
@@ -598,7 +604,8 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
 def apply_serialized_repetition_disturbance(
         input_path, protected_clean_path, protected_disturbed_path,
         recovered_path, repetitions=5, protected_steps=1,
-        protected_frames=None, count=0, rate=0.0, seed=42,
+        protected_frames=None, protected_cells=None,
+        count=0, rate=0.0, seed=42,
         target_steps=None, target_frames=None,
         disturbance_mode='adaptive-pairs', interleave_seed=0,
         burst_start=0):
@@ -622,21 +629,41 @@ def apply_serialized_repetition_disturbance(
 
     payload = bytearray(Path(input_path).read_bytes())
     layout = _parse_tdcm_payload_layout(payload)
-    protected_steps = min(int(protected_steps), layout['n_sde'])
-    if protected_frames is None:
-        protected_frame_ids = set(range(layout['n_lat']))
+    sparse_cells = None
+    if protected_cells:
+        sparse_cells = sorted({(int(step), int(frame))
+                               for step, frame in protected_cells})
+        invalid_cells = [
+            (step, frame) for step, frame in sparse_cells
+            if step < 0 or step >= layout['n_sde']
+            or frame < 0 or frame >= layout['n_lat']
+        ]
+        if invalid_cells:
+            raise ValueError(f'Invalid protected sign cells: {invalid_cells}')
+        if len(sparse_cells) > 255:
+            raise ValueError('Sparse sign repetition supports at most 255 cells')
+        protected_steps = max(step for step, _ in sparse_cells) + 1
+        protected_frame_ids = {frame for _, frame in sparse_cells}
+        protected_slots = [
+            slot for slot in layout['slots']
+            if (slot['step'], slot['frame']) in set(sparse_cells)
+        ]
     else:
-        protected_frame_ids = {int(v) for v in protected_frames}
-    invalid = sorted(v for v in protected_frame_ids
-                     if v < 0 or v >= layout['n_lat'])
-    if invalid or not protected_frame_ids:
-        raise ValueError(f'Invalid protected latent frames: {invalid}')
+        protected_steps = min(int(protected_steps), layout['n_sde'])
+        if protected_frames is None:
+            protected_frame_ids = set(range(layout['n_lat']))
+        else:
+            protected_frame_ids = {int(v) for v in protected_frames}
+        invalid = sorted(v for v in protected_frame_ids
+                         if v < 0 or v >= layout['n_lat'])
+        if invalid or not protected_frame_ids:
+            raise ValueError(f'Invalid protected latent frames: {invalid}')
+        protected_slots = [slot for slot in layout['slots']
+                           if slot['step'] < protected_steps
+                           and slot['frame'] in protected_frame_ids]
     if layout['n_lat'] > 64:
         raise ValueError('The repetition container supports at most 64 latent frames')
     frame_mask = sum(1 << frame for frame in protected_frame_ids)
-    protected_slots = [slot for slot in layout['slots']
-                       if slot['step'] < protected_steps
-                       and slot['frame'] in protected_frame_ids]
     redundancy_bits = len(protected_slots) * (repetitions - 1)
     if interleave_seed:
         interleave = np.random.default_rng(interleave_seed).permutation(
@@ -654,16 +681,30 @@ def apply_serialized_repetition_disturbance(
                 bit_index = ordinal * (repetitions - 1) + copy - 1
                 physical_bit = int(interleave[bit_index])
                 redundancy[physical_bit // 8] |= 1 << (physical_bit % 8)
-    header = struct.pack(
-        _REPETITION_HEADER_FORMAT, _REPETITION_MAGIC,
-        _REPETITION_VERSION, repetitions, protected_steps,
-        len(payload), frame_mask)
-    clean_container = bytearray(header + payload + redundancy)
+    if sparse_cells is None:
+        header = struct.pack(
+            _REPETITION_HEADER_FORMAT, _REPETITION_MAGIC,
+            _REPETITION_VERSION, repetitions, protected_steps,
+            len(payload), frame_mask)
+        cell_table = b''
+    else:
+        header = struct.pack(
+            _SPARSE_SIGN_REPETITION_HEADER_FORMAT,
+            _SPARSE_SIGN_REPETITION_MAGIC,
+            _SPARSE_SIGN_REPETITION_VERSION, repetitions,
+            len(sparse_cells), 0, len(payload), int(interleave_seed),
+            redundancy_bits)
+        cell_table = b''.join(struct.pack('<BB', step, frame)
+                              for step, frame in sparse_cells)
+    prefix_size = len(header) + len(cell_table)
+    clean_container = bytearray(header + cell_table + payload + redundancy)
     Path(protected_clean_path).parent.mkdir(parents=True, exist_ok=True)
     Path(protected_clean_path).write_bytes(clean_container)
 
     if target_steps is None:
-        step_ids = set(range(protected_steps))
+        step_ids = ({step for step, _ in sparse_cells}
+                    if sparse_cells is not None
+                    else set(range(protected_steps)))
     else:
         step_ids = {int(v) for v in target_steps}
     if target_frames is None:
@@ -683,16 +724,19 @@ def apply_serialized_repetition_disturbance(
 
     def physical_location(ordinal, slot, copy):
         if copy == 0:
-            return (_REPETITION_HEADER_SIZE + slot['sign_offset'],
+            return (prefix_size + slot['sign_offset'],
                     slot['sign_mask'])
         bit_index = ordinal * (repetitions - 1) + copy - 1
         physical_bit = int(interleave[bit_index])
-        return (_REPETITION_HEADER_SIZE + len(payload) + physical_bit // 8,
+        return (prefix_size + len(payload) + physical_bit // 8,
                 1 << (physical_bit % 8))
 
     rng = np.random.default_rng(seed)
     if disturbance_mode == 'contiguous-burst':
-        if step_ids != set(range(protected_steps)) or frame_ids != protected_frame_ids:
+        all_protected_steps = ({step for step, _ in sparse_cells}
+                               if sparse_cells is not None
+                               else set(range(protected_steps)))
+        if step_ids != all_protected_steps or frame_ids != protected_frame_ids:
             raise ValueError('A physical burst spans the full protected redundancy region; '
                              'do not set narrower target steps/frames')
         if burst_start < 0 or burst_start + requested > redundancy_bits:
@@ -744,8 +788,7 @@ def apply_serialized_repetition_disturbance(
     Path(protected_disturbed_path).write_bytes(disturbed)
 
     recovered = bytearray(
-        disturbed[_REPETITION_HEADER_SIZE:
-                  _REPETITION_HEADER_SIZE + len(payload)])
+        disturbed[prefix_size:prefix_size + len(payload)])
     changed = 0
     corrected = 0
     majority = repetitions // 2 + 1
@@ -776,6 +819,9 @@ def apply_serialized_repetition_disturbance(
         target_steps_zero_based=sorted(step_ids), target_frames=sorted(frame_ids),
         defense='sign-repetition', defense_steps=protected_steps,
         defense_frames=sorted(protected_frame_ids),
+        protected_cells=(
+            [list(cell) for cell in sparse_cells]
+            if sparse_cells is not None else None),
         defense_repetitions=repetitions,
         defense_attack_mode=disturbance_mode,
         interleave_seed=int(interleave_seed), burst_start=int(burst_start),
@@ -783,7 +829,7 @@ def apply_serialized_repetition_disturbance(
         total_symbols=total_symbols, total_payload_bits=total_payload_bits,
         protection_overhead_bits=redundancy_bits,
         protected_payload_bits=protected_payload_bits,
-        container_header_bits=_REPETITION_HEADER_SIZE * 8,
+        container_header_bits=prefix_size * 8,
         channel_flipped_bits=requested, changed_symbols=changed,
         changed_bits=requested, corrected_logical_symbols=corrected,
         payload_BER=requested / protected_payload_bits,

@@ -86,6 +86,25 @@ class CombinatorialRankAttackTest(unittest.TestCase):
             metadata["protection_overhead_bits"],
             (rank_bits - high_start) * 2)
 
+    def test_sparse_sign_repetition_corrects_one_physical_error(self):
+        data, _ = self._tiny_tdc2()
+        with tempfile.TemporaryDirectory() as tmp:
+            clean = Path(tmp) / "clean.tdcm"
+            protected = Path(tmp) / "clean.tds2"
+            disturbed = Path(tmp) / "disturbed.tds2"
+            recovered = Path(tmp) / "recovered.tdcm"
+            clean.write_bytes(data)
+            metadata = attacks.apply_serialized_repetition_disturbance(
+                clean, protected, disturbed, recovered,
+                repetitions=3, protected_cells=[(0, 0)],
+                count=1, seed=42, disturbance_mode="random")
+            recovered_bytes = recovered.read_bytes()
+        self.assertEqual(recovered_bytes, bytes(data))
+        self.assertEqual(metadata["protected_cells"], [[0, 0]])
+        self.assertEqual(metadata["changed_symbols"], 0)
+        self.assertEqual(metadata["corrected_logical_symbols"], 1)
+        self.assertEqual(metadata["protection_overhead_bits"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -404,6 +404,9 @@ def main():
                         help="Number of leading SDE steps protected by the stream defense")
     parser.add_argument("--stream_defense_frames", type=int, nargs="*", default=None,
                         help="0-based latent frames protected by repetition; default protects all")
+    parser.add_argument("--stream_defense_sign_cells", nargs="*", default=None,
+                        help=("Sparse sign cells as 1-based-step:0-based-frame, "
+                              "for example 1:3 1:4 2:1"))
     parser.add_argument("--stream_defense_rank_cells", nargs="*", default=None,
                         help=("Sparse protected rank cells as 1-based-step:0-based-frame, "
                               "for example 1:3 1:4 2:1"))
@@ -469,6 +472,26 @@ def main():
         parser.error("--stream_defense_frames requires at least one frame position")
     if args.stream_defense_frames and any(v < 0 for v in args.stream_defense_frames):
         parser.error("--stream_defense_frames cannot contain negative positions")
+    sign_defense_cells = None
+    if args.stream_defense_sign_cells is not None:
+        if not args.stream_defense_sign_cells:
+            parser.error("--stream_defense_sign_cells requires at least one cell")
+        if args.stream_defense_frames is not None:
+            parser.error(
+                "--stream_defense_sign_cells cannot be combined with "
+                "--stream_defense_frames")
+        sign_defense_cells = []
+        for token in args.stream_defense_sign_cells:
+            try:
+                step_text, frame_text = token.split(":", 1)
+                step_value, frame_value = int(step_text), int(frame_text)
+            except (ValueError, AttributeError):
+                parser.error(f"Invalid sign defense cell {token!r}; use STEP:FRAME")
+            if not 1 <= step_value <= args.steps - args.ddim_tail:
+                parser.error(f"Sign defense step is outside SDE range: {step_value}")
+            if frame_value < 0:
+                parser.error(f"Sign defense frame cannot be negative: {frame_value}")
+            sign_defense_cells.append((step_value - 1, frame_value))
     if args.stream_defense_repetitions < 3 or args.stream_defense_repetitions % 2 != 1:
         parser.error("--stream_defense_repetitions must be an odd integer >= 3")
     if args.stream_defense_interleave_seed < 0:
@@ -477,6 +500,10 @@ def main():
         parser.error("--stream_disturbance_burst_start cannot be negative")
     if args.stream_defense == "sign-repetition3" and args.stream_defense_repetitions != 3:
         parser.error("--stream_defense sign-repetition3 fixes the repetition factor at 3")
+    if (sign_defense_cells is not None
+            and args.stream_defense not in ("sign-repetition", "sign-repetition3")):
+        parser.error(
+            "--stream_defense_sign_cells requires a sign repetition defense")
     if args.stream_attack_transport == "serialized" and args.stream_defense != "none":
         parser.error("Serialized transport currently supports unprotected .tdcm only; use logical mode for the repetition pilot")
     if args.stream_attack_transport == "protected-serialized":
@@ -971,6 +998,7 @@ def main():
                         repetitions=repetitions,
                         protected_steps=args.stream_defense_steps,
                         protected_frames=args.stream_defense_frames,
+                        protected_cells=sign_defense_cells,
                         count=args.stream_attack_count,
                         rate=args.stream_attack_rate,
                         seed=args.stream_attack_seed,

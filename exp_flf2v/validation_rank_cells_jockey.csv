@@ -1,0 +1,4 @@
+role,sde_step,latent_position
+sensitive,1,3
+same-step-control,1,0
+same-position-control,9,3

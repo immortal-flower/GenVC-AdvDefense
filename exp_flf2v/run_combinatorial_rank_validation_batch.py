@@ -167,7 +167,10 @@ def write_summary(path, rows):
             "latent_position": row["latent_position"],
             "attack_seed": row["attack_seed"],
             "flipped_rank_bit": example.get("flipped_bit", ""),
-            "replaced_atoms": example.get("replaced_atoms", ""),
+            "replaced_atoms": example.get(
+                "replaced_atoms",
+                metrics.get("stream_attack", {}).get("changed_symbols", ""),
+            ),
             "PSNR_dB": metrics["PSNR_dB"],
             "PSNR_drop_dB": round(
                 float(metrics["clean_PSNR_dB"]) - float(metrics["PSNR_dB"]), 4
@@ -389,9 +392,12 @@ def main():
         )
         write_summary(summary_path, manifest_rows)
         example = attack_metadata["examples"][0]
+        replaced_atoms = example.get(
+            "replaced_atoms", attack_metadata.get("changed_symbols", "")
+        )
         print(
             f"[DONE] bit={example['flipped_bit']} "
-            f"replaced={example['replaced_atoms']} PSNR={mean_psnr:.2f} dB "
+            f"replaced={replaced_atoms} PSNR={mean_psnr:.2f} dB "
             f"LPIPS={mean_lpips:.4f} decode={decode_seconds:.1f}s"
         )
         del reconstructed, reconstructed_tensor, attacked_step_data

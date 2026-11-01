@@ -51,13 +51,14 @@ class CombinatorialRankAttackTest(unittest.TestCase):
             clean.write_bytes(data)
             metadata = attacks.apply_serialized_codebook_attack(
                 clean, attacked, attack="rank-bitflip", count=1,
-                target_steps=[0], target_frames=[0],
+                target_cells=[(0, 0)],
                 rank_region="low", rank_bits=[0])
             parsed = attacks._parse_tdcm_payload_layout(
                 bytearray(attacked.read_bytes()))
         self.assertEqual(metadata["channel_flipped_bits"], 1)
         self.assertEqual(metadata["changed_symbols"], 1)
         self.assertEqual(metadata["examples"][0]["flipped_bit"], 0)
+        self.assertEqual(metadata["target_cells_zero_based"], [[0, 0]])
         self.assertEqual(parsed["rank_entries"][0]["rank"], 1)
         self.assertEqual(parsed["rank_entries"][0]["indices"], [0, 1, 2, 3, 5])
 

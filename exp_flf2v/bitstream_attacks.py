@@ -394,6 +394,7 @@ def select_trajectory_sign_slots(step_data, codebook, count, step_idx,
 def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
                                      seed=42, early_steps=0, count=0,
                                      target_steps=None, target_frames=None,
+                                     target_cells=None,
                                      selected_slots=None, selection_metadata=None,
                                      rank_region='all', rank_bits=None):
     """Flip real bits in a serialized ``.tdcm`` payload and write a new file.
@@ -421,9 +422,24 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
     slots = layout['slots']
     total_symbols = len(slots)
     total_payload_bits = layout['payload_bits']
-    if early_steps > 0 and target_steps:
+    if target_cells and (early_steps > 0 or target_steps or target_frames):
+        raise ValueError(
+            'target_cells is mutually exclusive with early_steps, '
+            'target_steps and target_frames')
+    cell_ids = None
+    if target_cells:
+        cell_ids = {(int(step), int(frame)) for step, frame in target_cells}
+        invalid = sorted(
+            (step, frame) for step, frame in cell_ids
+            if step < 0 or step >= layout['n_sde']
+            or frame < 0 or frame >= layout['n_lat'])
+        if invalid:
+            raise ValueError(f'Invalid zero-based target cells: {invalid}')
+        step_ids = {step for step, _ in cell_ids}
+        frame_ids = {frame for _, frame in cell_ids}
+    elif early_steps > 0 and target_steps:
         raise ValueError('early_steps and target_steps are mutually exclusive')
-    if target_steps:
+    elif target_steps:
         step_ids = {int(v) for v in target_steps}
         invalid = sorted(v for v in step_ids if v < 0 or v >= layout['n_sde'])
         if invalid:
@@ -431,7 +447,9 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
     else:
         max_step = min(early_steps, layout['n_sde']) if early_steps > 0 else layout['n_sde']
         step_ids = set(range(max_step))
-    if target_frames:
+    if cell_ids is not None:
+        pass
+    elif target_frames:
         frame_ids = {int(v) for v in target_frames}
         invalid = sorted(v for v in frame_ids if v < 0 or v >= layout['n_lat'])
         if invalid:
@@ -439,11 +457,17 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
     else:
         frame_ids = set(range(layout['n_lat']))
     eligible = [slot for slot in slots
-                if slot['step'] in step_ids and slot['frame'] in frame_ids]
+                if ((slot['step'], slot['frame']) in cell_ids
+                    if cell_ids is not None else
+                    slot['step'] in step_ids and slot['frame'] in frame_ids)]
     rng = np.random.default_rng(seed)
     if attack == 'rank-bitflip':
-        eligible_entries = [entry for entry in layout['rank_entries']
-                            if entry['step'] in step_ids and entry['frame'] in frame_ids]
+        eligible_entries = [
+            entry for entry in layout['rank_entries']
+            if ((entry['step'], entry['frame']) in cell_ids
+                if cell_ids is not None else
+                entry['step'] in step_ids and entry['frame'] in frame_ids)
+        ]
         candidates = []
         for entry in eligible_entries:
             width = entry['rank_bits']
@@ -553,6 +577,9 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
         attack=attack, rate=rate, requested_count=count, seed=seed,
         early_steps=early_steps,
         target_steps_zero_based=sorted(step_ids), target_frames=sorted(frame_ids),
+        target_cells_zero_based=(
+            [list(cell) for cell in sorted(cell_ids)]
+            if cell_ids is not None else None),
         defense='none', defense_steps=0, transport='serialized-tdcm',
         total_symbols=total_symbols, total_payload_bits=total_payload_bits,
         protection_overhead_bits=0, protected_payload_bits=total_payload_bits,

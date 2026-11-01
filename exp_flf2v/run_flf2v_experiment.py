@@ -389,6 +389,9 @@ def main():
                         help="Exact 1-based SDE steps to attack, e.g. --stream_attack_target_steps 1 4")
     parser.add_argument("--stream_attack_target_frames", type=int, nargs="*", default=None,
                         help="Exact 0-based latent frame positions to attack (0..8 for a 33-frame GOP)")
+    parser.add_argument("--stream_attack_target_cells", nargs="*", default=None,
+                        help=("Sparse attack cells as 1-based-step:0-based-frame, "
+                              "for example 1:3 1:4 2:1"))
     parser.add_argument("--stream_attack_transport", choices=STREAM_TRANSPORT_CHOICES,
                         default="logical",
                         help=("logical edits Python data; serialized edits .tdcm; "
@@ -438,6 +441,28 @@ def main():
         parser.error("A targeted SDE step exceeds steps - ddim_tail")
     if args.stream_attack_target_frames and any(v < 0 for v in args.stream_attack_target_frames):
         parser.error("--stream_attack_target_frames cannot contain negative positions")
+    attack_target_cells = None
+    if args.stream_attack_target_cells is not None:
+        if not args.stream_attack_target_cells:
+            parser.error("--stream_attack_target_cells requires at least one cell")
+        if (args.stream_attack_early_steps > 0
+                or args.stream_attack_target_steps
+                or args.stream_attack_target_frames):
+            parser.error(
+                "--stream_attack_target_cells cannot be combined with attack "
+                "early-steps/target-steps/target-frames")
+        attack_target_cells = []
+        for token in args.stream_attack_target_cells:
+            try:
+                step_text, frame_text = token.split(":", 1)
+                step_value, frame_value = int(step_text), int(frame_text)
+            except (ValueError, AttributeError):
+                parser.error(f"Invalid attack cell {token!r}; use STEP:FRAME")
+            if not 1 <= step_value <= args.steps - args.ddim_tail:
+                parser.error(f"Attack step is outside SDE range: {step_value}")
+            if frame_value < 0:
+                parser.error(f"Attack frame cannot be negative: {frame_value}")
+            attack_target_cells.append((step_value - 1, frame_value))
     if args.stream_defense_steps < 1:
         parser.error("--stream_defense_steps must be positive")
     if args.stream_defense_frames is not None and not args.stream_defense_frames:
@@ -904,6 +929,7 @@ def main():
                     target_steps=([v - 1 for v in args.stream_attack_target_steps]
                                   if args.stream_attack_target_steps else None),
                     target_frames=args.stream_attack_target_frames,
+                    target_cells=attack_target_cells,
                     selected_slots=impact_slots,
                     selection_metadata=impact_metadata,
                     rank_region=args.stream_attack_rank_region,

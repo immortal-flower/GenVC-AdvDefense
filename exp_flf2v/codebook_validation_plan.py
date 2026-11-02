@@ -21,6 +21,60 @@ class ValidationJob:
                 f"frame{self.frame}_aseed{self.attack_seed}{gop_tag}_{tag}")
 
 
+@dataclass(frozen=True)
+class SparseValidationJob:
+    cells: tuple
+    count: int
+    attack_seed: int
+    role: str = "sparse-field-control"
+
+    @property
+    def step(self):
+        return "|".join(str(step + 1) for step, _ in self.cells)
+
+    @property
+    def frame(self):
+        return "|".join(str(frame) for _, frame in self.cells)
+
+    def run_name(self, sequence: str, gop_index: int = 0) -> str:
+        tag = "".join(ch.lower() if ch.isalnum() or ch in "_-" else "_"
+                      for ch in sequence)
+        gop_tag = "" if gop_index == 0 else f"_gop{gop_index}"
+        return (f"sign_uep_unprotected_count{self.count}_"
+                f"aseed{self.attack_seed}{gop_tag}_{tag}")
+
+
+def parse_sparse_cells(tokens, max_step=17, max_frame=8):
+    cells = []
+    for token in tokens or []:
+        try:
+            step_text, frame_text = token.split(":", 1)
+            step, frame = int(step_text), int(frame_text)
+        except (ValueError, AttributeError):
+            raise ValueError(f"Invalid sparse cell {token!r}; use STEP:FRAME")
+        if not 1 <= step <= max_step:
+            raise ValueError(f"Sparse SDE step must lie in [1,{max_step}], got {step}")
+        if not 0 <= frame <= max_frame:
+            raise ValueError(f"Sparse latent position must lie in [0,{max_frame}], got {frame}")
+        cells.append((step - 1, frame))
+    if not cells:
+        raise ValueError("Sparse validation requires at least one cell")
+    if len(set(cells)) != len(cells):
+        raise ValueError("Sparse validation cells contain duplicates")
+    return tuple(cells)
+
+
+def expand_sparse_jobs(cells, counts, attack_seeds, symbols_per_cell=64):
+    pool_size = len(cells) * symbols_per_cell
+    if any(int(count) < 1 or int(count) > pool_size for count in counts):
+        raise ValueError(f"Sparse bit counts must lie in [1,{pool_size}]")
+    return [
+        SparseValidationJob(tuple(cells), int(count), int(seed))
+        for count in counts
+        for seed in attack_seeds
+    ]
+
+
 def load_cells(path):
     cells = []
     with Path(path).open(newline="", encoding="utf-8-sig") as handle:

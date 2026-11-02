@@ -23,7 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bitstream_attacks import apply_serialized_codebook_attack
 from batch_flf2v_runtime import load_dual_gpu_flf2v_model
-from codebook_validation_plan import expand_jobs, load_cells
+from codebook_validation_plan import (
+    SparseValidationJob,
+    expand_jobs,
+    expand_sparse_jobs,
+    load_cells,
+    parse_sparse_cells,
+)
 from run_flf2v_experiment import (
     compress_boundary_frame,
     compute_lpips,
@@ -42,8 +48,11 @@ from sde_rf_wan.turbo_pipeline import TurboDDCMWanPipeline
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Persistent-model targeted codebook validation")
-    parser.add_argument("--plan", required=True,
+    parser.add_argument("--plan",
                         help="CSV with role,sde_step,latent_position columns")
+    parser.add_argument("--sparse_cells", nargs="+",
+                        help=("Attack one shared random budget across exact "
+                              "STEP:FRAME cells, e.g. 1:3 1:4 2:1"))
     parser.add_argument("--data", required=True, help="Single 720p YUV sequence")
     parser.add_argument("--sequence", default="Jockey")
     parser.add_argument("--wan_ckpt", default="exp_flf2v/Wan2.1-FLF2V-14B-720P")
@@ -102,11 +111,21 @@ def main():
         raise ValueError("--gop_index must be non-negative")
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
     output_dir = Path(args.output_dir)
-    cells = load_cells(args.plan)
-    jobs = expand_jobs(cells, args.counts, args.attack_seeds)
+    if bool(args.plan) == bool(args.sparse_cells):
+        raise ValueError("Specify exactly one of --plan or --sparse_cells")
+    if args.sparse_cells:
+        sparse_cells = parse_sparse_cells(
+            args.sparse_cells, args.steps - args.ddim_tail, 8)
+        jobs = expand_sparse_jobs(
+            sparse_cells, args.counts, args.attack_seeds, args.M)
+    else:
+        cells = load_cells(args.plan)
+        jobs = expand_jobs(cells, args.counts, args.attack_seeds)
     gop_tag = "" if args.gop_index == 0 else f"_gop{args.gop_index}"
+    manifest_kind = "sparse_unprotected" if args.sparse_cells else "batch"
     manifest_path = output_dir / (
-        f"validation_batch_manifest_{args.sequence.lower()}{gop_tag}.csv")
+        f"validation_{manifest_kind}_manifest_"
+        f"{args.sequence.lower()}{gop_tag}.csv")
     manifest_rows = write_manifest(
         manifest_path, jobs, args.sequence, output_dir, args.gop_index)
     complete = sum(row["status"] == "complete" for row in manifest_rows)
@@ -180,10 +199,16 @@ def main():
         clean_path = run_dir / "codebook_clean.tdcm"
         attacked_path = run_dir / "codebook.tdcm"
         shutil.copy2(canonical_clean, clean_path)
-        attack_metadata = apply_serialized_codebook_attack(
-            clean_path, attacked_path, attack="sign-bitflip", rate=0.0,
-            count=job.count, seed=job.attack_seed, early_steps=0,
-            target_steps=[job.step - 1], target_frames=[job.frame])
+        if isinstance(job, SparseValidationJob):
+            attack_metadata = apply_serialized_codebook_attack(
+                clean_path, attacked_path, attack="sign-bitflip", rate=0.0,
+                count=job.count, seed=job.attack_seed, early_steps=0,
+                target_cells=list(job.cells))
+        else:
+            attack_metadata = apply_serialized_codebook_attack(
+                clean_path, attacked_path, attack="sign-bitflip", rate=0.0,
+                count=job.count, seed=job.attack_seed, early_steps=0,
+                target_steps=[job.step - 1], target_frames=[job.frame])
         attacked_step_data = TurboBitstream.load(str(attacked_path))["step_data"]
 
         started = time.time()

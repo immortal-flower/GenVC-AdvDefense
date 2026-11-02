@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from exp_flf2v.codebook_validation_plan import expand_jobs, load_cells
+from exp_flf2v.codebook_validation_plan import (
+    expand_jobs,
+    expand_sparse_jobs,
+    load_cells,
+    parse_sparse_cells,
+)
 
 
 class ValidationPlanTests(unittest.TestCase):
@@ -40,6 +45,20 @@ class ValidationPlanTests(unittest.TestCase):
     def test_invalid_budget_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Bit count"):
             expand_jobs([("hot", 1, 3)], [65], [42])
+
+    def test_sparse_cells_share_one_budget(self):
+        cells = parse_sparse_cells(["1:3", "1:4", "2:1"])
+        jobs = expand_sparse_jobs(cells, [11, 21], [42, 123])
+        self.assertEqual(cells, ((0, 3), (0, 4), (1, 1)))
+        self.assertEqual(len(jobs), 4)
+        self.assertEqual(
+            jobs[-1].run_name("Jockey"),
+            "sign_uep_unprotected_count21_aseed123_jockey")
+
+    def test_sparse_budget_is_bounded_by_shared_pool(self):
+        cells = parse_sparse_cells(["1:3", "1:4", "2:1"])
+        with self.assertRaisesRegex(ValueError, "Sparse bit counts"):
+            expand_sparse_jobs(cells, [193], [42])
 
 
 if __name__ == "__main__":

@@ -59,6 +59,14 @@ def parse_args():
     parser.add_argument("--sparse_repetitions", type=int, default=1,
                         help=("1 runs an unprotected serialized baseline; an "
                               "odd value >=3 applies sparse sign repetition"))
+    parser.add_argument(
+        "--sparse_disturbance_mode",
+        choices=["random", "contiguous-burst"], default="random",
+        help="Random protected-bit errors or a contiguous redundancy burst")
+    parser.add_argument("--sparse_interleave_seed", type=int, default=0,
+                        help="Shared redundancy interleaver seed; 0 disables it")
+    parser.add_argument("--sparse_burst_starts", type=int, nargs="+", default=[0],
+                        help="Physical redundancy-bit offsets for burst validation")
     parser.add_argument("--data", required=True, help="Single 720p YUV sequence")
     parser.add_argument("--sequence", default="Jockey")
     parser.add_argument("--wan_ckpt", default="exp_flf2v/Wan2.1-FLF2V-14B-720P")
@@ -124,19 +132,28 @@ def main():
         raise ValueError("--sparse_repetitions must be 1 or an odd integer >=3")
     if args.plan and args.sparse_repetitions != 1:
         raise ValueError("--sparse_repetitions is only valid with --sparse_cells")
+    if args.plan and args.sparse_disturbance_mode != "random":
+        raise ValueError("Sparse disturbance options require --sparse_cells")
     if args.sparse_cells:
         sparse_cells = parse_sparse_cells(
             args.sparse_cells, args.steps - args.ddim_tail, 8)
         jobs = expand_sparse_jobs(
             sparse_cells, args.counts, args.attack_seeds, args.M,
-            args.sparse_repetitions)
+            args.sparse_repetitions, args.sparse_disturbance_mode,
+            args.sparse_interleave_seed, args.sparse_burst_starts)
     else:
         cells = load_cells(args.plan)
         jobs = expand_jobs(cells, args.counts, args.attack_seeds)
     gop_tag = "" if args.gop_index == 0 else f"_gop{args.gop_index}"
     if args.sparse_cells:
-        manifest_kind = ("sparse_unprotected" if args.sparse_repetitions == 1
-                         else f"sparse_rep{args.sparse_repetitions}")
+        if args.sparse_repetitions == 1:
+            manifest_kind = "sparse_unprotected"
+        elif args.sparse_disturbance_mode == "contiguous-burst":
+            manifest_kind = (
+                f"sparse_rep{args.sparse_repetitions}_burst_"
+                f"i{args.sparse_interleave_seed}")
+        else:
+            manifest_kind = f"sparse_rep{args.sparse_repetitions}"
     else:
         manifest_kind = "batch"
     manifest_path = output_dir / (
@@ -223,7 +240,10 @@ def main():
                 clean_path, protected_clean_path, protected_disturbed_path,
                 attacked_path, repetitions=job.repetitions,
                 protected_cells=list(job.cells), count=job.count, rate=0.0,
-                seed=job.attack_seed, disturbance_mode="random")
+                seed=job.attack_seed,
+                disturbance_mode=job.disturbance_mode,
+                interleave_seed=job.interleave_seed,
+                burst_start=job.burst_start)
         elif isinstance(job, SparseValidationJob):
             attack_metadata = apply_serialized_codebook_attack(
                 clean_path, attacked_path, attack="sign-bitflip", rate=0.0,

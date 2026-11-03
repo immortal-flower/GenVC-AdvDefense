@@ -69,6 +69,24 @@ class ValidationPlanTests(unittest.TestCase):
             job.run_name("Jockey", 1),
             "sign_uep_rep3_count64_aseed42_gop1_jockey")
 
+    def test_sparse_burst_jobs_expand_over_starts(self):
+        cells = parse_sparse_cells(["1:3", "1:4", "2:1"])
+        jobs = expand_sparse_jobs(
+            cells, [32, 64], [42], repetitions=3,
+            disturbance_mode="contiguous-burst", interleave_seed=9,
+            burst_starts=[0, 128, 256])
+        self.assertEqual(len(jobs), 6)
+        self.assertEqual(
+            jobs[-1].run_name("Jockey"),
+            "sign_uep_rep3_burst64_ileave9_start256_jockey")
+
+    def test_sparse_burst_cannot_cross_redundancy_end(self):
+        cells = parse_sparse_cells(["1:3", "1:4", "2:1"])
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            expand_sparse_jobs(
+                cells, [129], [42], repetitions=3,
+                disturbance_mode="contiguous-burst", burst_starts=[256])
+
 
 if __name__ == "__main__":
     unittest.main()

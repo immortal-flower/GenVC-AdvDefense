@@ -27,6 +27,9 @@ class SparseValidationJob:
     count: int
     attack_seed: int
     repetitions: int = 1
+    disturbance_mode: str = "random"
+    interleave_seed: int = 0
+    burst_start: int = 0
 
     @property
     def role(self):
@@ -48,6 +51,10 @@ class SparseValidationJob:
         gop_tag = "" if gop_index == 0 else f"_gop{gop_index}"
         protection = ("unprotected" if self.repetitions == 1
                       else f"rep{self.repetitions}")
+        if self.disturbance_mode == "contiguous-burst":
+            return (f"sign_uep_{protection}_burst{self.count}_"
+                    f"ileave{self.interleave_seed}_start{self.burst_start}"
+                    f"{gop_tag}_{tag}")
         return (f"sign_uep_{protection}_count{self.count}_"
                 f"aseed{self.attack_seed}{gop_tag}_{tag}")
 
@@ -73,13 +80,40 @@ def parse_sparse_cells(tokens, max_step=17, max_frame=8):
 
 
 def expand_sparse_jobs(cells, counts, attack_seeds, symbols_per_cell=64,
-                       repetitions=1):
+                       repetitions=1, disturbance_mode="random",
+                       interleave_seed=0, burst_starts=(0,)):
     pool_size = len(cells) * symbols_per_cell
     if any(int(count) < 1 or int(count) > pool_size for count in counts):
         raise ValueError(f"Sparse bit counts must lie in [1,{pool_size}]")
+    if disturbance_mode not in ("random", "contiguous-burst"):
+        raise ValueError(f"Unsupported sparse disturbance mode: {disturbance_mode}")
+    if int(interleave_seed) < 0:
+        raise ValueError("Sparse interleave seed cannot be negative")
+    if disturbance_mode == "contiguous-burst":
+        if repetitions < 3:
+            raise ValueError("Contiguous burst validation requires repetition")
+        starts = tuple(int(value) for value in burst_starts)
+        if not starts or any(value < 0 for value in starts):
+            raise ValueError("Sparse burst starts must be non-negative")
+        redundancy_bits = len(cells) * symbols_per_cell * (repetitions - 1)
+        for count in counts:
+            for start in starts:
+                if start + int(count) > redundancy_bits:
+                    raise ValueError(
+                        f"Burst [{start},{start + int(count)}) exceeds "
+                        f"{redundancy_bits} redundancy bits")
+        return [
+            SparseValidationJob(
+                tuple(cells), int(count), int(attack_seeds[0]),
+                int(repetitions), disturbance_mode, int(interleave_seed),
+                int(start))
+            for count in counts
+            for start in starts
+        ]
     return [
         SparseValidationJob(
-            tuple(cells), int(count), int(seed), int(repetitions))
+            tuple(cells), int(count), int(seed), int(repetitions),
+            disturbance_mode, int(interleave_seed), 0)
         for count in counts
         for seed in attack_seeds
     ]

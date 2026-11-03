@@ -26,7 +26,13 @@ class SparseValidationJob:
     cells: tuple
     count: int
     attack_seed: int
-    role: str = "sparse-field-control"
+    repetitions: int = 1
+
+    @property
+    def role(self):
+        if self.repetitions == 1:
+            return "sparse-field-control"
+        return f"sparse-repetition-{self.repetitions}"
 
     @property
     def step(self):
@@ -40,7 +46,9 @@ class SparseValidationJob:
         tag = "".join(ch.lower() if ch.isalnum() or ch in "_-" else "_"
                       for ch in sequence)
         gop_tag = "" if gop_index == 0 else f"_gop{gop_index}"
-        return (f"sign_uep_unprotected_count{self.count}_"
+        protection = ("unprotected" if self.repetitions == 1
+                      else f"rep{self.repetitions}")
+        return (f"sign_uep_{protection}_count{self.count}_"
                 f"aseed{self.attack_seed}{gop_tag}_{tag}")
 
 
@@ -64,12 +72,14 @@ def parse_sparse_cells(tokens, max_step=17, max_frame=8):
     return tuple(cells)
 
 
-def expand_sparse_jobs(cells, counts, attack_seeds, symbols_per_cell=64):
+def expand_sparse_jobs(cells, counts, attack_seeds, symbols_per_cell=64,
+                       repetitions=1):
     pool_size = len(cells) * symbols_per_cell
     if any(int(count) < 1 or int(count) > pool_size for count in counts):
         raise ValueError(f"Sparse bit counts must lie in [1,{pool_size}]")
     return [
-        SparseValidationJob(tuple(cells), int(count), int(seed))
+        SparseValidationJob(
+            tuple(cells), int(count), int(seed), int(repetitions))
         for count in counts
         for seed in attack_seeds
     ]

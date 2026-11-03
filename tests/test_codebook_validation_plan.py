@@ -60,6 +60,15 @@ class ValidationPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Sparse bit counts"):
             expand_sparse_jobs(cells, [193], [42])
 
+    def test_sparse_repetition_jobs_have_distinct_names(self):
+        cells = parse_sparse_cells(["1:3", "1:4", "2:1"])
+        job = expand_sparse_jobs(
+            cells, [64], [42], repetitions=3)[0]
+        self.assertEqual(job.role, "sparse-repetition-3")
+        self.assertEqual(
+            job.run_name("Jockey", 1),
+            "sign_uep_rep3_count64_aseed42_gop1_jockey")
+
 
 if __name__ == "__main__":
     unittest.main()

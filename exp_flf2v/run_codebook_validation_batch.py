@@ -21,7 +21,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bitstream_attacks import apply_serialized_codebook_attack
+from bitstream_attacks import (
+    apply_serialized_codebook_attack,
+    apply_serialized_repetition_disturbance,
+)
 from batch_flf2v_runtime import load_dual_gpu_flf2v_model
 from codebook_validation_plan import (
     SparseValidationJob,
@@ -53,6 +56,9 @@ def parse_args():
     parser.add_argument("--sparse_cells", nargs="+",
                         help=("Attack one shared random budget across exact "
                               "STEP:FRAME cells, e.g. 1:3 1:4 2:1"))
+    parser.add_argument("--sparse_repetitions", type=int, default=1,
+                        help=("1 runs an unprotected serialized baseline; an "
+                              "odd value >=3 applies sparse sign repetition"))
     parser.add_argument("--data", required=True, help="Single 720p YUV sequence")
     parser.add_argument("--sequence", default="Jockey")
     parser.add_argument("--wan_ckpt", default="exp_flf2v/Wan2.1-FLF2V-14B-720P")
@@ -113,16 +119,26 @@ def main():
     output_dir = Path(args.output_dir)
     if bool(args.plan) == bool(args.sparse_cells):
         raise ValueError("Specify exactly one of --plan or --sparse_cells")
+    if args.sparse_repetitions != 1 and (
+            args.sparse_repetitions < 3 or args.sparse_repetitions % 2 != 1):
+        raise ValueError("--sparse_repetitions must be 1 or an odd integer >=3")
+    if args.plan and args.sparse_repetitions != 1:
+        raise ValueError("--sparse_repetitions is only valid with --sparse_cells")
     if args.sparse_cells:
         sparse_cells = parse_sparse_cells(
             args.sparse_cells, args.steps - args.ddim_tail, 8)
         jobs = expand_sparse_jobs(
-            sparse_cells, args.counts, args.attack_seeds, args.M)
+            sparse_cells, args.counts, args.attack_seeds, args.M,
+            args.sparse_repetitions)
     else:
         cells = load_cells(args.plan)
         jobs = expand_jobs(cells, args.counts, args.attack_seeds)
     gop_tag = "" if args.gop_index == 0 else f"_gop{args.gop_index}"
-    manifest_kind = "sparse_unprotected" if args.sparse_cells else "batch"
+    if args.sparse_cells:
+        manifest_kind = ("sparse_unprotected" if args.sparse_repetitions == 1
+                         else f"sparse_rep{args.sparse_repetitions}")
+    else:
+        manifest_kind = "batch"
     manifest_path = output_dir / (
         f"validation_{manifest_kind}_manifest_"
         f"{args.sequence.lower()}{gop_tag}.csv")
@@ -199,7 +215,16 @@ def main():
         clean_path = run_dir / "codebook_clean.tdcm"
         attacked_path = run_dir / "codebook.tdcm"
         shutil.copy2(canonical_clean, clean_path)
-        if isinstance(job, SparseValidationJob):
+        if isinstance(job, SparseValidationJob) and job.repetitions > 1:
+            protected_clean_path = run_dir / "codebook_protected_clean.tdcmr"
+            protected_disturbed_path = (
+                run_dir / "codebook_protected_disturbed.tdcmr")
+            attack_metadata = apply_serialized_repetition_disturbance(
+                clean_path, protected_clean_path, protected_disturbed_path,
+                attacked_path, repetitions=job.repetitions,
+                protected_cells=list(job.cells), count=job.count, rate=0.0,
+                seed=job.attack_seed, disturbance_mode="random")
+        elif isinstance(job, SparseValidationJob):
             attack_metadata = apply_serialized_codebook_attack(
                 clean_path, attacked_path, attack="sign-bitflip", rate=0.0,
                 count=job.count, seed=job.attack_seed, early_steps=0,
@@ -229,7 +254,10 @@ def main():
             loss_fn=lpips_metric)
         codebook_bits = (pipe.num_sde_steps * pipe.num_latent_frames *
                          pipe.codebook.bits_per_frame_step)
-        total_bits = codebook_bits + boundary_bytes * 8
+        protection_overhead_bits = int(
+            attack_metadata.get("protection_overhead_bits", 0))
+        total_bits = (codebook_bits + protection_overhead_bits +
+                      boundary_bytes * 8)
         result = {
             "sequence": args.sequence,
             "gop": args.gop_index,
@@ -245,7 +273,7 @@ def main():
             "codebook_bits": codebook_bits,
             "codebook_bytes": (codebook_bits + 7) // 8,
             "boundary_bytes": boundary_bytes,
-            "protection_overhead_bits": 0,
+            "protection_overhead_bits": protection_overhead_bits,
             "encode_seconds": 0.0,
             "decode_seconds": round(decode_seconds, 3),
             "clean_PSNR_dB": clean_metrics["PSNR_dB"],

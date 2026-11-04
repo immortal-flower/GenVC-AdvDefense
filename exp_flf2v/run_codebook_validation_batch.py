@@ -24,14 +24,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bitstream_attacks import (
     apply_serialized_codebook_attack,
     apply_serialized_repetition_disturbance,
+    apply_serialized_slot_repetition_bsc,
+    select_sign_protection_slots,
 )
 from batch_flf2v_runtime import load_dual_gpu_flf2v_model
 from codebook_validation_plan import (
+    PolicyValidationJob,
     SparseValidationJob,
     expand_jobs,
+    expand_policy_jobs,
     expand_sparse_jobs,
     load_cells,
     parse_sparse_cells,
+)
+from experiment_provenance import (
+    build_job_provenance,
+    build_shared_validation_provenance,
+    formal_run_name,
+    metrics_matches_provenance,
 )
 from run_flf2v_experiment import (
     compress_boundary_frame,
@@ -56,6 +66,18 @@ def parse_args():
     parser.add_argument("--sparse_cells", nargs="+",
                         help=("Attack one shared random budget across exact "
                               "STEP:FRAME cells, e.g. 1:3 1:4 2:1"))
+    parser.add_argument(
+        "--protection_policies", nargs="+",
+        choices=["eep", "random", "early-step", "frozen-joint"],
+        help=("Run equal-overhead partial-sign policies under one uniform "
+              "physical sign-bit channel"))
+    parser.add_argument("--protected_signs", type=int, default=192)
+    parser.add_argument("--policy_seeds", type=int, nargs="+", default=[42])
+    parser.add_argument(
+        "--policy_cells", nargs="+", default=["1:3", "1:4", "2:1"],
+        help="Frozen STEP:FRAME cells used only by frozen-joint")
+    parser.add_argument("--policy_repetitions", type=int, default=3)
+    parser.add_argument("--policy_interleave_seed", type=int, default=42)
     parser.add_argument("--sparse_repetitions", type=int, default=1,
                         help=("1 runs an unprotected serialized baseline; an "
                               "odd value >=3 applies sparse sign repetition"))
@@ -93,22 +115,43 @@ def parse_args():
     parser.add_argument("--save_video", action="store_true",
                         help="Save reconstructed MP4 for every job; metrics never use it")
     parser.add_argument("--plan_only", action="store_true")
+    parser.add_argument(
+        "--formal_run", action="store_true",
+        help=("Use content-derived configuration IDs in output names and "
+              "only skip metrics with an exact provenance match"))
+    parser.add_argument(
+        "--experiment_tag", default="paper",
+        help="Readable tag added to formal-run output and manifest names")
     return parser.parse_args()
 
 
-def write_manifest(path, jobs, sequence, output_dir, gop_index=0):
+def write_manifest(path, jobs, sequence, output_dir, gop_index=0,
+                   provenance_records=None, experiment_tag="paper"):
     fields = ["run_name", "role", "count", "sde_step", "latent_position",
-              "attack_seed", "status", "metrics_path"]
+              "attack_seed", "model_seed", "configuration_id", "status",
+              "metrics_path"]
     rows = []
-    for job in jobs:
-        name = job.run_name(sequence, gop_index)
+    for index, job in enumerate(jobs):
+        provenance = (provenance_records[index]
+                      if provenance_records is not None else None)
+        base_name = job.run_name(sequence, gop_index)
+        name = (formal_run_name(base_name, provenance, experiment_tag)
+                if provenance is not None else base_name)
         metrics = (output_dir / name / sequence / f"gop{gop_index}" /
                    "metrics.json")
+        if provenance is None:
+            complete = metrics.exists()
+        else:
+            complete = metrics_matches_provenance(metrics, provenance)
         rows.append({
             "run_name": name, "role": job.role, "count": job.count,
             "sde_step": job.step, "latent_position": job.frame,
             "attack_seed": job.attack_seed,
-            "status": "complete" if metrics.exists() else "pending",
+            "model_seed": (provenance["model"]["model_seed"]
+                           if provenance is not None else ""),
+            "configuration_id": (provenance["configuration_id"]
+                                 if provenance is not None else ""),
+            "status": "complete" if complete else "pending",
             "metrics_path": str(metrics),
         })
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,16 +168,27 @@ def main():
         raise ValueError("--gop_index must be non-negative")
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
     output_dir = Path(args.output_dir)
-    if bool(args.plan) == bool(args.sparse_cells):
-        raise ValueError("Specify exactly one of --plan or --sparse_cells")
+    modes = sum(bool(value) for value in (
+        args.plan, args.sparse_cells, args.protection_policies))
+    if modes != 1:
+        raise ValueError(
+            "Specify exactly one of --plan, --sparse_cells or "
+            "--protection_policies")
     if args.sparse_repetitions != 1 and (
             args.sparse_repetitions < 3 or args.sparse_repetitions % 2 != 1):
         raise ValueError("--sparse_repetitions must be 1 or an odd integer >=3")
-    if args.plan and args.sparse_repetitions != 1:
+    if (args.plan or args.protection_policies) and args.sparse_repetitions != 1:
         raise ValueError("--sparse_repetitions is only valid with --sparse_cells")
-    if args.plan and args.sparse_disturbance_mode != "random":
+    if (args.plan or args.protection_policies) and args.sparse_disturbance_mode != "random":
         raise ValueError("Sparse disturbance options require --sparse_cells")
-    if args.sparse_cells:
+    if args.protection_policies:
+        policy_cells = parse_sparse_cells(
+            args.policy_cells, args.steps - args.ddim_tail, 8)
+        jobs = expand_policy_jobs(
+            args.protection_policies, args.protected_signs, args.counts,
+            args.attack_seeds, args.policy_seeds, args.policy_repetitions,
+            policy_cells, args.policy_interleave_seed)
+    elif args.sparse_cells:
         sparse_cells = parse_sparse_cells(
             args.sparse_cells, args.steps - args.ddim_tail, 8)
         jobs = expand_sparse_jobs(
@@ -144,8 +198,15 @@ def main():
     else:
         cells = load_cells(args.plan)
         jobs = expand_jobs(cells, args.counts, args.attack_seeds)
+    provenance_records = None
+    if args.formal_run:
+        shared_provenance = build_shared_validation_provenance(args)
+        provenance_records = [
+            build_job_provenance(shared_provenance, job) for job in jobs]
     gop_tag = "" if args.gop_index == 0 else f"_gop{args.gop_index}"
-    if args.sparse_cells:
+    if args.protection_policies:
+        manifest_kind = "same_budget_policy"
+    elif args.sparse_cells:
         if args.sparse_repetitions == 1:
             manifest_kind = "sparse_unprotected"
         elif args.sparse_disturbance_mode == "contiguous-burst":
@@ -156,11 +217,13 @@ def main():
             manifest_kind = f"sparse_rep{args.sparse_repetitions}"
     else:
         manifest_kind = "batch"
+    formal_tag = f"_{args.experiment_tag.lower()}" if args.formal_run else ""
     manifest_path = output_dir / (
         f"validation_{manifest_kind}_manifest_"
-        f"{args.sequence.lower()}{gop_tag}.csv")
+        f"{args.sequence.lower()}{gop_tag}{formal_tag}.csv")
     manifest_rows = write_manifest(
-        manifest_path, jobs, args.sequence, output_dir, args.gop_index)
+        manifest_path, jobs, args.sequence, output_dir, args.gop_index,
+        provenance_records, args.experiment_tag)
     complete = sum(row["status"] == "complete" for row in manifest_rows)
     print(f"Validation jobs: {len(jobs)}; complete: {complete}; "
           f"pending: {len(jobs) - complete}")
@@ -232,7 +295,21 @@ def main():
         clean_path = run_dir / "codebook_clean.tdcm"
         attacked_path = run_dir / "codebook.tdcm"
         shutil.copy2(canonical_clean, clean_path)
-        if isinstance(job, SparseValidationJob) and job.repetitions > 1:
+        if isinstance(job, PolicyValidationJob):
+            protected_clean_path = run_dir / "codebook_protected_clean.tds3"
+            protected_disturbed_path = (
+                run_dir / "codebook_protected_disturbed.tds3")
+            protected_slots = select_sign_protection_slots(
+                clean_path, job.policy, job.protected_signs,
+                policy_seed=job.policy_seed, cells=job.cells)
+            attack_metadata = apply_serialized_slot_repetition_bsc(
+                clean_path, protected_clean_path, protected_disturbed_path,
+                attacked_path, protected_slots=protected_slots,
+                repetitions=job.repetitions, count=job.count,
+                seed=job.attack_seed, policy_name=job.policy,
+                policy_seed=job.policy_seed,
+                interleave_seed=job.interleave_seed)
+        elif isinstance(job, SparseValidationJob) and job.repetitions > 1:
             protected_clean_path = run_dir / "codebook_protected_clean.tdcmr"
             protected_disturbed_path = (
                 run_dir / "codebook_protected_disturbed.tdcmr")
@@ -276,8 +353,16 @@ def main():
                          pipe.codebook.bits_per_frame_step)
         protection_overhead_bits = int(
             attack_metadata.get("protection_overhead_bits", 0))
-        total_bits = (codebook_bits + protection_overhead_bits +
-                      boundary_bytes * 8)
+        if isinstance(job, PolicyValidationJob):
+            # TDS3 is a complete serialized codebook container.  Count its
+            # fixed header and byte padding instead of reporting only the
+            # theoretical atom payload.
+            transmitted_codebook_bits = int(
+                attack_metadata["transmitted_container_bits"])
+            total_bits = transmitted_codebook_bits + boundary_bytes * 8
+        else:
+            transmitted_codebook_bits = codebook_bits + protection_overhead_bits
+            total_bits = transmitted_codebook_bits + boundary_bytes * 8
         result = {
             "sequence": args.sequence,
             "gop": args.gop_index,
@@ -294,16 +379,24 @@ def main():
             "codebook_bytes": (codebook_bits + 7) // 8,
             "boundary_bytes": boundary_bytes,
             "protection_overhead_bits": protection_overhead_bits,
+            "transport_codebook_bits": transmitted_codebook_bits,
+            "container_header_bits": int(
+                attack_metadata.get("container_header_bits", 0)),
+            "container_padding_bits": int(
+                attack_metadata.get("container_padding_bits", 0)),
             "encode_seconds": 0.0,
             "decode_seconds": round(decode_seconds, 3),
             "clean_PSNR_dB": clean_metrics["PSNR_dB"],
             "clean_LPIPS": clean_metrics["LPIPS"],
         }
+        if provenance_records is not None:
+            result["provenance"] = provenance_records[index - 1]
         with (run_dir / "metrics.json").open("w", encoding="utf-8") as handle:
             json.dump(result, handle, indent=2)
         row["status"] = "complete"
-        write_manifest(manifest_path, jobs, args.sequence, output_dir,
-                       args.gop_index)
+        write_manifest(
+            manifest_path, jobs, args.sequence, output_dir, args.gop_index,
+            provenance_records, args.experiment_tag)
         print(f"[DONE] PSNR={mean_psnr:.2f} dB, LPIPS={mean_lpips:.4f}, "
               f"decode={decode_seconds:.1f}s")
         del reconstructed, reconstructed_tensor, attacked_step_data

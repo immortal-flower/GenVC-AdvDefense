@@ -59,6 +59,50 @@ class SparseValidationJob:
                 f"aseed{self.attack_seed}{gop_tag}_{tag}")
 
 
+@dataclass(frozen=True)
+class PolicyValidationJob:
+    policy: str
+    protected_signs: int
+    count: int
+    attack_seed: int
+    policy_seed: int = 42
+    repetitions: int = 3
+    cells: tuple = ()
+    interleave_seed: int = 0
+
+    @property
+    def role(self):
+        return f"same-budget-{self.policy}"
+
+    @property
+    def step(self):
+        if not self.cells:
+            return "policy"
+        return "|".join(str(step + 1) for step, _ in self.cells)
+
+    @property
+    def frame(self):
+        if not self.cells:
+            return "policy"
+        return "|".join(str(frame) for _, frame in self.cells)
+
+    @property
+    def disturbance_mode(self):
+        return "uniform-sign-bsc"
+
+    @property
+    def burst_start(self):
+        return 0
+
+    def run_name(self, sequence: str, gop_index: int = 0) -> str:
+        tag = "".join(ch.lower() if ch.isalnum() or ch in "_-" else "_"
+                      for ch in sequence)
+        gop_tag = "" if gop_index == 0 else f"_gop{gop_index}"
+        return (f"sign_policy_{self.policy}_p{self.protected_signs}_"
+                f"b{self.count}_pseed{self.policy_seed}_"
+                f"aseed{self.attack_seed}{gop_tag}_{tag}")
+
+
 def parse_sparse_cells(tokens, max_step=17, max_frame=8):
     cells = []
     for token in tokens or []:
@@ -117,6 +161,38 @@ def expand_sparse_jobs(cells, counts, attack_seeds, symbols_per_cell=64,
         for count in counts
         for seed in attack_seeds
     ]
+
+
+def expand_policy_jobs(policies, protected_signs, counts, attack_seeds,
+                       policy_seeds=(42,), repetitions=3, cells=(),
+                       interleave_seed=0):
+    allowed = {"eep", "random", "early-step", "frozen-joint"}
+    policies = tuple(str(policy) for policy in policies)
+    invalid = sorted(set(policies) - allowed)
+    if not policies or invalid:
+        raise ValueError(f"Invalid protection policies: {invalid}")
+    if int(protected_signs) < 1:
+        raise ValueError("protected_signs must be positive")
+    if repetitions < 3 or repetitions % 2 != 1:
+        raise ValueError("Policy repetitions must be an odd integer >=3")
+    if any(int(count) < 1 for count in counts):
+        raise ValueError("Policy channel counts must be positive")
+    cells = tuple(cells or ())
+    if "frozen-joint" in policies and not cells:
+        raise ValueError("frozen-joint policy requires frozen cells")
+    jobs = []
+    for count in counts:
+        for attack_seed in attack_seeds:
+            for policy in policies:
+                seeds = policy_seeds if policy == "random" else (0,)
+                for policy_seed in seeds:
+                    jobs.append(PolicyValidationJob(
+                        policy=policy, protected_signs=int(protected_signs),
+                        count=int(count), attack_seed=int(attack_seed),
+                        policy_seed=int(policy_seed), repetitions=int(repetitions),
+                        cells=cells if policy == "frozen-joint" else (),
+                        interleave_seed=int(interleave_seed)))
+    return jobs
 
 
 def load_cells(path):

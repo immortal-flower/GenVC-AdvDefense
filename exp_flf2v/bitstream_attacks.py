@@ -1,4 +1,5 @@
 """Controlled corruption attacks on transmitted Turbo-DDCM codebook data."""
+import hashlib
 import math
 import struct
 from pathlib import Path
@@ -35,6 +36,12 @@ _RANK_REPETITION_VERSION = 1
 _RANK_REPETITION_HEADER_FORMAT = '<4sBBBBIII'
 _RANK_REPETITION_HEADER_SIZE = struct.calcsize(
     _RANK_REPETITION_HEADER_FORMAT)
+
+_SLOT_SIGN_REPETITION_MAGIC = b'TDS3'
+_SLOT_SIGN_REPETITION_VERSION = 1
+_SLOT_SIGN_REPETITION_HEADER_FORMAT = '<4sBBBBIII16s'
+_SLOT_SIGN_REPETITION_HEADER_SIZE = struct.calcsize(
+    _SLOT_SIGN_REPETITION_HEADER_FORMAT)
 
 
 def _parse_tdcm_payload_layout(raw):
@@ -840,6 +847,217 @@ def apply_serialized_repetition_disturbance(
         protected_disturbed_path=str(protected_disturbed_path),
         recovered_path=str(recovered_path),
         defense_model='serialized odd-repetition majority protection',
+    )
+
+
+def _evenly_spaced(items, count):
+    """Return ``count`` deterministic, approximately uniform list entries."""
+    if count < 1 or count > len(items):
+        raise ValueError(f'Protected sign count must lie in [1,{len(items)}]')
+    indices = [int((index + 0.5) * len(items) / count)
+               for index in range(count)]
+    if len(set(indices)) != count:
+        raise RuntimeError('Even sign selection unexpectedly produced duplicates')
+    return [items[index] for index in indices]
+
+
+def select_sign_protection_slots(input_path, policy, protected_count,
+                                 policy_seed=42, cells=None):
+    """Select sign slots using a policy fixed before test-time corruption.
+
+    ``eep`` spreads redundancy over the complete step/time grid;
+    ``early-step`` spreads it within SDE step 1; ``random`` is a same-budget
+    concentration control; and ``frozen-joint`` uses an externally frozen
+    list of cells.  None of these selectors reads reconstruction quality.
+    """
+    payload = bytearray(Path(input_path).read_bytes())
+    layout = _parse_tdcm_payload_layout(payload)
+    all_slots = [(slot['step'], slot['frame'], slot['atom'])
+                 for slot in layout['slots']]
+    protected_count = int(protected_count)
+    if policy == 'eep':
+        candidates = all_slots
+        chosen = _evenly_spaced(candidates, protected_count)
+    elif policy == 'early-step':
+        candidates = [slot for slot in all_slots if slot[0] == 0]
+        chosen = _evenly_spaced(candidates, protected_count)
+    elif policy == 'random':
+        if protected_count < 1 or protected_count > len(all_slots):
+            raise ValueError(
+                f'Protected sign count must lie in [1,{len(all_slots)}]')
+        rng = np.random.default_rng(int(policy_seed))
+        chosen = [all_slots[int(index)] for index in sorted(
+            rng.choice(len(all_slots), size=protected_count, replace=False))]
+    elif policy == 'frozen-joint':
+        if not cells:
+            raise ValueError('frozen-joint policy requires STEP:FRAME cells')
+        cell_set = {(int(step), int(frame)) for step, frame in cells}
+        candidates = [slot for slot in all_slots
+                      if (slot[0], slot[1]) in cell_set]
+        if not candidates:
+            raise ValueError('Frozen joint cells select no sign slots')
+        chosen = _evenly_spaced(candidates, protected_count)
+    else:
+        raise ValueError(f'Unknown sign protection policy: {policy}')
+    return tuple(chosen)
+
+
+def apply_serialized_slot_repetition_bsc(
+        input_path, protected_clean_path, protected_disturbed_path,
+        recovered_path, protected_slots, repetitions=3, count=0, rate=0.0,
+        seed=42, policy_name='custom', policy_seed=42,
+        interleave_seed=0):
+    """Apply one blind BSC over protected and unprotected sign copies.
+
+    Every original sign contributes one physical bit. Selected signs receive
+    ``R-1`` additional copies, but the random channel samples uniformly from
+    the *whole* physical sign domain.  Consequently two policies with the same
+    number of protected signs and repetitions have identical transmitted sign
+    length and see the same channel model.  The fixed-size TDS3 header carries
+    only a policy digest; the slot rule is assumed to be shared by sender and
+    receiver rather than sent as a test-specific oracle map.
+    """
+    if repetitions < 3 or repetitions % 2 != 1:
+        raise ValueError('repetitions must be an odd integer >= 3')
+    if count < 0 or (count == 0 and not 0 < rate <= 1):
+        raise ValueError('A positive count or rate in (0,1] is required')
+    payload = bytearray(Path(input_path).read_bytes())
+    layout = _parse_tdcm_payload_layout(payload)
+    slots_by_key = {
+        (slot['step'], slot['frame'], slot['atom']): slot
+        for slot in layout['slots']
+    }
+    protected_keys = tuple(sorted({tuple(map(int, key))
+                                   for key in protected_slots}))
+    if not protected_keys:
+        raise ValueError('At least one protected sign slot is required')
+    missing = [key for key in protected_keys if key not in slots_by_key]
+    if missing:
+        raise ValueError(f'Invalid protected sign slots: {missing[:5]}')
+    protected = [slots_by_key[key] for key in protected_keys]
+
+    rule_bytes = b''.join(struct.pack('<BBH', *key) for key in protected_keys)
+    rule_digest = hashlib.sha256(rule_bytes).digest()[:16]
+    redundancy_bits = len(protected) * (repetitions - 1)
+    if interleave_seed:
+        interleave = np.random.default_rng(int(interleave_seed)).permutation(
+            redundancy_bits)
+    else:
+        interleave = np.arange(redundancy_bits, dtype=np.int64)
+    redundancy = bytearray((redundancy_bits + 7) // 8)
+    protected_ordinal = {key: ordinal
+                         for ordinal, key in enumerate(protected_keys)}
+    for ordinal, slot in enumerate(protected):
+        value = 1 if payload[slot['sign_offset']] & slot['sign_mask'] else 0
+        if value:
+            for copy in range(1, repetitions):
+                raw_bit = ordinal * (repetitions - 1) + copy - 1
+                physical_bit = int(interleave[raw_bit])
+                redundancy[physical_bit // 8] |= 1 << (physical_bit % 8)
+
+    policy_code = int(hashlib.sha256(
+        str(policy_name).encode('utf-8')).digest()[0])
+    header = struct.pack(
+        _SLOT_SIGN_REPETITION_HEADER_FORMAT,
+        _SLOT_SIGN_REPETITION_MAGIC, _SLOT_SIGN_REPETITION_VERSION,
+        repetitions, policy_code, 0, len(payload), int(policy_seed),
+        int(interleave_seed), rule_digest)
+    prefix_size = len(header)
+    clean_container = bytearray(header + payload + redundancy)
+    Path(protected_clean_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(protected_clean_path).write_bytes(clean_container)
+
+    def physical_location(slot, copy):
+        if copy == 0:
+            return prefix_size + slot['sign_offset'], slot['sign_mask']
+        key = (slot['step'], slot['frame'], slot['atom'])
+        ordinal = protected_ordinal[key]
+        raw_bit = ordinal * (repetitions - 1) + copy - 1
+        physical_bit = int(interleave[raw_bit])
+        return (prefix_size + len(payload) + physical_bit // 8,
+                1 << (physical_bit % 8))
+
+    physical_domain = []
+    for slot in layout['slots']:
+        key = (slot['step'], slot['frame'], slot['atom'])
+        copies = repetitions if key in protected_ordinal else 1
+        physical_domain.extend((slot, copy) for copy in range(copies))
+    requested = int(count) if count > 0 else max(
+        1, int(round(len(physical_domain) * rate)))
+    if requested > len(physical_domain):
+        raise ValueError('Requested changes exceed the physical sign domain')
+    rng = np.random.default_rng(int(seed))
+    chosen_ids = rng.choice(
+        len(physical_domain), size=requested, replace=False)
+    disturbed = bytearray(clean_container)
+    touched = set()
+    examples = []
+    for physical_id in chosen_ids:
+        slot, copy = physical_domain[int(physical_id)]
+        byte_offset, bit_mask = physical_location(slot, copy)
+        disturbed[byte_offset] ^= bit_mask
+        key = (slot['step'], slot['frame'], slot['atom'])
+        touched.add(key)
+        if len(examples) < 20:
+            examples.append(dict(
+                step=slot['step'], frame=slot['frame'], atom=slot['atom'],
+                copy=copy, byte_offset=byte_offset))
+    Path(protected_disturbed_path).write_bytes(disturbed)
+
+    recovered = bytearray(
+        disturbed[prefix_size:prefix_size + len(payload)])
+    changed = 0
+    corrected = 0
+    majority = repetitions // 2 + 1
+    for key, slot in slots_by_key.items():
+        if key in protected_ordinal:
+            votes = 0
+            for copy in range(repetitions):
+                byte_offset, bit_mask = physical_location(slot, copy)
+                votes += 1 if disturbed[byte_offset] & bit_mask else 0
+            new_value = 1 if votes >= majority else 0
+        else:
+            byte_offset, bit_mask = physical_location(slot, 0)
+            new_value = 1 if disturbed[byte_offset] & bit_mask else 0
+        old_value = 1 if payload[slot['sign_offset']] & slot['sign_mask'] else 0
+        if new_value:
+            recovered[slot['sign_offset']] |= slot['sign_mask']
+        else:
+            recovered[slot['sign_offset']] &= ~slot['sign_mask'] & 0xff
+        if new_value != old_value:
+            changed += 1
+        elif key in touched:
+            corrected += 1
+    Path(recovered_path).write_bytes(recovered)
+    _parse_tdcm_payload_layout(recovered)
+
+    total_payload_bits = layout['payload_bits']
+    header_bits = prefix_size * 8
+    padding_bits = len(redundancy) * 8 - redundancy_bits
+    return dict(
+        attack='sign-bitflip', channel_model='uniform-sign-bsc',
+        rate=rate, requested_count=count, seed=int(seed),
+        defense='slot-sign-repetition', defense_repetitions=repetitions,
+        protection_policy=str(policy_name), policy_seed=int(policy_seed),
+        protection_rule_sha256=rule_digest.hex(),
+        protected_sign_symbols=len(protected),
+        protected_cells=[list(cell) for cell in sorted({
+            (key[0], key[1]) for key in protected_keys})],
+        interleave_seed=int(interleave_seed), transport='protected-serialized-tds3',
+        total_symbols=len(layout['slots']), total_payload_bits=total_payload_bits,
+        protection_overhead_bits=redundancy_bits,
+        container_header_bits=header_bits, container_padding_bits=padding_bits,
+        transmitted_container_bits=(len(clean_container) * 8),
+        channel_flipped_bits=requested, changed_symbols=changed,
+        changed_bits=requested, corrected_logical_symbols=corrected,
+        payload_BER=requested / len(physical_domain),
+        eligible_symbols=len(layout['slots']),
+        eligible_physical_bits=len(physical_domain), examples=examples,
+        input_path=str(input_path), protected_clean_path=str(protected_clean_path),
+        protected_disturbed_path=str(protected_disturbed_path),
+        recovered_path=str(recovered_path),
+        defense_model=('same-budget partial sign repetition under a uniform '
+                       'physical sign-bit channel'),
     )
 
 

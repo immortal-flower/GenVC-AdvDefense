@@ -5,6 +5,7 @@ from pathlib import Path
 
 from exp_flf2v.codebook_validation_plan import (
     expand_jobs,
+    expand_policy_jobs,
     expand_sparse_jobs,
     load_cells,
     parse_sparse_cells,
@@ -86,6 +87,25 @@ class ValidationPlanTests(unittest.TestCase):
             expand_sparse_jobs(
                 cells, [129], [42], repetitions=3,
                 disturbance_mode="contiguous-burst", burst_starts=[256])
+
+    def test_same_budget_policy_jobs_expand_deterministically(self):
+        cells = parse_sparse_cells(["1:3", "1:4", "2:1"])
+        jobs = expand_policy_jobs(
+            ["eep", "random", "early-step", "frozen-joint"],
+            protected_signs=192, counts=[32, 64],
+            attack_seeds=[42, 123], policy_seeds=[7, 9],
+            repetitions=3, cells=cells, interleave_seed=42)
+        # Three deterministic policies contribute one job; random contributes
+        # two policy seeds: 5 policies per channel budget/attack-seed pair.
+        self.assertEqual(len(jobs), 2 * 2 * 5)
+        frozen = [job for job in jobs if job.policy == "frozen-joint"][0]
+        self.assertEqual(frozen.cells, cells)
+        self.assertIn("sign_policy_frozen-joint_p192_b32", frozen.run_name("Jockey"))
+
+    def test_frozen_policy_requires_cells(self):
+        with self.assertRaisesRegex(ValueError, "requires frozen cells"):
+            expand_policy_jobs(
+                ["frozen-joint"], 192, [32], [42], cells=())
 
 
 if __name__ == "__main__":

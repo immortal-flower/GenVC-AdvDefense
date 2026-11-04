@@ -105,6 +105,48 @@ class CombinatorialRankAttackTest(unittest.TestCase):
         self.assertEqual(metadata["corrected_logical_symbols"], 1)
         self.assertEqual(metadata["protection_overhead_bits"], 10)
 
+    def test_same_budget_slot_policies_use_one_global_channel(self):
+        data, _ = self._tiny_tdc2()
+        with tempfile.TemporaryDirectory() as tmp:
+            clean = Path(tmp) / "clean.tdcm"
+            clean.write_bytes(data)
+            eep = attacks.select_sign_protection_slots(
+                clean, "eep", 2)
+            random_slots = attacks.select_sign_protection_slots(
+                clean, "random", 2, policy_seed=7)
+            self.assertEqual(len(eep), 2)
+            self.assertEqual(len(random_slots), 2)
+
+            protected = Path(tmp) / "clean.tds3"
+            disturbed = Path(tmp) / "disturbed.tds3"
+            recovered = Path(tmp) / "recovered.tdcm"
+            metadata = attacks.apply_serialized_slot_repetition_bsc(
+                clean, protected, disturbed, recovered,
+                protected_slots=eep, repetitions=3, count=1, seed=42,
+                policy_name="eep", policy_seed=0)
+            parsed = attacks._parse_tdcm_payload_layout(
+                bytearray(recovered.read_bytes()))
+            serialized_bits = len(protected.read_bytes()) * 8
+        self.assertEqual(parsed["n_sde"], 1)
+        self.assertEqual(metadata["protected_sign_symbols"], 2)
+        self.assertEqual(metadata["protection_overhead_bits"], 4)
+        self.assertEqual(metadata["eligible_physical_bits"], 9)
+        self.assertEqual(metadata["channel_flipped_bits"], 1)
+        self.assertEqual(
+            metadata["transmitted_container_bits"],
+            serialized_bits)
+
+    def test_frozen_joint_selection_is_cell_bounded(self):
+        data, _ = self._tiny_tdc2()
+        with tempfile.TemporaryDirectory() as tmp:
+            clean = Path(tmp) / "clean.tdcm"
+            clean.write_bytes(data)
+            chosen = attacks.select_sign_protection_slots(
+                clean, "frozen-joint", 3, cells=[(0, 0)])
+        self.assertEqual(len(chosen), 3)
+        self.assertTrue(all((step, frame) == (0, 0)
+                            for step, frame, _ in chosen))
+
 
 if __name__ == "__main__":
     unittest.main()

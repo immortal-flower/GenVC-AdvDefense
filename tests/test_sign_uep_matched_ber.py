@@ -17,6 +17,12 @@ class MatchedBerPlotTests(unittest.TestCase):
         self.assertEqual(
             unprotected_run_name(21, 123, "Jockey"),
             "sign_uep_unprotected_count21_aseed123_jockey")
+        self.assertEqual(
+            protected_run_name(64, 123, "Jockey", 1),
+            "sign_uep_rep3_count64_aseed123_gop1_jockey")
+        self.assertEqual(
+            unprotected_run_name(21, 123, "Jockey", 1),
+            "sign_uep_unprotected_count21_aseed123_gop1_jockey")
 
     def test_collect_rows_matches_local_error_rates(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:

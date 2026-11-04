@@ -39,16 +39,24 @@ def read_metrics(path):
         return json.load(handle)
 
 
-def protected_run_name(budget, seed):
-    if budget == 64 and seed == 42:
+def sequence_tag(sequence):
+    return "".join(ch.lower() if ch.isalnum() or ch in "_-" else "_"
+                   for ch in sequence)
+
+
+def protected_run_name(budget, seed, sequence="Jockey", gop_index=0):
+    if gop_index == 0 and budget == 64 and seed == 42:
         return "sign64_hotspot_sparse_rep3"
+    if gop_index:
+        return (f"sign_uep_rep3_count{budget}_aseed{seed}_"
+                f"gop{gop_index}_{sequence_tag(sequence)}")
     return f"sign_uep_rep3_budget{budget}_seed{seed}"
 
 
-def unprotected_run_name(count, seed, sequence):
-    tag = "".join(ch.lower() if ch.isalnum() or ch in "_-" else "_"
-                  for ch in sequence)
-    return f"sign_uep_unprotected_count{count}_aseed{seed}_{tag}"
+def unprotected_run_name(count, seed, sequence, gop_index=0):
+    gop_tag = "" if gop_index == 0 else f"_gop{gop_index}"
+    return (f"sign_uep_unprotected_count{count}_aseed{seed}"
+            f"{gop_tag}_{sequence_tag(sequence)}")
 
 
 def metric_path(root, run_name, sequence, gop_index):
@@ -71,10 +79,12 @@ def collect_rows(root, sequence, gop_index, seeds, clean_psnr, clean_lpips):
         unprotected = []
         for seed in seeds:
             protected_path = metric_path(
-                root, protected_run_name(protected_budget, seed),
+                root, protected_run_name(
+                    protected_budget, seed, sequence, gop_index),
                 sequence, gop_index)
             unprotected_path = metric_path(
-                root, unprotected_run_name(unprotected_count, seed, sequence),
+                root, unprotected_run_name(
+                    unprotected_count, seed, sequence, gop_index),
                 sequence, gop_index)
             for label, path, destination in (
                     ("protected", protected_path, protected),

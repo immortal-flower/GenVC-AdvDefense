@@ -22,6 +22,18 @@ class BlindPacketXorFecTests(unittest.TestCase):
         second, _ = group_assignment(20, 4, "shared-shuffle", 42)
         self.assertEqual(first.tolist(), second.tolist())
 
+    def test_two_parities_recover_two_data_losses(self):
+        assignment, groups = group_assignment(8, 4, "contiguous-groups")
+        self.assertTrue(exact_recovery(
+            8, assignment, groups, [0, 1], parity_per_group=2))
+
+    def test_data_and_parity_loss_can_exceed_mds_budget(self):
+        assignment, groups = group_assignment(8, 4, "contiguous-groups")
+        first_group_parity = 8
+        self.assertFalse(exact_recovery(
+            8, assignment, groups, [0, 1, first_group_parity],
+            parity_per_group=2))
+
 
 if __name__ == "__main__":
     unittest.main()

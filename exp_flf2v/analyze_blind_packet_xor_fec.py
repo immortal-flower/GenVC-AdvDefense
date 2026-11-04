@@ -1,4 +1,8 @@
-"""Format-agnostic XOR packet-FEC baseline for blind burst erasures."""
+"""Format-agnostic systematic packet-FEC for blind burst erasures.
+
+One parity packet models XOR parity.  Multiple parity packets model an ideal
+systematic MDS erasure code and are reported as an analytical upper baseline.
+"""
 
 import argparse
 import csv
@@ -25,14 +29,17 @@ def group_assignment(n_data, data_per_group, layout, seed=42):
     return assignment, groups
 
 
-def exact_recovery(n_data, assignment, groups, erased_packets):
+def exact_recovery(n_data, assignment, groups, erased_packets,
+                   parity_per_group=1):
     erased = set(erased_packets)
     for group in range(groups):
         missing_data = sum(
             packet in erased for packet in range(n_data)
             if int(assignment[packet]) == group)
-        parity_missing = n_data + group in erased
-        if missing_data > 1 or (missing_data == 1 and parity_missing):
+        parity_missing = sum(
+            n_data + group * parity_per_group + copy in erased
+            for copy in range(parity_per_group))
+        if missing_data > parity_per_group - parity_missing:
             return False
     return True
 
@@ -51,11 +58,13 @@ def main():
     parser.add_argument("--stream", required=True)
     parser.add_argument("--packet_bytes", type=int, default=1200)
     parser.add_argument("--data_per_group", type=int, default=8)
+    parser.add_argument("--parity_per_group", type=int, default=1)
     parser.add_argument("--loss_lengths", type=int, nargs="+", default=[1, 2, 3])
     parser.add_argument("--shuffle_seed", type=int, default=42)
     parser.add_argument("--output_prefix", required=True)
     args = parser.parse_args()
-    if args.packet_bytes < 1 or args.data_per_group < 1:
+    if (args.packet_bytes < 1 or args.data_per_group < 1
+            or args.parity_per_group < 1):
         raise ValueError("Packet size and group size must be positive")
     if any(value < 1 for value in args.loss_lengths):
         raise ValueError("Loss lengths must be positive")
@@ -67,14 +76,15 @@ def main():
     for layout in LAYOUTS:
         assignment, groups = group_assignment(
             n_data, args.data_per_group, layout, args.shuffle_seed)
-        total_packets = n_data + groups
+        total_packets = n_data + groups * args.parity_per_group
         for loss in args.loss_lengths:
             if loss > total_packets:
                 raise ValueError("Loss length exceeds transmitted packet count")
             rows = []
             for start in range(total_packets - loss + 1):
                 recovered = exact_recovery(
-                    n_data, assignment, groups, range(start, start + loss))
+                    n_data, assignment, groups, range(start, start + loss),
+                    args.parity_per_group)
                 row = {
                     "layout": layout,
                     "lost_packets": loss,
@@ -93,7 +103,7 @@ def main():
             })
 
     groups = math.ceil(n_data / args.data_per_group)
-    overhead_bytes = groups * args.packet_bytes
+    overhead_bytes = groups * args.parity_per_group * args.packet_bytes
     prefix = Path(args.output_prefix)
     detail_path = prefix.with_name(prefix.name + "_detail.csv")
     aggregate_path = prefix.with_name(prefix.name + "_aggregate.csv")
@@ -106,19 +116,22 @@ def main():
         "packet_bytes": args.packet_bytes,
         "data_packets": n_data,
         "data_per_group": args.data_per_group,
-        "parity_packets": groups,
+        "parity_per_group": args.parity_per_group,
+        "parity_packets": groups * args.parity_per_group,
         "overhead_bytes": overhead_bytes,
         "overhead_vs_stream": overhead_bytes / stream_bytes,
         "aggregate": aggregate,
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print("Blind XOR packet-FEC summary")
+    coding = "XOR" if args.parity_per_group == 1 else "ideal MDS"
+    print(f"Blind {coding} packet-FEC summary")
     print("Layout              Lost  Starts  ExactRecovery")
     for row in aggregate:
         print(f"{row['layout']:19s} {row['lost_packets']:4d}  "
               f"{row['evaluated_starts']:6d}  "
               f"{100 * row['exact_recovery_rate']:12.2f}%")
-    print(f"Stream: {stream_bytes} bytes; data={n_data}, parity={groups}, "
+    print(f"Stream: {stream_bytes} bytes; data={n_data}, "
+          f"parity={groups * args.parity_per_group}, "
           f"overhead={100 * overhead_bytes / stream_bytes:.2f}%")
     print(f"Saved: {detail_path}")
     print(f"Saved: {aggregate_path}")

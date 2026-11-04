@@ -18,6 +18,11 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    from .tdcm_layout import parse_tdcm_payload_layout
+except ImportError:
+    from tdcm_layout import parse_tdcm_payload_layout
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -26,10 +31,7 @@ LAYOUTS = ("sequential", "replica-stripe", "shared-shuffle")
 
 
 def parse_tdcm_layout(payload):
-    # Delay the project codec import so pure packet-layout tests do not require
-    # PyTorch or the 14B model environment.
-    from bitstream_attacks import _parse_tdcm_payload_layout
-    return _parse_tdcm_payload_layout(payload)
+    return parse_tdcm_payload_layout(payload)
 
 
 def parse_args():

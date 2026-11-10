@@ -36,11 +36,16 @@ def main():
     p.add_argument('--steps',type=int,default=20);p.add_argument('--epsilon',type=float,default=2)
     p.add_argument('--alpha',type=float,default=0.25);p.add_argument('--momentum',type=float,default=0.8)
     p.add_argument('--seed',type=int,default=42);p.add_argument('--eval_every',type=int,default=5)
+    p.add_argument('--objective',choices=['mean','balanced'],default='mean',
+                   help='balanced also maximizes a smooth minimum over latent time positions')
+    p.add_argument('--balance_weight',type=float,default=1.0)
+    p.add_argument('--balance_temperature',type=float,default=0.01)
     a=p.parse_args()
     if not (a.frames>=5 and (a.frames-1)%4==0 and 1<=a.anchors<=a.frames and a.steps>0
             and min(a.height,a.width,a.opt_height,a.opt_width)>0
             and a.opt_height%16==0 and a.opt_width%16==0 and a.epsilon>0 and a.alpha>0
-            and 0<=a.momentum<1 and a.eval_every>0):
+            and 0<=a.momentum<1 and a.eval_every>0
+            and a.balance_weight>=0 and a.balance_temperature>0):
         p.error('Invalid dimensions, optimizer parameters or 4n+1 frame count')
     torch.manual_seed(a.seed)
     frames=resize_frames(load_yuv420_frames(a.data,a.frames),a.width,a.height)
@@ -67,7 +72,10 @@ def main():
             pixels=((target+delta).clamp(0,1)*255).round()/255
             small=resize_video(pixels,(a.opt_height,a.opt_width))
             z=vae.encode([small*2-1])[0];r=(vae.decode([z])[0]+1)/2
+            per_position=(z-z0).float().square().mean(dim=(0,2,3))
             rows[name]=dict(latent_shift_MSE=float((z-z0).square().mean()),
+                            latent_position_MSE=[float(v) for v in per_position],
+                            worst_latent_position_MSE=float(per_position.min()),
                             lowres_reconstruction_shift_MSE=float((r-r0).square().mean()),
                             lowres_reconstruction_MSE=float((r-clean_small).square().mean()),
                             native_input_PSNR_dB=float(-10*torch.log10((pixels-target).square().mean().clamp_min(1e-12))))
@@ -79,7 +87,17 @@ def main():
         delta=lift_controls(c,weights,(a.height,a.width))
         small=resize_video((target+delta).clamp(0,1),(a.opt_height,a.opt_width))
         z=vae.encode([small*2-1])[0]
-        loss=(z-z0).square().mean()
+        per_position=(z-z0).float().square().mean(dim=(0,2,3))
+        mean_shift=per_position.mean()
+        if a.objective=='balanced':
+            # A differentiable minimum: its gradient emphasizes the least
+            # changed latent time slices. It is a VAE proxy, not a codec loss.
+            tau=a.balance_temperature
+            soft_min=-tau*torch.logsumexp(-per_position/tau,dim=0)
+            soft_min=soft_min+tau*np.log(per_position.numel())
+            loss=mean_shift+a.balance_weight*soft_min
+        else:
+            loss=mean_shift
         grad,=torch.autograd.grad(loss,c)
         if not torch.isfinite(grad).all() or grad.abs().max().item()==0:
             raise RuntimeError('Invalid/zero full-context VAE gradient')
@@ -87,9 +105,11 @@ def main():
             normalized=grad/grad.abs().mean(dim=(1,2,3),keepdim=True).clamp_min(1e-12)
             velocity=a.momentum*velocity+normalized
             controls=(c+alpha*velocity.sign()).clamp(-eps,eps).detach()
-        history.append(dict(step=step+1,latent_shift_MSE=float(loss.detach())))
+        history.append(dict(step=step+1,objective=float(loss.detach()),
+                            latent_shift_MSE=float(mean_shift.detach()),
+                            worst_latent_position_MSE=float(per_position.min().detach())))
         print(f'Full-context PGD {step+1}/{a.steps}: loss={history[-1]["latent_shift_MSE"]:.6f}',flush=True)
-        del c,delta,small,z,loss,grad,normalized
+        del c,delta,small,z,loss,grad,normalized,per_position,mean_shift
         if (step+1)%a.eval_every==0 or step+1==a.steps:evaluate(step+1)
     with torch.no_grad():delta=lift_controls(controls,weights,(a.height,a.width)).permute(1,2,3,0).cpu().numpy()
     pixels=np.floor(np.clip(original.astype(np.float32)/255+delta,0,1)*255+0.5).astype(np.uint8)

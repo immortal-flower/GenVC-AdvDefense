@@ -47,6 +47,7 @@ def run_summary(clean_dir, run_dir, clean_metrics):
         "target_cell_replaced_atoms": target["replaced_atoms"],
         "target_cell_shared_sign_flips": target["shared_atoms_sign_flipped"],
         "early_mean_replaced_atoms": sum(row["replaced_atoms"] for row in early) / len(early),
+        "encoding_trace_saved": (run_dir / "input_attack_trace.npz").is_file(),
         "per_frame_PSNR_dB": frames,
     }
 

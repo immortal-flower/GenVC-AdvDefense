@@ -95,6 +95,7 @@ foreach ($run in $runs) {
         --ref_codec compressai --ref_quality 4 `
         --seed $Seed --sequences Jockey `
         --attack vae-pgd --attack_file $run.File `
+        --input_attack_diagnostics `
         --epsilon 2 --attack_scope all --defense none
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $metrics -PathType Leaf)) {
         throw "Incomplete full re-encoding: $name"

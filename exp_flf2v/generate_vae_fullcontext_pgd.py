@@ -118,6 +118,10 @@ def main():
         input_PSNR_dB=float(-10*np.log10(max(float(np.mean(actual**2)),1e-12))),
         measured_Linf_pixel=float(np.abs(actual).max()*255),history=history,fixed_evaluations=evaluations)
     out=Path(a.output);out.parent.mkdir(parents=True,exist_ok=True)
+    with torch.no_grad():
+        random_delta=lift_controls(initial,weights,(a.height,a.width)).permute(1,2,3,0).cpu().numpy()
+    np.savez_compressed(out.with_name(out.stem+'_initial.npz'),
+                        delta=random_delta[0] if a.anchors==1 else random_delta)
     # Shared mode uses the existing compact HWC file format.
     np.savez_compressed(out,delta=delta[0] if a.anchors==1 else delta)
     previews=out.parent/(out.stem+'_input_png');previews.mkdir(parents=True,exist_ok=True)

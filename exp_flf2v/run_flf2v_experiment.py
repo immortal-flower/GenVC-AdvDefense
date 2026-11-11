@@ -185,6 +185,9 @@ def flf2v_encode(pipe, model, gop_frames, flf2v_cond, height, width):
     # batch=1，潜通道=16，潜在时间帧=(33-1)/4+1=9，空间=720/8×1280/8。
     # 原视频只在编码端通过这个 x0_true 计算残差；解码端没有它。
     x0_true = model.encode_video(gop_frames, height, width)
+    trace = {} if getattr(pipe, 'input_attack_diagnostics', False) else None
+    if trace is not None:
+        trace['target_latent'] = x0_true.detach().float().cpu().numpy()
     
     # model_fn(x_t, t) 以当前潜变量、时间和首尾帧条件预测速度 u_t。
     model_fn = pipe._model_fn(embeds, flf2v_cond)
@@ -248,6 +251,10 @@ def flf2v_encode(pipe, model, gop_frames, flf2v_cond, height, width):
         # 将 9 个合成噪声叠回 [1, 16, 9, 90, 160]，修正下一时刻轨迹。
         # stack(..., dim=1) 在通道后插入时间维；unsqueeze(0) 再插入 batch 维。
         noise_3d = torch.stack(noise_frames, dim=1).unsqueeze(0)
+        if trace is not None and sde_idx < 2:
+            trace[f'noise_step{sde_idx+1}'] = noise_3d.detach().float().cpu().numpy()
+            trace[f'correction_step{sde_idx+1}'] = (noise_coeff*noise_3d).detach().float().cpu().numpy()
+            trace[f'residual_step{sde_idx+1}'] = residual.detach().float().cpu().numpy()[None]
         # SDE 更新 = 模型给出的漂移运动 + 码本选出的随机纠偏方向。
         x_t = x_t - f_t * delta_t + noise_coeff * noise_3d
         sde_idx += 1
@@ -257,6 +264,8 @@ def flf2v_encode(pipe, model, gop_frames, flf2v_cond, height, width):
             print(f"    Encode step {i+1}/{pipe.num_steps}: residual_MSE={mse:.4f}, noise_coeff={noise_coeff:.4f}")
 
     # 返回两个对象给 main()：码本索引/符号，以及仅编码端使用的真值潜变量。
+    if trace is not None:
+        pipe.input_attack_trace = trace
     return step_data, x0_true
 
 def flf2v_decode(pipe, model, step_data, flf2v_cond, prompt_embeds=None):
@@ -362,6 +371,8 @@ def main():
     parser.add_argument("--epsilon", type=float, default=4.0, help="Attack budget; values > 1 are interpreted as pixel levels out of 255")
     parser.add_argument("--attack_steps", type=int, default=8)
     parser.add_argument("--attack_file", default=None, help="Saved RGB perturbation NPZ for vae-pgd")
+    parser.add_argument('--input_attack_diagnostics', action='store_true',
+                        help='Save actual target latent and first two SDE correction vectors for paired diagnostics')
     parser.add_argument("--attack_scope", choices=["all", "target-only", "condition-only"], default="all",
                         help="Diagnostic split between x0_true target and shared FLF2V boundary conditions")
     parser.add_argument("--attack_alpha", type=float, default=0.0, help="Attack step size; 0 uses epsilon / attack_steps")
@@ -906,7 +917,11 @@ def main():
                 # 右侧函数返回两个对象，左侧两个变量一次接收（解包赋值）。
                 # step_data 保存 [SDE步][潜在时间帧] 的码本索引/符号；
                 # x0_true 是编码端的 [1,16,9,90,160] 真值潜变量，解码不用传它。
+                pipe.input_attack_diagnostics = args.input_attack_diagnostics
                 step_data, x0_true = flf2v_encode(pipe, model, gop_frames, flf2v_cond, HEIGHT, WIDTH)
+                if args.input_attack_diagnostics:
+                    np.savez_compressed(gop_dir / 'input_attack_trace.npz', **pipe.input_attack_trace)
+                    del pipe.input_attack_trace
                 t_enc = time.time() - t0
 
             # A stream attack models corruption after encoding: the encoder
@@ -1085,6 +1100,25 @@ def main():
             mean_msssim = compute_msssim(t_gt, t_rec)
             mean_lpips = compute_lpips(t_gt, t_rec, device="cuda:1")
 
+            # For source-side attacks, distinguish input damage from codec
+            # distortion. References are in-memory RGB, not lossy MP4 frames.
+            input_reference_metrics = {}
+            if args.attack_scope == 'all' and args.defense == 'none':
+                offset = g * frames_per_gop_excl_first
+                t_submitted = frames_to_tensor(attacked_frames[offset:offset+n])
+                input_psnr, _ = compute_psnr(t_gt, t_submitted)
+                submitted_psnr, submitted_per_frame = compute_psnr(t_submitted, t_rec)
+                input_reference_metrics = {
+                    'input_PSNR_dB': float(input_psnr),
+                    'input_MSE': float((t_submitted-t_gt).square().mean()),
+                    'input_Linf_pixel': float((t_submitted-t_gt).abs().max()*255),
+                    'reconstruction_vs_submitted_PSNR_dB': float(submitted_psnr),
+                    'reconstruction_vs_submitted_MSE': float((t_submitted-t_rec).square().mean()),
+                    'reconstruction_vs_original_MSE': float((t_gt-t_rec).square().mean()),
+                    'reconstruction_vs_submitted_per_frame_PSNR_dB': submitted_per_frame.tolist(),
+                }
+                del t_submitted
+
             # BPP 用理论码本比特数 + 两侧边界帧压缩字节数计算。
             # 例如 20 步、尾部 3 步、33 帧时：17 个 SDE 步 × 9 个潜在时间帧。
             # 这里不直接用 .tdcm 文件大小；文件头等封装开销可能使实际文件更大。
@@ -1125,6 +1159,7 @@ def main():
                 "decode_seconds": round(t_dec, 3),
             }
             gop_results.append(result)
+            result.update(input_reference_metrics)
             # 每个 gopN/metrics.json 记录整 GOP 平均指标与逐帧 PSNR。
             with open(gop_dir / "metrics.json", "w") as mf: json.dump(result, mf, indent=2)
 

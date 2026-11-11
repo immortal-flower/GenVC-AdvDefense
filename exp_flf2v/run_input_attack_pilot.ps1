@@ -24,11 +24,14 @@ if ($Epsilon -lt 1 -or $Epsilon -gt 8 -or $OptimizerSteps -lt 1) {
 
 $vae = Join-Path $WanCkpt 'Wan2.1_VAE.pth'
 if (-not (Test-Path -LiteralPath $vae)) { throw "Missing VAE: $vae" }
-$asset = ".\exp_flf2v\attack_assets\input_balanced_eps${Epsilon}_seed${Seed}_steps${OptimizerSteps}.npz"
-$tag = "input_pilot_eps${Epsilon}_seed${Seed}_steps${OptimizerSteps}"
+$asset = ".\exp_flf2v\attack_assets\input_v2_balanced_eps${Epsilon}_seed${Seed}_steps${OptimizerSteps}.npz"
+$meanAsset = $asset.Replace('_balanced_', '_mean_')
+$randomAsset = $asset.Replace('.npz', '_initial.npz')
+$tag = "input_pilot_v2_eps${Epsilon}_seed${Seed}_steps${OptimizerSteps}"
 $runs = @(
     [pscustomobject]@{ Name="${tag}_clean"; Attack='none'; File=$null },
-    [pscustomobject]@{ Name="${tag}_random"; Attack='ftuap'; File=$null }
+    [pscustomobject]@{ Name="${tag}_random"; Attack='vae-pgd'; File=$randomAsset },
+    [pscustomobject]@{ Name="${tag}_mean_vae"; Attack='vae-pgd'; File=$meanAsset }
 )
 if ($Epsilon -eq 2 -and (Test-Path -LiteralPath $OldAttack)) {
     $runs += [pscustomobject]@{ Name="${tag}_old_vae"; Attack='vae-pgd'; File=$OldAttack }
@@ -42,20 +45,26 @@ Write-Host "All codec evaluations re-encode the perturbed input; no clean codebo
 $runs | ForEach-Object { Write-Host "  $($_.Name): $($_.Attack)" }
 if ($PlanOnly) { Write-Host '[PLAN ONLY] No model loaded.'; return }
 
-if (-not (Test-Path -LiteralPath $asset)) {
+foreach ($objective in @('balanced','mean')) {
+    $candidate = if ($objective -eq 'balanced') { $asset } else { $meanAsset }
+    $initialFile = $candidate.Replace('.npz', '_initial.npz')
+    if ((Test-Path -LiteralPath $candidate) -and (Test-Path -LiteralPath $initialFile)) { continue }
     & $Python '.\exp_flf2v\generate_vae_fullcontext_pgd.py' `
-        --data $Data --vae $vae --output $asset --height 720 --width 1280 `
+        --data $Data --vae $vae --output $candidate --height 720 --width 1280 `
         --frames 33 --anchors 3 --steps $OptimizerSteps --epsilon $Epsilon `
-        --alpha 0.25 --objective balanced --balance_weight 1.0 `
+        --alpha 0.25 --objective $objective --balance_weight 1.0 `
         --balance_temperature 0.01 --seed $Seed
-    if ($LASTEXITCODE -ne 0) { throw 'Balanced perturbation generation failed.' }
+    if ($LASTEXITCODE -ne 0) { throw "Perturbation generation failed: $objective" }
 }
 
 foreach ($run in $runs) {
     $metrics = Join-Path $OutputRoot "$($run.Name)\Jockey\gop0\metrics.json"
     if (Test-Path -LiteralPath $metrics) {
-        Write-Host "[SKIP] $($run.Name) already has metrics.json"
-        continue
+        $existing = Get-Content -LiteralPath $metrics -Raw | ConvertFrom-Json
+        if ($null -ne $existing.reconstruction_vs_submitted_PSNR_dB) {
+            Write-Host "[SKIP] $($run.Name) already has complete v2 metrics"
+            continue
+        }
     }
     $argv = @('.\exp_flf2v\run_flf2v_experiment.py',
         '--wan_ckpt', $WanCkpt, '--data_dir', $Data,
@@ -66,7 +75,7 @@ foreach ($run in $runs) {
         '--ref_codec', 'compressai', '--ref_quality', '4',
         '--seed', "$Seed", '--sequences', 'Jockey',
         '--attack', $run.Attack, '--epsilon', "$Epsilon",
-        '--attack_scope', 'all', '--defense', 'none')
+        '--attack_scope', 'all', '--defense', 'none', '--input_attack_diagnostics')
     if ($run.File) { $argv += @('--attack_file', $run.File) }
     Write-Host "[RUN] $($run.Name)"
     & $Python @argv
@@ -88,6 +97,10 @@ $summary = foreach ($run in $runs) {
         LPIPS = $m.LPIPS
         Delta_LPIPS = [math]::Round([double]$m.LPIPS - [double]$clean.LPIPS, 4)
         BPP = $m.BPP
+        InputPSNR = $m.input_PSNR_dB
+        InputLinfPixel = $m.input_Linf_pixel
+        PSNR_vs_Submitted = $m.reconstruction_vs_submitted_PSNR_dB
+        CodecMSEIncrease = [double]$m.reconstruction_vs_submitted_MSE - [double]$clean.reconstruction_vs_submitted_MSE
     }
 }
 $summaryPath = Join-Path $OutputRoot "${tag}_summary.csv"

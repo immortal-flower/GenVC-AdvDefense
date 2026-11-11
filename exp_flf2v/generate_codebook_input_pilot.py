@@ -24,7 +24,7 @@ from input_codebook_objective import input_codebook_loss_from_latent, straight_t
 from sde_rf_wan.turbo_codebook import TurboBitstream, TurboPerFrameCodebook
 
 
-def candidate_bank(stream, residual, step, position, count, device):
+def candidate_bank(stream, residual, step, position, count, device, return_indices=False):
     """Select the strongest clean-residual atoms from the *actual* K-bank."""
     indices, signs = stream["step_data"][step - 1][position]
     if count < len(indices):
@@ -48,7 +48,7 @@ def candidate_bank(stream, residual, step, position, count, device):
         if chosen_signs != signs:
             raise RuntimeError("Clean transmitted signs disagree with residual; wrong trace/bitstream")
         atoms = book.regenerate_selected_atoms(candidates, step - 1, position)
-    return atoms
+    return (atoms, candidates) if return_indices else atoms
 
 
 @torch.enable_grad()

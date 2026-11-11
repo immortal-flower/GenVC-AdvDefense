@@ -60,15 +60,21 @@ def assess_pair(random, candidate):
     psnr_gain = random["PSNR_dB"] - candidate["PSNR_dB"]
     lpips_gain = candidate["LPIPS"] - random["LPIPS"]
     submitted_gain = random["PSNR_vs_submitted_dB"] - candidate["PSNR_vs_submitted_dB"]
+    direction_agrees = matched and within_budget and psnr_gain > 0 and lpips_gain > 0 and submitted_gain > 0
+    if direction_agrees and psnr_gain >= 0.3 and lpips_gain >= 0.005:
+        result = "promising_single_GOP"
+    elif direction_agrees:
+        result = "weak_single_GOP_signal"
+    else:
+        result = "not_yet_consistent"
     return {
         "input_MSE_matched_within_1pct": matched,
         "both_within_2_255_bound": within_budget,
         "candidate_extra_PSNR_drop_dB": psnr_gain,
         "candidate_extra_LPIPS": lpips_gain,
         "candidate_extra_PSNR_drop_vs_submitted_dB": submitted_gain,
-        "screening_result": "promising_single_GOP" if (
-            matched and within_budget and psnr_gain > 0 and lpips_gain > 0 and submitted_gain > 0
-        ) else "not_yet_consistent",
+        "screening_result": result,
+        "screening_note": "0.3 dB PSNR and 0.005 LPIPS are pilot triage thresholds, not statistical significance.",
     }
 
 

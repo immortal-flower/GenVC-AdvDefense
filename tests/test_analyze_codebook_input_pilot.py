@@ -22,6 +22,14 @@ class PairedScreenTest(unittest.TestCase):
                          PSNR_dB=32.7, LPIPS=0.09, PSNR_vs_submitted_dB=32.8)
         self.assertFalse(assess_pair(random, candidate)["input_MSE_matched_within_1pct"])
 
+    def test_small_positive_differences_are_not_called_promising(self):
+        random = dict(input_MSE=0.00004, input_Linf_pixel=2.0,
+                      PSNR_dB=33.44, LPIPS=0.0757, PSNR_vs_submitted_dB=33.365)
+        candidate = dict(input_MSE=0.00004, input_Linf_pixel=2.0,
+                         PSNR_dB=33.34, LPIPS=0.0758, PSNR_vs_submitted_dB=33.273)
+        self.assertEqual(assess_pair(random, candidate)["screening_result"],
+                         "weak_single_GOP_signal")
+
 
 if __name__ == "__main__":
     unittest.main()

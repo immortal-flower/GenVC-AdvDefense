@@ -1,9 +1,29 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from exp_flf2v.analyze_codebook_input_pilot import assess_pair
+import numpy as np
+
+from exp_flf2v.analyze_codebook_input_pilot import assess_pair, trace_shift_summary
 
 
 class PairedScreenTest(unittest.TestCase):
+    def test_trace_shift_reports_target_position_only(self):
+        with TemporaryDirectory() as tmp:
+            clean_dir = Path(tmp) / "clean"
+            run_dir = Path(tmp) / "run"
+            clean_dir.mkdir()
+            run_dir.mkdir()
+            shape = (1, 2, 9, 3, 4)
+            clean = np.zeros(shape, dtype=np.float32)
+            changed = clean.copy()
+            changed[:, :, 3] = 2.0
+            changed[:, :, 4] = 9.0
+            np.savez(clean_dir / "input_attack_trace.npz", target_latent=clean)
+            np.savez(run_dir / "input_attack_trace.npz", target_latent=changed)
+            result = trace_shift_summary(clean_dir, run_dir)
+            self.assertEqual(result["target_latent_cell3_MSE"], 4.0)
+
     def test_promising_requires_both_metrics_and_submitted_reference(self):
         random = dict(input_MSE=0.00004, input_Linf_pixel=2.0,
                       PSNR_dB=33.2, LPIPS=0.08, PSNR_vs_submitted_dB=33.0)

@@ -22,6 +22,31 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def trace_shift_summary(clean_dir, run_dir, position=3):
+    """Compare saved encoder traces at the targeted latent cell, if present."""
+    clean_path = clean_dir / "input_attack_trace.npz"
+    run_path = run_dir / "input_attack_trace.npz"
+    if not clean_path.is_file() or not run_path.is_file():
+        return None
+    import numpy as np
+
+    result = {}
+    keys = ("target_latent", "residual_step1", "noise_step1",
+            "correction_step1", "residual_step2", "noise_step2")
+    with np.load(clean_path, allow_pickle=False) as clean, np.load(run_path, allow_pickle=False) as attacked:
+        for key in keys:
+            if key not in clean or key not in attacked:
+                continue
+            if clean[key].shape != attacked[key].shape or clean[key].ndim != 5:
+                raise ValueError(f"Incompatible encoder trace for {key}: {run_path}")
+            if position >= clean[key].shape[2]:
+                raise ValueError(f"Latent position {position} outside {key}")
+            diff = (attacked[key][0, :, position].astype(np.float64) -
+                    clean[key][0, :, position].astype(np.float64))
+            result[f"{key}_cell{position}_MSE"] = float(np.square(diff).mean())
+    return result
+
+
 def run_summary(clean_dir, run_dir, clean_metrics):
     metrics = read_json(run_dir / "metrics.json")
     clean_book = load_codebook(clean_dir / "codebook.tdcm")
@@ -48,6 +73,7 @@ def run_summary(clean_dir, run_dir, clean_metrics):
         "target_cell_shared_sign_flips": target["shared_atoms_sign_flipped"],
         "early_mean_replaced_atoms": sum(row["replaced_atoms"] for row in early) / len(early),
         "encoding_trace_saved": (run_dir / "input_attack_trace.npz").is_file(),
+        "encoding_trace_cell3_shift": trace_shift_summary(clean_dir, run_dir),
         "per_frame_PSNR_dB": frames,
     }
 
@@ -130,6 +156,14 @@ def main():
     print(f"Candidate minus random: extra PSNR drop={comparison['candidate_extra_PSNR_drop_dB']:+.3f} dB, "
           f"extra LPIPS={comparison['candidate_extra_LPIPS']:+.4f}, "
           f"result={comparison['screening_result']}")
+    if all(runs[label]["encoding_trace_cell3_shift"] is not None for label in runs):
+        for key in runs["candidate"]["encoding_trace_cell3_shift"]:
+            c = runs["candidate"]["encoding_trace_cell3_shift"][key]
+            r = runs["random"]["encoding_trace_cell3_shift"].get(key)
+            if r is not None:
+                print(f"Trace {key}: candidate={c:.6g} random={r:.6g} ratio={c/max(r, 1e-20):.3f}")
+    else:
+        print("Encoder-trace comparison unavailable for these runs; do not infer where changes were absorbed.")
     print(f"Saved: {output}")
 
 

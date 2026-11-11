@@ -1,6 +1,7 @@
 param(
     [string]$Python = 'C:\Users\Admin\.conda\envs\GVCC-5090\python.exe',
     [string]$Data = 'D:\yzb and lmk\dataset-720P\UVG\Jockey_720p.yuv',
+    [ValidatePattern('^[A-Za-z0-9]+$')][string]$Sequence = 'Jockey',
     [string]$WanCkpt = '.\exp_flf2v\Wan2.1-FLF2V-14B-720P',
     [string]$OldAttack = '.\exp_flf2v\attack_assets\jockey_vae_temporal_pgd_eps2.npz',
     [string]$OutputRoot = '.\exp_flf2v\results_720p',
@@ -35,7 +36,17 @@ if ($Gop -ne 0 -and -not $MatchedOnly) { throw 'Nonzero GOP requires -MatchedOnl
 if ($MatchedOnly -and ($PairedOnly -or $Epsilon -lt 2)) { throw 'MatchedOnly requires epsilon >= 2 and cannot be combined with PairedOnly' }
 if ($PairedOnly -or $InitSeed -ne $Seed) { $tag += "_init${InitSeed}" }
 if ($MatchedOnly) { $tag += "_gop${Gop}_matched" }
+if ($Sequence -ne 'Jockey') {
+    if (-not $MatchedOnly) { throw 'Non-Jockey sequences require -MatchedOnly' }
+    $tag += "_$Sequence"
+    $source = Get-Item -LiteralPath $Data
+    if ($source.PSIsContainer -or $source.Name -cnotmatch "^${Sequence}_(720p|1280x720)\.yuv$" -or
+        $source.Length % 1382400 -ne 0 -or $source.Length -lt (32*$Gop+33)*1382400) {
+        throw 'Expected a named 1280x720 8-bit planar YUV420 file with enough complete frames.'
+    }
+}
 $suffix = if ($tag -ne $cleanTag) { "_init${InitSeed}" } else { '' }
+if ($Sequence -ne 'Jockey') { $suffix += "_${Sequence}_gop${Gop}_matched" }
 $asset = ".\exp_flf2v\attack_assets\input_v2_balanced_eps${Epsilon}_seed${Seed}_steps${OptimizerSteps}${suffix}.npz"
 $cleanRun = "${tag}_clean"
 $meanAsset = $asset.Replace('_balanced_', '_mean_')
@@ -89,7 +100,7 @@ foreach ($objective in $objectives) {
 }
 
 foreach ($run in $runs) {
-    $metrics = Join-Path $OutputRoot "$($run.Name)\Jockey\gop$Gop\metrics.json"
+    $metrics = Join-Path $OutputRoot "$($run.Name)\$Sequence\gop$Gop\metrics.json"
     if (Test-Path -LiteralPath $metrics) {
         $existing = Get-Content -LiteralPath $metrics -Raw | ConvertFrom-Json
         if ($null -ne $existing.reconstruction_vs_submitted_PSNR_dB) {
@@ -104,7 +115,7 @@ foreach ($run in $runs) {
         '--height', '720', '--width', '1280', '--M', '64', '--K', '16384',
         '--steps', '20', '--ddim_tail', '3', '--g_scale', '3.0',
         '--ref_codec', 'compressai', '--ref_quality', '4',
-        '--seed', "$Seed", '--sequences', 'Jockey',
+        '--seed', "$Seed", '--sequences', $Sequence,
         '--attack', $run.Attack, '--epsilon', "$Epsilon",
         '--attack_scope', 'all', '--defense', 'none', '--input_attack_diagnostics')
     if ($run.File) { $argv += @('--attack_file', $run.File) }
@@ -115,10 +126,10 @@ foreach ($run in $runs) {
     }
 }
 
-$cleanPath = Join-Path $OutputRoot "$cleanRun\Jockey\gop$Gop\metrics.json"
+$cleanPath = Join-Path $OutputRoot "$cleanRun\$Sequence\gop$Gop\metrics.json"
 $clean = Get-Content -LiteralPath $cleanPath -Raw | ConvertFrom-Json
 $summary = foreach ($run in $runs) {
-    $path = Join-Path $OutputRoot "$($run.Name)\Jockey\gop$Gop\metrics.json"
+    $path = Join-Path $OutputRoot "$($run.Name)\$Sequence\gop$Gop\metrics.json"
     $m = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
     [pscustomobject]@{
         Run = $run.Name
@@ -140,6 +151,6 @@ $summary | Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF
 $summary | Format-Table -AutoSize
 Write-Host "Saved: $summaryPath"
 & $Python '.\exp_flf2v\analyze_input_attack_pilot.py' `
-    --results_root $OutputRoot --tag $tag --clean-run $cleanRun --sequence Jockey --gop $Gop
+    --results_root $OutputRoot --tag $tag --clean-run $cleanRun --sequence $Sequence --gop $Gop
 if ($LASTEXITCODE -ne 0) { throw 'Post-hoc codebook analysis failed.' }
 Write-Host 'Note: this is a VAE-balanced input attack pilot, not yet a codec-gradient attack.'

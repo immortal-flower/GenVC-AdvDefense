@@ -54,11 +54,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--results_root', type=Path, required=True)
     p.add_argument('--tag', required=True)
+    p.add_argument('--clean-run', help='Existing clean run directory name under results-root')
     p.add_argument('--sequence', default='Jockey')
     p.add_argument('--gop', type=int, default=0)
     args = p.parse_args()
     base = args.results_root
-    clean_dir = base / f'{args.tag}_clean' / args.sequence / f'gop{args.gop}'
+    clean_dir = base / (args.clean_run or f'{args.tag}_clean') / args.sequence / f'gop{args.gop}'
     clean = load_codebook(clean_dir / 'codebook.tdcm')
     clean_metrics = json.loads((clean_dir / 'metrics.json').read_text())
     out = []

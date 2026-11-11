@@ -5,6 +5,8 @@ param(
     [string]$OldAttack = '.\exp_flf2v\attack_assets\jockey_vae_temporal_pgd_eps2.npz',
     [string]$OutputRoot = '.\exp_flf2v\results_720p',
     [int]$Seed = 42,
+    [Nullable[int]]$InitSeed = $null,
+    [switch]$PairedOnly,
     [int]$Epsilon = 2,
     [int]$OptimizerSteps = 20,
     [switch]$PlanOnly
@@ -24,10 +26,15 @@ if ($Epsilon -lt 1 -or $Epsilon -gt 8 -or $OptimizerSteps -lt 1) {
 
 $vae = Join-Path $WanCkpt 'Wan2.1_VAE.pth'
 if (-not (Test-Path -LiteralPath $vae)) { throw "Missing VAE: $vae" }
-$asset = ".\exp_flf2v\attack_assets\input_v2_balanced_eps${Epsilon}_seed${Seed}_steps${OptimizerSteps}.npz"
+$cleanTag = "input_pilot_v2_eps${Epsilon}_seed${Seed}_steps${OptimizerSteps}"
+if ($null -eq $InitSeed) { $InitSeed = $Seed }
+$tag = $cleanTag
+if ($PairedOnly -or $InitSeed -ne $Seed) { $tag += "_init${InitSeed}" }
+$suffix = if ($tag -ne $cleanTag) { "_init${InitSeed}" } else { '' }
+$asset = ".\exp_flf2v\attack_assets\input_v2_balanced_eps${Epsilon}_seed${Seed}_steps${OptimizerSteps}${suffix}.npz"
+$cleanRun = "${tag}_clean"
 $meanAsset = $asset.Replace('_balanced_', '_mean_')
 $randomAsset = $asset.Replace('.npz', '_initial.npz')
-$tag = "input_pilot_v2_eps${Epsilon}_seed${Seed}_steps${OptimizerSteps}"
 $runs = @(
     [pscustomobject]@{ Name="${tag}_clean"; Attack='none'; File=$null },
     [pscustomobject]@{ Name="${tag}_random"; Attack='vae-pgd'; File=$randomAsset },
@@ -39,8 +46,19 @@ if ($Epsilon -eq 2 -and (Test-Path -LiteralPath $OldAttack)) {
     Write-Warning "Skipping old VAE comparison: requires an existing epsilon=2 asset ($OldAttack)"
 }
 $runs += [pscustomobject]@{ Name="${tag}_balanced_vae"; Attack='vae-pgd'; File=$asset }
+if ($PairedOnly) {
+    $cleanRun = "${cleanTag}_clean"
+    $runs = @($runs | Where-Object { $_.Name -in @("${tag}_mean_vae", "${tag}_balanced_vae") })
+    $baseline = Join-Path $OutputRoot "$cleanRun\Jockey\gop0"
+    foreach ($file in @('metrics.json','codebook.tdcm','input_attack_trace.npz')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $baseline $file) -PathType Leaf)) {
+            throw "Missing reusable clean result: $baseline\$file"
+        }
+    }
+    Write-Host "Reusing clean comparison only: $baseline (candidate encodings remain independent)"
+}
 
-Write-Host "Input attack pilot: $Data | seed=$Seed | epsilon=$Epsilon/255"
+Write-Host "Input attack pilot: $Data | codec seed=$Seed | perturbation initialization seed=$InitSeed | epsilon=$Epsilon/255"
 Write-Host "All codec evaluations re-encode the perturbed input; no clean codebook is reused."
 $runs | ForEach-Object { Write-Host "  $($_.Name): $($_.Attack)" }
 if ($PlanOnly) { Write-Host '[PLAN ONLY] No model loaded.'; return }
@@ -53,7 +71,7 @@ foreach ($objective in @('balanced','mean')) {
         --data $Data --vae $vae --output $candidate --height 720 --width 1280 `
         --frames 33 --anchors 3 --steps $OptimizerSteps --epsilon $Epsilon `
         --alpha 0.25 --objective $objective --balance_weight 1.0 `
-        --balance_temperature 0.01 --seed $Seed
+        --balance_temperature 0.01 --seed $InitSeed
     if ($LASTEXITCODE -ne 0) { throw "Perturbation generation failed: $objective" }
 }
 
@@ -84,7 +102,7 @@ foreach ($run in $runs) {
     }
 }
 
-$cleanPath = Join-Path $OutputRoot "${tag}_clean\Jockey\gop0\metrics.json"
+$cleanPath = Join-Path $OutputRoot "$cleanRun\Jockey\gop0\metrics.json"
 $clean = Get-Content -LiteralPath $cleanPath -Raw | ConvertFrom-Json
 $summary = foreach ($run in $runs) {
     $path = Join-Path $OutputRoot "$($run.Name)\Jockey\gop0\metrics.json"
@@ -108,6 +126,6 @@ $summary | Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF
 $summary | Format-Table -AutoSize
 Write-Host "Saved: $summaryPath"
 & $Python '.\exp_flf2v\analyze_input_attack_pilot.py' `
-    --results_root $OutputRoot --tag $tag --sequence Jockey --gop 0
+    --results_root $OutputRoot --tag $tag --clean-run $cleanRun --sequence Jockey --gop 0
 if ($LASTEXITCODE -ne 0) { throw 'Post-hoc codebook analysis failed.' }
 Write-Host 'Note: this is a VAE-balanced input attack pilot, not yet a codec-gradient attack.'

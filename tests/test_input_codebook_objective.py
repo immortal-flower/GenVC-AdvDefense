@@ -37,3 +37,14 @@ class InputCodebookObjectiveTest(unittest.TestCase):
         self.assertAlmostEqual(y.item(), (x.detach() * 255).round().item() / 255)
         y.backward()
         self.assertEqual(x.grad.item(), 1.0)
+
+    def test_native_residual_objective_has_gradient(self):
+        from exp_flf2v.input_codebook_objective import input_codebook_loss_from_residual
+
+        displacement = torch.tensor([0.02, -0.01, 0.03, 0.0], requires_grad=True)
+        residual = torch.tensor([0.4, -0.3, 0.2, 0.1]) + displacement
+        atoms = torch.eye(4)
+        loss = input_codebook_loss_from_residual(residual, atoms, m=2, gain=0.3)
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(displacement.grad.abs().sum().item(), 0)

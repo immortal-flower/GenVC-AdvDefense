@@ -20,7 +20,10 @@ sys.path.insert(0, str(ROOT))
 from generate_vae_pgd import load_yuv420_frames, resize_frames, WanVAE
 from generate_vae_fullcontext_pgd import lift_controls, resize_video
 from generate_vae_temporal_pgd import temporal_weights
-from input_codebook_objective import input_codebook_loss_from_latent, straight_through_8bit
+from input_codebook_objective import (
+    input_codebook_loss_from_latent, input_codebook_loss_from_residual,
+    straight_through_8bit,
+)
 from sde_rf_wan.turbo_codebook import TurboBitstream, TurboPerFrameCodebook
 
 
@@ -69,6 +72,7 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--opt_height", type=int, default=192)
     p.add_argument("--opt_width", type=int, default=336)
+    p.add_argument("--proxy_geometry", choices=("native", "lowres"), default="native")
     a = p.parse_args()
     if min(a.steps, a.epsilon, a.alpha, a.noise_coeff, a.opt_height, a.opt_width) <= 0:
         p.error("Positive steps, epsilon, alpha, noise coefficient and dimensions required")
@@ -101,27 +105,42 @@ def main():
         p.error("Input has fewer than 33 frames at requested start")
     original = np.stack([np.asarray(frame) for frame in frames]).copy()
     target = torch.from_numpy(original).permute(3, 0, 1, 2).float().to(device) / 255
-    native_atoms = candidate_bank(stream, native_residual[:, a.latent_position],
-                                  1, a.latent_position, a.candidate_count, device)
+    native_atoms, candidate_indices = candidate_bank(
+        stream, native_residual[:, a.latent_position],
+        1, a.latent_position, a.candidate_count, device, return_indices=True,
+    )
+    if a.proxy_geometry == "native":
+        with torch.no_grad():
+            clean_scores = native_atoms @ native_residual[:, a.latent_position].to(device).flatten()
+            predicted = {candidate_indices[i] for i in clean_scores.abs().topk(stream["M"]).indices.tolist()}
+            transmitted = set(stream["step_data"][0][a.latent_position][0])
+            if predicted != transmitted:
+                raise RuntimeError("Native proxy does not recover the clean top-M selection")
+        print(f"Native clean top-M agreement: {len(predicted)}/{stream['M']}", flush=True)
     low_shape = (a.opt_height // 8, a.opt_width // 8)
-    atoms = F.interpolate(native_atoms.view(-1, *stream["frame_shape"]),
-                          size=low_shape, mode="bilinear", align_corners=False)
-    atoms = atoms.flatten(1)
-    atoms = atoms / atoms.std(dim=1, keepdim=True).clamp_min(1e-8)
-    del native_atoms
+    if a.proxy_geometry == "lowres":
+        atoms = F.interpolate(native_atoms.view(-1, *stream["frame_shape"]),
+                              size=low_shape, mode="bilinear", align_corners=False)
+        atoms = atoms.flatten(1)
+        atoms = atoms / atoms.std(dim=1, keepdim=True).clamp_min(1e-8)
+        del native_atoms
+    else:
+        atoms = native_atoms
 
     def downsample_latent(z):
         # The VAE has (C,T,H,W); interpolate only spatial dimensions.
         return F.interpolate(z.permute(1, 0, 2, 3), size=low_shape,
                              mode="bilinear", align_corners=False).permute(1, 0, 2, 3)
 
-    residual_small = downsample_latent(native_residual).to(device)
+    native_residual = native_residual.to(device)
+    if a.proxy_geometry == "lowres":
+        residual_small = downsample_latent(native_residual)
     clean_small = resize_video(target, (a.opt_height, a.opt_width))
     vae = WanVAE(vae_pth=str(a.vae), dtype=torch.bfloat16, device=device)
     with torch.no_grad():
         clean_latent = vae.encode([clean_small * 2 - 1])[0].float()
-    if clean_latent.shape != residual_small.shape:
-        raise RuntimeError("Low-resolution VAE latent and residual geometry differ")
+    if clean_latent.shape[:2] != native_residual.shape[:2] or clean_latent.shape[2:] != low_shape:
+        raise RuntimeError("Low-resolution VAE latent geometry differs from clean trajectory")
     weights = torch.from_numpy(temporal_weights(33, 3)).to(device)
     eps, alpha = a.epsilon / 255, a.alpha / 255
     controls = torch.empty(3, 3, a.opt_height, a.opt_width, device=device).uniform_(-eps, eps)
@@ -137,10 +156,21 @@ def main():
         encoded = vae.encode([attacked_small * 2 - 1])[0].float()
         if not encoded.requires_grad:
             raise RuntimeError("VAE encoding detached from the input; check grad mode")
-        objective = input_codebook_loss_from_latent(
-            encoded, clean_latent, residual_small, atoms,
-            a.latent_position, stream["M"], a.noise_coeff,
-        )
+        if a.proxy_geometry == "native":
+            latent_shift = encoded - clean_latent
+            native_shift = F.interpolate(
+                latent_shift.permute(1, 0, 2, 3),
+                size=stream["frame_shape"][1:], mode="bilinear", align_corners=False,
+            ).permute(1, 0, 2, 3)
+            residual = native_residual[:, a.latent_position] + native_shift[:, a.latent_position]
+            objective = input_codebook_loss_from_residual(
+                residual, atoms, stream["M"], a.noise_coeff,
+            )
+        else:
+            objective = input_codebook_loss_from_latent(
+                encoded, clean_latent, residual_small, atoms,
+                a.latent_position, stream["M"], a.noise_coeff,
+            )
         if not objective.requires_grad:
             raise RuntimeError("Codebook proxy objective detached from the input")
         grad, = torch.autograd.grad(objective, c)

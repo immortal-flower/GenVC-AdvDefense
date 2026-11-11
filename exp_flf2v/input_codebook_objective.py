@@ -83,6 +83,24 @@ def input_codebook_loss_from_latent(
         raise ValueError("Latent position out of range")
     residual = (clean_residual[:, latent_position] +
                 encoded[:, latent_position] - clean_latent[:, latent_position]).flatten()
+    return input_codebook_loss_from_residual(
+        residual, atoms, m, gain,
+        selection_temperature=selection_temperature,
+        sign_temperature=sign_temperature,
+    )
+
+
+def input_codebook_loss_from_residual(
+    residual: torch.Tensor,
+    atoms: torch.Tensor,
+    m: int,
+    gain: float,
+    *,
+    selection_temperature: float = 0.1,
+    sign_temperature: float = 0.1,
+) -> torch.Tensor:
+    """Score a flattened residual in the same geometry as the atom bank."""
+    residual = residual.flatten()
     correction = soft_codebook_correction(
         residual, atoms, m,
         selection_temperature=selection_temperature,

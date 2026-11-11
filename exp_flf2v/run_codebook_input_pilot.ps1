@@ -8,6 +8,8 @@ param(
     [int]$AttackSeed = 42,
     [int]$ProxySteps = 4,
     [double]$NoiseCoeff = 0.3062,
+    [ValidateSet('native', 'lowres')]
+    [string]$ProxyGeometry = 'native',
     [switch]$AnalyzeOnly,
     [switch]$PlanOnly
 )
@@ -18,7 +20,7 @@ $env:CUDA_VISIBLE_DEVICES = '0,1'
 $cleanDir = Join-Path $OutputRoot "$CleanRun\Jockey\gop0"
 $vae = Join-Path $WanCkpt 'Wan2.1_VAE.pth'
 $noiseTag = $NoiseCoeff.ToString('0.####', [Globalization.CultureInfo]::InvariantCulture).Replace('.', 'p')
-$prefix = "input_codebook_proxy_step1pos3_eps2_seed${Seed}_aseed${AttackSeed}_p${ProxySteps}_n${noiseTag}"
+$prefix = "input_codebook_proxy_step1pos3_eps2_seed${Seed}_aseed${AttackSeed}_p${ProxySteps}_n${noiseTag}_g${ProxyGeometry}"
 $legacyPrefix = "input_codebook_proxy_step1pos3_eps2_seed${Seed}_p${ProxySteps}_n${noiseTag}"
 if ($AnalyzeOnly -and $AttackSeed -eq 42 -and
     -not (Test-Path -LiteralPath (Join-Path $OutputRoot "${prefix}_candidate\Jockey\gop0\metrics.json") -PathType Leaf) -and
@@ -68,7 +70,7 @@ if (-not ((Test-Path -LiteralPath $asset -PathType Leaf) -and
         --bitstream (Join-Path $cleanDir 'codebook.tdcm') `
         --trace (Join-Path $cleanDir 'input_attack_trace.npz') `
         --output $asset --steps $ProxySteps `
-        --noise_coeff $NoiseCoeff --seed $AttackSeed
+        --noise_coeff $NoiseCoeff --seed $AttackSeed --proxy_geometry $ProxyGeometry
     if ($LASTEXITCODE -ne 0) { throw 'Candidate generation failed; no codec run started' }
 }
 if (-not ((Test-Path -LiteralPath $asset -PathType Leaf) -and

@@ -51,6 +51,7 @@ def candidate_bank(stream, residual, step, position, count, device):
     return atoms
 
 
+@torch.enable_grad()
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data", type=Path, required=True)
@@ -134,10 +135,14 @@ def main():
         quantized = straight_through_8bit(target + delta)
         attacked_small = resize_video(quantized, (a.opt_height, a.opt_width))
         encoded = vae.encode([attacked_small * 2 - 1])[0].float()
+        if not encoded.requires_grad:
+            raise RuntimeError("VAE encoding detached from the input; check grad mode")
         objective = input_codebook_loss_from_latent(
             encoded, clean_latent, residual_small, atoms,
             a.latent_position, stream["M"], a.noise_coeff,
         )
+        if not objective.requires_grad:
+            raise RuntimeError("Codebook proxy objective detached from the input")
         grad, = torch.autograd.grad(objective, c)
         if not torch.isfinite(grad).all() or grad.abs().max() == 0:
             raise RuntimeError("Non-finite or zero pixel gradient")

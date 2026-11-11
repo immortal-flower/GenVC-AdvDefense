@@ -57,6 +57,30 @@ def input_codebook_loss(
     clean_latent = clean_latent.to(device=encoded.device, dtype=encoded.dtype)
     clean_residual = clean_residual.to(device=encoded.device, dtype=encoded.dtype)
     atoms = atoms.to(device=encoded.device, dtype=encoded.dtype)
+    return input_codebook_loss_from_latent(
+        encoded, clean_latent, clean_residual, atoms, latent_position, m, gain,
+        selection_temperature=selection_temperature,
+        sign_temperature=sign_temperature,
+    )
+
+
+def input_codebook_loss_from_latent(
+    encoded: torch.Tensor,
+    clean_latent: torch.Tensor,
+    clean_residual: torch.Tensor,
+    atoms: torch.Tensor,
+    latent_position: int,
+    m: int,
+    gain: float,
+    *,
+    selection_temperature: float = 0.1,
+    sign_temperature: float = 0.1,
+) -> torch.Tensor:
+    """Score one cell after a shared differentiable VAE encoding."""
+    if encoded.shape != clean_latent.shape or encoded.shape != clean_residual.shape:
+        raise ValueError("Attacked/clean latent and residual shapes must match")
+    if not 0 <= latent_position < encoded.shape[1]:
+        raise ValueError("Latent position out of range")
     residual = (clean_residual[:, latent_position] +
                 encoded[:, latent_position] - clean_latent[:, latent_position]).flatten()
     correction = soft_codebook_correction(

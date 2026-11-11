@@ -5,8 +5,10 @@ param(
     [string]$OutputRoot = '.\exp_flf2v\results_720p',
     [string]$CleanRun = 'input_pilot_v2_eps2_seed42_steps20_clean',
     [int]$Seed = 42,
+    [int]$AttackSeed = 42,
     [int]$ProxySteps = 4,
     [double]$NoiseCoeff = 0.3062,
+    [switch]$AnalyzeOnly,
     [switch]$PlanOnly
 )
 
@@ -16,9 +18,19 @@ $env:CUDA_VISIBLE_DEVICES = '0,1'
 $cleanDir = Join-Path $OutputRoot "$CleanRun\Jockey\gop0"
 $vae = Join-Path $WanCkpt 'Wan2.1_VAE.pth'
 $noiseTag = $NoiseCoeff.ToString('0.####', [Globalization.CultureInfo]::InvariantCulture).Replace('.', 'p')
-$prefix = "input_codebook_proxy_step1pos3_eps2_seed${Seed}_p${ProxySteps}_n${noiseTag}"
+$prefix = "input_codebook_proxy_step1pos3_eps2_seed${Seed}_aseed${AttackSeed}_p${ProxySteps}_n${noiseTag}"
+$legacyPrefix = "input_codebook_proxy_step1pos3_eps2_seed${Seed}_p${ProxySteps}_n${noiseTag}"
+if ($AnalyzeOnly -and $AttackSeed -eq 42 -and
+    -not (Test-Path -LiteralPath (Join-Path $OutputRoot "${prefix}_candidate\Jockey\gop0\metrics.json") -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $OutputRoot "${legacyPrefix}_candidate\Jockey\gop0\metrics.json") -PathType Leaf)) {
+    $prefix = $legacyPrefix
+}
 $asset = ".\exp_flf2v\attack_assets\${prefix}.npz"
 $randomAsset = $asset.Replace('.npz', '_matched.npz')
+$runs = @(
+    [pscustomobject]@{ Label = 'random'; File = $randomAsset },
+    [pscustomobject]@{ Label = 'candidate'; File = $asset }
+)
 $required = @($Python, $Data, $WanCkpt, $vae,
               (Join-Path $cleanDir 'metrics.json'),
               (Join-Path $cleanDir 'codebook.tdcm'),
@@ -41,6 +53,7 @@ if ($PlanOnly) {
     return
 }
 
+if (-not $AnalyzeOnly) {
 & $Python '.\exp_flf2v\validate_codebook_proxy.py' `
     --bitstream (Join-Path $cleanDir 'codebook.tdcm') `
     --trace (Join-Path $cleanDir 'input_attack_trace.npz') `
@@ -55,7 +68,7 @@ if (-not ((Test-Path -LiteralPath $asset -PathType Leaf) -and
         --bitstream (Join-Path $cleanDir 'codebook.tdcm') `
         --trace (Join-Path $cleanDir 'input_attack_trace.npz') `
         --output $asset --steps $ProxySteps `
-        --noise_coeff $NoiseCoeff --seed $Seed
+        --noise_coeff $NoiseCoeff --seed $AttackSeed
     if ($LASTEXITCODE -ne 0) { throw 'Candidate generation failed; no codec run started' }
 }
 if (-not ((Test-Path -LiteralPath $asset -PathType Leaf) -and
@@ -64,10 +77,6 @@ if (-not ((Test-Path -LiteralPath $asset -PathType Leaf) -and
     throw 'Candidate or matched control asset is incomplete; no codec run started'
 }
 
-$runs = @(
-    [pscustomobject]@{ Label = 'random'; File = $randomAsset },
-    [pscustomobject]@{ Label = 'candidate'; File = $asset }
-)
 foreach ($run in $runs) {
     $name = "${prefix}_$($run.Label)"
     $metrics = Join-Path $OutputRoot "$name\Jockey\gop0\metrics.json"
@@ -89,6 +98,7 @@ foreach ($run in $runs) {
         throw "Incomplete full re-encoding: $name"
     }
 }
+}
 
 $clean = Get-Content -LiteralPath (Join-Path $cleanDir 'metrics.json') -Raw | ConvertFrom-Json
 $rows = foreach ($run in $runs) {
@@ -109,3 +119,7 @@ $rows = foreach ($run in $runs) {
 }
 $rows | Format-Table -AutoSize
 $rows | Export-Csv (Join-Path $OutputRoot "${prefix}_summary.csv") -NoTypeInformation -Encoding UTF8
+& $Python '.\exp_flf2v\analyze_codebook_input_pilot.py' `
+    --results_root $OutputRoot --clean_run $CleanRun --prefix $prefix `
+    --output_prefix (Join-Path $OutputRoot "${prefix}_analysis")
+if ($LASTEXITCODE -ne 0) { throw 'Post-hoc pilot analysis failed' }

@@ -9,6 +9,21 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from exp_flf2v.analyze_combinatorial_index_robustness import read_codebook_records
+
+
+def load_codebook(path):
+    # Use the CPU-only parser: importing the full codec loads PyTorch and
+    # can conflict with NumPy's OpenMP runtime on Windows.
+    k, _, _, records = read_codebook_records(path)
+    steps = []
+    for row in records:
+        if row['latent'] == 0:
+            steps.append([])
+        steps[-1].append((row['indices'], row['signs']))
+    if not steps:
+        raise ValueError(f'Empty codebook: {path}')
+    return dict(K=k, num_sde_steps=len(steps), num_latent_frames=len(steps[0]), step_data=steps)
 
 
 def compare_records(clean, attacked):
@@ -36,7 +51,6 @@ def compare_records(clean, attacked):
 
 def main():
     import numpy as np
-    from sde_rf_wan.turbo_codebook import TurboBitstream
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--results_root', type=Path, required=True)
     p.add_argument('--tag', required=True)
@@ -45,14 +59,14 @@ def main():
     args = p.parse_args()
     base = args.results_root
     clean_dir = base / f'{args.tag}_clean' / args.sequence / f'gop{args.gop}'
-    clean = TurboBitstream.load(str(clean_dir / 'codebook.tdcm'))
+    clean = load_codebook(clean_dir / 'codebook.tdcm')
     clean_metrics = json.loads((clean_dir / 'metrics.json').read_text())
     out = []
     for name in ('random', 'old_vae', 'mean_vae', 'balanced_vae'):
         run_dir = base / f'{args.tag}_{name}' / args.sequence / f'gop{args.gop}'
         if not (run_dir / 'metrics.json').exists():
             continue
-        attack = TurboBitstream.load(str(run_dir / 'codebook.tdcm'))
+        attack = load_codebook(run_dir / 'codebook.tdcm')
         metrics = json.loads((run_dir / 'metrics.json').read_text())
         records = compare_records(clean, attack)
         trace_path = run_dir / 'input_attack_trace.npz'

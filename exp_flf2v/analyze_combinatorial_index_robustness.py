@@ -113,9 +113,11 @@ def read_codebook_records(
             sign_bytes = (m_actual + 7) // 8
             if off + sign_bytes > len(raw):
                 raise ValueError("Truncated TDC2 sign payload")
+            signs = [1 if raw[off + i // 8] & (1 << (i % 8)) else -1
+                     for i in range(m_actual)]
             off += sign_bytes
             records.append(dict(step=step, latent=latent, M=m_actual,
-                                rank=rank, indices=indices))
+                                rank=rank, indices=indices, signs=signs))
     if off != len(raw):
         raise ValueError(f"Unexpected {len(raw) - off} trailing bytes")
     return K, M, magic.decode("ascii"), records

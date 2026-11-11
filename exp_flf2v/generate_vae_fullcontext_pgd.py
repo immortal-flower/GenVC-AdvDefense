@@ -39,6 +39,8 @@ def main():
     p.add_argument('--objective',choices=['mean','balanced'],default='mean',
                    help='balanced also maximizes a smooth minimum over latent time positions')
     p.add_argument('--balance_weight',type=float,default=1.0)
+    p.add_argument('--start_frame',type=int,default=0)
+    p.add_argument('--matched_random',action='store_true')
     p.add_argument('--balance_temperature',type=float,default=0.01)
     a=p.parse_args()
     if not (a.frames>=5 and (a.frames-1)%4==0 and 1<=a.anchors<=a.frames and a.steps>0
@@ -48,7 +50,9 @@ def main():
             and a.balance_weight>=0 and a.balance_temperature>0):
         p.error('Invalid dimensions, optimizer parameters or 4n+1 frame count')
     torch.manual_seed(a.seed)
-    frames=resize_frames(load_yuv420_frames(a.data,a.frames),a.width,a.height)
+    if a.start_frame < 0:
+        p.error('--start_frame must be non-negative')
+    frames=resize_frames(load_yuv420_frames(a.data,a.frames,start_frame=a.start_frame),a.width,a.height)
     if len(frames)!=a.frames:raise ValueError('Not enough frames')
     device=torch.device('cuda:0');eps=a.epsilon/255;alpha=a.alpha/255
     original=np.stack([np.asarray(f) for f in frames]).copy()
@@ -124,6 +128,18 @@ def main():
                         delta=random_delta[0] if a.anchors==1 else random_delta)
     # Shared mode uses the existing compact HWC file format.
     np.savez_compressed(out,delta=delta[0] if a.anchors==1 else delta)
+    if a.matched_random:
+        # Preserve each realized integer RGB magnitude; randomize its sign
+        # with a spatial mask shared over time. Respect saturated pixels.
+        base=original.astype(np.int16)
+        magnitude=np.abs(pixels.astype(np.int16)-base)
+        rng=np.random.default_rng(a.seed+1)
+        signs=rng.integers(0,2,size=base.shape[1:],dtype=np.int16)*2-1
+        signed=magnitude*signs
+        invalid=(base+signed<0)|(base+signed>255)
+        signed[invalid]*=-1
+        np.savez_compressed(out.with_name(out.stem+'_matched.npz'),
+                            delta=signed.astype(np.float32)/255)
     previews=out.parent/(out.stem+'_input_png');previews.mkdir(parents=True,exist_ok=True)
     for f in [0,a.frames//2,a.frames-1]:
         Image.fromarray(original[f]).save(previews/f'frame{f:02d}_original.png')

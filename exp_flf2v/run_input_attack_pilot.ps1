@@ -7,6 +7,8 @@ param(
     [int]$Seed = 42,
     [Nullable[int]]$InitSeed = $null,
     [switch]$PairedOnly,
+    [ValidateRange(0, 10000)][int]$Gop = 0,
+    [switch]$MatchedOnly,
     [int]$Epsilon = 2,
     [int]$OptimizerSteps = 20,
     [switch]$PlanOnly
@@ -29,7 +31,10 @@ if (-not (Test-Path -LiteralPath $vae)) { throw "Missing VAE: $vae" }
 $cleanTag = "input_pilot_v2_eps${Epsilon}_seed${Seed}_steps${OptimizerSteps}"
 if ($null -eq $InitSeed) { $InitSeed = $Seed }
 $tag = $cleanTag
+if ($Gop -ne 0 -and -not $MatchedOnly) { throw 'Nonzero GOP requires -MatchedOnly' }
+if ($MatchedOnly -and ($PairedOnly -or $Epsilon -lt 2)) { throw 'MatchedOnly requires epsilon >= 2 and cannot be combined with PairedOnly' }
 if ($PairedOnly -or $InitSeed -ne $Seed) { $tag += "_init${InitSeed}" }
+if ($MatchedOnly) { $tag += "_gop${Gop}_matched" }
 $suffix = if ($tag -ne $cleanTag) { "_init${InitSeed}" } else { '' }
 $asset = ".\exp_flf2v\attack_assets\input_v2_balanced_eps${Epsilon}_seed${Seed}_steps${OptimizerSteps}${suffix}.npz"
 $cleanRun = "${tag}_clean"
@@ -46,6 +51,11 @@ if ($Epsilon -eq 2 -and (Test-Path -LiteralPath $OldAttack)) {
     Write-Warning "Skipping old VAE comparison: requires an existing epsilon=2 asset ($OldAttack)"
 }
 $runs += [pscustomobject]@{ Name="${tag}_balanced_vae"; Attack='vae-pgd'; File=$asset }
+if ($MatchedOnly) {
+    $randomAsset = $meanAsset.Replace('.npz', '_matched.npz')
+    $runs = @($runs | Where-Object { $_.Name -in @("${tag}_clean", "${tag}_random", "${tag}_mean_vae") })
+    ($runs | Where-Object Name -eq "${tag}_random").File = $randomAsset
+}
 if ($PairedOnly) {
     $cleanRun = "${cleanTag}_clean"
     $runs = @($runs | Where-Object { $_.Name -in @("${tag}_mean_vae", "${tag}_balanced_vae") })
@@ -58,25 +68,28 @@ if ($PairedOnly) {
     Write-Host "Reusing clean comparison only: $baseline (candidate encodings remain independent)"
 }
 
-Write-Host "Input attack pilot: $Data | codec seed=$Seed | perturbation initialization seed=$InitSeed | epsilon=$Epsilon/255"
+Write-Host "Input attack pilot: $Data | GOP=$Gop | codec seed=$Seed | initialization seed=$InitSeed | epsilon=$Epsilon/255"
 Write-Host "All codec evaluations re-encode the perturbed input; no clean codebook is reused."
 $runs | ForEach-Object { Write-Host "  $($_.Name): $($_.Attack)" }
 if ($PlanOnly) { Write-Host '[PLAN ONLY] No model loaded.'; return }
 
-foreach ($objective in @('balanced','mean')) {
+$objectives = if ($MatchedOnly) { @('mean') } else { @('balanced','mean') }
+foreach ($objective in $objectives) {
     $candidate = if ($objective -eq 'balanced') { $asset } else { $meanAsset }
     $initialFile = $candidate.Replace('.npz', '_initial.npz')
+    $extra = @('--start_frame', "$(32*$Gop)")
+    if ($MatchedOnly) { $initialFile = $randomAsset; $extra += '--matched_random' }
     if ((Test-Path -LiteralPath $candidate) -and (Test-Path -LiteralPath $initialFile)) { continue }
     & $Python '.\exp_flf2v\generate_vae_fullcontext_pgd.py' `
         --data $Data --vae $vae --output $candidate --height 720 --width 1280 `
         --frames 33 --anchors 3 --steps $OptimizerSteps --epsilon $Epsilon `
         --alpha 0.25 --objective $objective --balance_weight 1.0 `
-        --balance_temperature 0.01 --seed $InitSeed
+        --balance_temperature 0.01 --seed $InitSeed @extra
     if ($LASTEXITCODE -ne 0) { throw "Perturbation generation failed: $objective" }
 }
 
 foreach ($run in $runs) {
-    $metrics = Join-Path $OutputRoot "$($run.Name)\Jockey\gop0\metrics.json"
+    $metrics = Join-Path $OutputRoot "$($run.Name)\Jockey\gop$Gop\metrics.json"
     if (Test-Path -LiteralPath $metrics) {
         $existing = Get-Content -LiteralPath $metrics -Raw | ConvertFrom-Json
         if ($null -ne $existing.reconstruction_vs_submitted_PSNR_dB) {
@@ -87,7 +100,7 @@ foreach ($run in $runs) {
     $argv = @('.\exp_flf2v\run_flf2v_experiment.py',
         '--wan_ckpt', $WanCkpt, '--data_dir', $Data,
         '--output_dir', $OutputRoot, '--run_name', $run.Name,
-        '--num_frames_per_gop', '33', '--num_gops', '1',
+        '--num_frames_per_gop', '33', '--num_gops', '1', '--start_gop', "$Gop",
         '--height', '720', '--width', '1280', '--M', '64', '--K', '16384',
         '--steps', '20', '--ddim_tail', '3', '--g_scale', '3.0',
         '--ref_codec', 'compressai', '--ref_quality', '4',
@@ -102,10 +115,10 @@ foreach ($run in $runs) {
     }
 }
 
-$cleanPath = Join-Path $OutputRoot "$cleanRun\Jockey\gop0\metrics.json"
+$cleanPath = Join-Path $OutputRoot "$cleanRun\Jockey\gop$Gop\metrics.json"
 $clean = Get-Content -LiteralPath $cleanPath -Raw | ConvertFrom-Json
 $summary = foreach ($run in $runs) {
-    $path = Join-Path $OutputRoot "$($run.Name)\Jockey\gop0\metrics.json"
+    $path = Join-Path $OutputRoot "$($run.Name)\Jockey\gop$Gop\metrics.json"
     $m = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
     [pscustomobject]@{
         Run = $run.Name
@@ -116,6 +129,7 @@ $summary = foreach ($run in $runs) {
         Delta_LPIPS = [math]::Round([double]$m.LPIPS - [double]$clean.LPIPS, 4)
         BPP = $m.BPP
         InputPSNR = $m.input_PSNR_dB
+        InputMSE = $m.input_MSE
         InputLinfPixel = $m.input_Linf_pixel
         PSNR_vs_Submitted = $m.reconstruction_vs_submitted_PSNR_dB
         CodecMSEIncrease = [double]$m.reconstruction_vs_submitted_MSE - [double]$clean.reconstruction_vs_submitted_MSE
@@ -126,6 +140,6 @@ $summary | Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF
 $summary | Format-Table -AutoSize
 Write-Host "Saved: $summaryPath"
 & $Python '.\exp_flf2v\analyze_input_attack_pilot.py' `
-    --results_root $OutputRoot --tag $tag --clean-run $cleanRun --sequence Jockey --gop 0
+    --results_root $OutputRoot --tag $tag --clean-run $cleanRun --sequence Jockey --gop $Gop
 if ($LASTEXITCODE -ne 0) { throw 'Post-hoc codebook analysis failed.' }
 Write-Host 'Note: this is a VAE-balanced input attack pilot, not yet a codec-gradient attack.'

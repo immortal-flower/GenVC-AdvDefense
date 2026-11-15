@@ -111,6 +111,30 @@ class TrajectoryObjectiveTest(unittest.TestCase):
         (grad,) = torch.autograd.grad(score, rgb)
         self.assertTrue((grad > 0).all())
 
+    def test_full_backward_tracks_first_and_last_sde_selection(self):
+        target = torch.ones(1, 1, 1, 1, 1, requires_grad=True)
+        initial = torch.zeros_like(target)
+        times = [1., .9, .8, .7, 0.]
+        calls, selected = [], []
+
+        def predict(state, t):
+            calls.append(t)
+            return state * .1
+
+        def correct(residual, step, pos):
+            selected.append(step)
+            return residual * .2
+
+        state, _ = full_trajectory(
+            target, initial, initial, times, 2, None, None, backward_steps=4,
+            predict_grad=predict, correct_grad=correct,
+        )
+        self.assertEqual(calls, times[:-1])
+        self.assertEqual(selected, [0, 1])
+        (grad,) = torch.autograd.grad(state.sum(), target)
+        self.assertTrue(torch.isfinite(grad).all())
+        self.assertGreater(float(grad), 0.)
+
     def test_grid_amplitude_with_clipped_nonmonotonic_energy(self):
         amp, mse = match_grid_amplitude(lambda a: min((a-1)**2 + 1, 5), 2.25, 4)
         self.assertAlmostEqual(amp, 1 + 1.25**.5, delta=.002)

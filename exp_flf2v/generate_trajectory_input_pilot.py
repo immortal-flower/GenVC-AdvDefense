@@ -1,4 +1,4 @@
-"""Short Wan/SDE rollout input attack. Experimental surrogate, not full codec AD.
+"""Short latent rollout or full-forward RGB robustness pilot; not exact codec AD.
 
 Hard full-K selection is recomputed at EVERY rollout step. Backward uses a
 local soft top-N bank. VAE and DiT graphs are separated by an exact latent VJP.
@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from run_flf2v_experiment import load_yuv420_frames, resize_frames, compress_boundary_frame
 from generate_wan_boundary_pgd import tensor_conditions
 from probe_wan_condition_grad import checkpoint_blocks
-from trajectory_input_objective import correction, rollout_loss
+from trajectory_input_objective import correction, full_trajectory, rgb_distortion, rollout_loss
 from sde_rf_wan.sde_convert import shifted_timesteps
 from sde_rf_wan.turbo_codebook import TurboPerFrameCodebook
 from sde_rf_wan.wan_flf2v_wrapper import WanFLF2VWrapper
@@ -62,6 +62,8 @@ def main():
     p.add_argument('--output_dir', required=True)
     p.add_argument('--iterations', type=int, default=4)
     p.add_argument('--rollout_steps', type=int, default=2)
+    p.add_argument('--objective', choices=['early-latent', 'final-rgb'], default='early-latent')
+    p.add_argument('--backward_steps', type=int, default=6, help='Final RGB mode only')
     p.add_argument('--height', type=int, default=128)
     p.add_argument('--width', type=int, default=224)
     p.add_argument('--epsilon', type=float, default=2.)
@@ -71,6 +73,9 @@ def main():
     p.add_argument('--gpu0_memory', default='20GiB')
     p.add_argument('--gpu1_memory', default='20GiB')
     a = p.parse_args()
+    final_rgb = a.objective == 'final-rgb'
+    if final_rgb and not 4 <= a.backward_steps <= 20:
+        p.error('Final RGB backward suffix must include at least one SDE step (4–20 steps)')
     if (a.iterations < 1 or not 1 <= a.rollout_steps <= 16 or
             min(a.height, a.width) < 32 or a.height % 16 or a.width % 16 or
             a.epsilon <= 0 or a.alpha <= 0 or not 64 <= a.pool_size <= 16384):
@@ -79,6 +84,8 @@ def main():
     report_path = out / 'generation.json'
     checkpoint = out / 'optimizer_checkpoint.npz'
     config = vars(a) | dict(data_sha256=digest(a.data), init_sha256=digest(a.initial_attack_file), version=1)
+    if not final_rgb:  # retain compatibility with existing short-rollout checkpoints
+        del config['objective'], config['backward_steps']
     fingerprint = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     if report_path.exists():
         previous = json.loads(report_path.read_text(encoding='utf-8'))
@@ -96,6 +103,11 @@ def main():
                   limitation='Reduced-resolution short rollout, full-K hard forward/local soft backward; not exact native codec gradient',
                   objective='Mean post-update predicted-x0 MSE against clean latent across rollout checkpoints and all latent positions',
                   boundary='Fixed initialized first/last RGB, compressed once using compressai q4 before resizing')
+    if final_rgb:
+        report.update(objective='Negative mean per-frame PSNR, float RGB decoder output vs clean source',
+                      limitation='Low-resolution 20-step hard forward, truncated backward and soft codebook gradients',
+                      tracked_steps=list(range(21 - a.backward_steps, 21)),
+                      tracked_sde_steps=list(range(21 - a.backward_steps, 18)))
     atomic_json(report_path, report)
     start = time.monotonic()
     try:
@@ -157,10 +169,48 @@ def main():
         with torch.no_grad():
             reference = encode(rgb).to('cuda:0')
         initial_state = torch.randn(reference.shape, generator=torch.Generator(device='cpu').manual_seed(a.seed)).to('cuda:0')
-        times = shifted_timesteps(20, shift=model.flow_shift, device='cpu')[:a.rollout_steps + 1].tolist()
+        schedule = shifted_timesteps(20, shift=model.flow_shift, device='cpu').tolist()
+        times = schedule if final_rgb else schedule[:a.rollout_steps + 1]
         book = TurboPerFrameCodebook(K=16384, M=64, frame_shape=(reference.shape[1], *reference.shape[-2:]), seed=a.seed, device=torch.device('cuda:0'))
         report['times'] = times
         report['device_map'] = {k: str(v) for k, v in mapping.items()}
+        with torch.no_grad():
+            rgb_reference = (F.interpolate(rgb, (a.height, a.width), mode='bilinear',
+                                          align_corners=False, antialias=True)
+                             if final_rgb else None)
+
+        def terminal(latent, grad=False):
+            return full_trajectory(
+                latent, reference, initial_state, times, 17,
+                lambda x, t: model.predict_velocity(x, t, embeds, cond),
+                lambda r, s, f: book.select_atoms(r, s, f)[2],
+                backward_steps=a.backward_steps if grad else 0,
+                predict_grad=lambda x, t: model.predict_velocity_with_grad(x, t, embeds, cond),
+                correct_grad=lambda r, s, f: correction(book, r, s, f, a.pool_size),
+            )
+
+        def decoded_score(state):
+            video = model.vae.decode([state[0].to('cuda:1')])[0]
+            reconstructed = (video.permute(1, 0, 2, 3) / 2 + .5).clamp(0, 1)
+            return rgb_distortion(reconstructed, rgb_reference)
+
+        def rgb_target_gradient(latent_value):
+            # Never hold the VAE decoder and the DiT suffix graphs at once.
+            with torch.no_grad():
+                hard_end, _ = terminal(latent_value)
+            end_leaf = hard_end.detach().requires_grad_(True)
+            score = decoded_score(end_leaf)
+            end_grad, = torch.autograd.grad(score, end_leaf)
+            del score, end_leaf
+            if not torch.isfinite(end_grad).all() or not torch.any(end_grad):
+                raise RuntimeError('Final RGB gradient is zero or non-finite')
+            target_leaf = latent_value.detach().requires_grad_(True)
+            replay, _ = terminal(target_leaf, grad=True)
+            if not torch.allclose(replay.detach(), hard_end, atol=1e-5, rtol=1e-4):
+                raise RuntimeError('Tracked replay changed the hard-forward final state')
+            latent_grad, = torch.autograd.grad(replay, target_leaf, grad_outputs=end_grad.detach())
+            return latent_grad.detach()
+
         def objective(latent, grad):
             predictor = model.predict_velocity_with_grad if grad else model.predict_velocity
             return rollout_loss(latent, reference, initial_state, times,
@@ -169,6 +219,12 @@ def main():
         @torch.no_grad()
         def evaluate(c):
             latent = encode(pixels(c)).to('cuda:0')
+            if final_rgb:
+                state, early = terminal(latent)
+                score = decoded_score(state)
+                if not torch.isfinite(score):
+                    raise RuntimeError('Non-finite final RGB score')
+                return float(score), early
             score, terms = objective(latent, False)
             if not torch.isfinite(score):
                 raise RuntimeError('Non-finite hard rollout score')
@@ -187,13 +243,19 @@ def main():
         print(f'[ROLLOUT] initial/resumed hard score={score:.8g}; completed={done}', flush=True)
         for iteration in range(done, a.iterations):
             tick = time.monotonic()
+            if final_rgb:
+                print(f'[BACKWARD] iteration {iteration+1}/{a.iterations}, final {a.backward_steps} steps', flush=True)
             with torch.no_grad():
                 latent_value = encode(pixels(controls)).to('cuda:0')
-            leaf = latent_value.detach().requires_grad_(True)
-            loss, terms_tensor = objective(leaf, True)
-            latent_grad, = torch.autograd.grad(loss, leaf)
+            if final_rgb:
+                latent_grad = rgb_target_gradient(latent_value)
+            else:
+                leaf = latent_value.detach().requires_grad_(True)
+                loss, terms_tensor = objective(leaf, True)
+                latent_grad, = torch.autograd.grad(loss, leaf)
+                del loss, terms_tensor, leaf
             latent_grad = latent_grad.detach().to('cuda:1')
-            del loss, terms_tensor, leaf, latent_value
+            del latent_value
             c = controls.detach().requires_grad_(True)
             encoded = encode(pixels(c))
             grad, = torch.autograd.grad(encoded, c, grad_outputs=latent_grad)
@@ -234,6 +296,9 @@ def main():
                       seconds=time.monotonic()-start, candidate_input_MSE=float(np.mean(candidate**2)),
                       random_input_MSE=float(np.mean(random**2)), candidate_Linf_pixel=float(abs(candidate).max()*255),
                       asset_sha256={n+'.npz': digest(out/(n+'.npz')) for n in ['initial', 'candidate', 'random']})
+        if final_rgb:
+            report.update(initial_proxy_rgb_psnr_db=-report['initial_score'],
+                          final_proxy_rgb_psnr_db=-score)
         atomic_json(report_path, report)
         print(f'[READY] {out}; proxy_improved={report["proxy_improved"]}. Full codec acceptance still required.', flush=True)
     except Exception as exc:

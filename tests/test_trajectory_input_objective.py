@@ -1,7 +1,8 @@
 import unittest
 import torch
 from exp_flf2v.trajectory_input_objective import (
-    correction, full_hard_forward, hard_forward_soft_backward, rollout_loss,
+    correction, full_hard_forward, full_trajectory, hard_forward_soft_backward,
+    rgb_distortion, rollout_loss,
 )
 from sde_rf_wan.turbo_codebook import TurboPerFrameCodebook
 
@@ -73,6 +74,42 @@ class TrajectoryObjectiveTest(unittest.TestCase):
         state, _ = full_hard_forward(initial, initial, initial, [1., .5, 0.], 0,
                                      lambda x, t: x, None)
         torch.testing.assert_close(state, torch.full_like(initial, .25))
+
+    def test_truncated_backward_keeps_forward_and_cuts_prefix(self):
+        target = torch.ones(1, 1, 1, 1, 1, requires_grad=True)
+        initial = torch.zeros_like(target)
+        times = [1., .9, .8, .7, 0.]
+        predict = lambda state, t: state * .1
+        # Only the first SDE correction has a target dependency in its forward.
+        # Its gradient must be cut, leaving solely our chosen soft derivative.
+        hard = lambda r, s, f: r if s == 0 else torch.zeros_like(r)
+        calls = []
+
+        def soft(r, s, f):
+            calls.append(s)
+            return hard_forward_soft_backward(hard(r, s, f), r)
+
+        expected, _ = full_hard_forward(target, initial, initial, times, 2, predict, hard)
+        actual, _ = full_trajectory(
+            target, initial, initial, times, 2, predict, hard, backward_steps=3,
+            predict_grad=predict, correct_grad=soft,
+        )
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(calls, [1])
+        (grad,) = torch.autograd.grad(actual.sum(), target)
+        # Single tracked SDE injection followed by two ODE updates.
+        expected_grad = 3 * .9**2 * (.9 - .8)**.5 * (1 - .1*(.8-.7)) * (1 - .1*.7)
+        torch.testing.assert_close(grad, torch.full_like(grad, expected_grad))
+        with self.assertRaises(ValueError):
+            full_trajectory(target, initial, initial, times, 2, predict, hard,
+                            backward_steps=2, predict_grad=predict, correct_grad=soft)
+
+    def test_rgb_objective_is_negative_mean_frame_psnr(self):
+        rgb = torch.tensor([.1, .2]).reshape(2, 1, 1, 1).requires_grad_(True)
+        score = rgb_distortion(rgb, torch.zeros_like(rgb))
+        self.assertAlmostEqual(score.item(), -16.9897, places=4)
+        (grad,) = torch.autograd.grad(score, rgb)
+        self.assertTrue((grad > 0).all())
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
     def test_gpu_hard_selection_and_backward(self):

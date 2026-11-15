@@ -6,27 +6,50 @@ param(
     [string]$InitialAttack = '.\exp_flf2v\results_720p\input_direction_oldvae_eps2_seed42_assets\full_positive.npz',
     [int]$Iterations = 4,
     [int]$RolloutSteps = 2,
+    [ValidateSet('early-latent', 'final-rgb')]
+    [string]$Objective = 'early-latent',
+    [ValidateRange(4,20)]
+    [int]$BackwardSteps = 6,
+    [ValidateRange(2,255)]
+    [int]$Epsilon = 2,
+    [double]$Alpha = 0.5,
+    [switch]$GenerateOnly,
     [switch]$PlanOnly
 )
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path -Parent $PSScriptRoot)
 $env:CUDA_VISIBLE_DEVICES = '0,1'
-$tag = "trajectory_v1_jockey_gop0_eps2_seed42_r${RolloutSteps}_p${Iterations}"
+$alphaArg = $Alpha.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
+$alphaTag = $alphaArg.Replace('.', 'p')
+$tag = if ($Objective -eq 'final-rgb') {
+    "trajectory_rgb_jockey_gop0_eps${Epsilon}_seed42_b${BackwardSteps}_p${Iterations}_a${alphaTag}"
+} elseif ($Epsilon -eq 2 -and $Alpha -eq 0.5) {
+    "trajectory_v1_jockey_gop0_eps2_seed42_r${RolloutSteps}_p${Iterations}"
+} else {
+    "trajectory_v1_jockey_gop0_eps${Epsilon}_seed42_r${RolloutSteps}_p${Iterations}_a${alphaTag}"
+}
 $assets = Join-Path $OutputRoot "${tag}_assets"
 foreach ($p in @($Python, $Data, $InitialAttack, (Join-Path $WanCkpt 'Wan2.1_VAE.pth'))) {
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "Missing: $p" }
 }
-Write-Host "Plan: GPU candidate generation -> fresh 720p encoding/decoding: initial, candidate, matched random."
+if ($Alpha -le 0 -or [double]::IsNaN($Alpha) -or [double]::IsInfinity($Alpha)) { throw 'Invalid Alpha' }
+if ($GenerateOnly) { Write-Host 'Plan: GPU candidate generation only; no native 720p runs.' }
+else { Write-Host 'Plan: candidate generation, then fresh 720p encoding/decoding if the proxy improves.' }
 Write-Host "Tag: $tag. Generation resumes from iteration checkpoints; completed codec cases are hash-verified."
 if ($PlanOnly) { return }
 & $Python -m unittest discover -s tests -p test_trajectory_input_objective.py -v
 if ($LASTEXITCODE -ne 0) { throw 'Trajectory tests failed; GPU experiment not started' }
 & $Python '.\exp_flf2v\generate_trajectory_input_pilot.py' `
     --data $Data --wan_ckpt $WanCkpt --initial_attack_file $InitialAttack `
-    --output_dir $assets --iterations $Iterations --rollout_steps $RolloutSteps
+    --output_dir $assets --iterations $Iterations --rollout_steps $RolloutSteps `
+    --objective $Objective --backward_steps $BackwardSteps --epsilon $Epsilon --alpha $alphaArg
 if ($LASTEXITCODE -ne 0) { throw 'Candidate generation failed. Resume with the same command after fixing the error.' }
 $report = Get-Content -Raw -LiteralPath (Join-Path $assets 'generation.json') | ConvertFrom-Json
 if ($report.status -ne 'completed') { throw 'Incomplete generation' }
+if ($GenerateOnly) {
+    Write-Host "Report: $(Join-Path $assets 'generation.json')"
+    return
+}
 if (-not $report.proxy_improved) {
     Write-Warning 'Hard surrogate did not improve. Stop without spending GPU time on identical/unsuccessful candidate acceptance.'
     return
@@ -51,8 +74,8 @@ $rows = foreach ($variant in @('initial', 'candidate', 'random')) {
             --num_frames_per_gop 33 --num_gops 1 --height 720 --width 1280 `
             --M 64 --K 16384 --steps 20 --ddim_tail 3 --g_scale 3.0 `
             --ref_codec compressai --ref_quality 4 --seed 42 --sequences Jockey `
-            --attack vae-pgd --attack_file $asset --epsilon 2 --attack_scope all --defense none `
-            --input_attack_diagnostics
+            --attack vae-pgd --attack_file $asset --epsilon $Epsilon --attack_scope all --defense none `
+            --input_attack_diagnostics | Out-Host
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $metric)) { throw "Codec acceptance failed: $run" }
         @{ signature=$signature; metrics_sha256=(Get-FileHash -LiteralPath $metric).Hash } |
             ConvertTo-Json | Set-Content -LiteralPath $receipt -Encoding UTF8

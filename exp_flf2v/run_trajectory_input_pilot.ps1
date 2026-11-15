@@ -67,13 +67,25 @@ Write-Host "Tag: $tag. Generation resumes from iteration checkpoints; completed 
 if ($PlanOnly) { return }
 & $Python -m unittest discover -s tests -p test_trajectory_input_objective.py -v
 if ($LASTEXITCODE -ne 0) { throw 'Trajectory tests failed; GPU experiment not started' }
+$reportPath = Join-Path $assets 'generation.json'
+$startedUtc = [datetime]::UtcNow
 & $Python '.\exp_flf2v\generate_trajectory_input_pilot.py' `
     --data $Data --wan_ckpt $WanCkpt --initial_attack_file $InitialAttack `
     --output_dir $assets --iterations $Iterations --rollout_steps $RolloutSteps `
     --objective $Objective --backward_steps $BackwardSteps --epsilon $Epsilon --alpha $alphaArg `
     --height $ProxyHeight --width $ProxyWidth @gridArgs @memoryArgs
-if ($LASTEXITCODE -ne 0) { throw 'Candidate generation failed. Resume with the same command after fixing the error.' }
-$report = Get-Content -Raw -LiteralPath (Join-Path $assets 'generation.json') | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) {
+    $failedReport = $null
+    if ((Test-Path -LiteralPath $reportPath -PathType Leaf) -and
+        ((Get-Item -LiteralPath $reportPath).LastWriteTimeUtc -ge $startedUtc)) {
+        $failedReport = Get-Content -Raw -LiteralPath $reportPath | ConvertFrom-Json
+    }
+    if ($failedReport.status -eq 'failed' -and $failedReport.error -match '\bCUDA out of memory\b') {
+        throw [System.OutOfMemoryException]::new("Candidate CUDA OOM: $($failedReport.error)")
+    }
+    throw 'Candidate generation failed. Resume with the same command after fixing the error.'
+}
+$report = Get-Content -Raw -LiteralPath $reportPath | ConvertFrom-Json
 if ($report.status -ne 'completed') { throw 'Incomplete generation' }
 if ($GenerateOnly) {
     Write-Host "Report: $(Join-Path $assets 'generation.json')"

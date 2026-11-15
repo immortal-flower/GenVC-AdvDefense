@@ -5,6 +5,7 @@ local soft top-N bank. VAE and DiT graphs are separated by an exact latent VJP.
 Native boundary pixels are held at their initialization throughout optimization.
 """
 import argparse
+from contextlib import nullcontext
 import gc
 import hashlib
 import json
@@ -78,6 +79,8 @@ def main():
     p.add_argument('--pool_size', type=int, default=80)
     p.add_argument('--gpu0_memory', default='20GiB')
     p.add_argument('--gpu1_memory', default='20GiB')
+    p.add_argument('--vae_cpu_activations', action='store_true',
+                   help='Keep VAE autograd saved tensors in host RAM, not on the GPU')
     a = p.parse_args()
     final_rgb = a.objective == 'final-rgb'
     control_h = a.height if a.control_height is None else a.control_height
@@ -94,6 +97,8 @@ def main():
     report_path = out / 'generation.json'
     checkpoint = out / 'optimizer_checkpoint.npz'
     config = vars(a) | dict(data_sha256=digest(a.data), init_sha256=digest(a.initial_attack_file), version=1)
+    if not a.vae_cpu_activations:
+        del config['vae_cpu_activations']
     if a.control_height is None and a.control_width is None and not a.grid_random:
         del config['control_height'], config['control_width'], config['grid_random']
     if not final_rgb:  # retain compatibility with existing short-rollout checkpoints
@@ -170,6 +175,8 @@ def main():
             raise RuntimeError(f'DiT does not fit on two GPUs: {mapping}')
         model.model = dispatch_model(model.model, device_map=mapping)
         model.device = torch.device('cuda:0')
+        print(f'[MEMORY] DiT budgets: GPU0={a.gpu0_memory}, GPU1={a.gpu1_memory}; '
+              f'VAE saved tensors on CPU: {a.vae_cpu_activations}', flush=True)
         embeds = [v.to('cuda:0') for v in embeds]
         cond = {k: v.to('cuda:0') for k, v in cond.items()}
         rgb = torch.from_numpy(original).permute(0, 3, 1, 2).to('cuda:1')
@@ -218,17 +225,25 @@ def main():
             reconstructed = (video.permute(1, 0, 2, 3) / 2 + .5).clamp(0, 1)
             return rgb_distortion(reconstructed, rgb_reference)
 
+        def vae_saved_tensor_context():
+            # Scope it to the VAE VJPs; the no-grad forward and DiT are unchanged.
+            return (torch.autograd.graph.save_on_cpu(pin_memory=False)
+                    if a.vae_cpu_activations else nullcontext())
+
         def rgb_target_gradient(latent_value):
             # Never hold the VAE decoder and the DiT suffix graphs at once.
             with torch.no_grad():
                 hard_end, _ = terminal(latent_value)
             end_leaf = hard_end.detach().requires_grad_(True)
-            score = decoded_score(end_leaf)
+            print('[BACKWARD] VAE decoder RGB gradient', flush=True)
+            with vae_saved_tensor_context():
+                score = decoded_score(end_leaf)
             end_grad, = torch.autograd.grad(score, end_leaf)
             del score, end_leaf
             if not torch.isfinite(end_grad).all() or not torch.any(end_grad):
                 raise RuntimeError('Final RGB gradient is zero or non-finite')
             target_leaf = latent_value.detach().requires_grad_(True)
+            print('[BACKWARD] DiT trajectory suffix gradient', flush=True)
             replay, _ = terminal(target_leaf, grad=True)
             if not torch.allclose(replay.detach(), hard_end, atol=1e-5, rtol=1e-4):
                 raise RuntimeError('Tracked replay changed the hard-forward final state')
@@ -281,7 +296,10 @@ def main():
             latent_grad = latent_grad.detach().to('cuda:1')
             del latent_value
             c = controls.detach().requires_grad_(True)
-            encoded = encode(pixels(c))
+            if a.vae_cpu_activations:
+                print('[BACKWARD] VAE encoder/input gradient', flush=True)
+            with vae_saved_tensor_context():
+                encoded = encode(pixels(c))
             grad, = torch.autograd.grad(encoded, c, grad_outputs=latent_grad)
             if not torch.isfinite(grad).all() or grad.abs().max().item() == 0:
                 raise RuntimeError('Pixel-control gradient is zero or non-finite; no candidate accepted')

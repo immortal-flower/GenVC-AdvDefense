@@ -17,6 +17,11 @@ param(
     [int]$ProxyWidth = 224,
     [switch]$GridRandom,
     [switch]$PairedOnly,
+    [ValidatePattern('^[1-9][0-9]*GiB$')]
+    [string]$Gpu0Memory = '20GiB',
+    [ValidatePattern('^[1-9][0-9]*GiB$')]
+    [string]$Gpu1Memory = '20GiB',
+    [switch]$VaeCpuActivations,
     [switch]$GenerateOnly,
     [switch]$PlanOnly
 )
@@ -40,6 +45,14 @@ if ($GridRandom -or $ProxyHeight -ne 128 -or $ProxyWidth -ne 224) {
     $tag += "_h${ProxyHeight}w${ProxyWidth}"
     if ($GridRandom) { $tag += '_grid128x224' }
 }
+$memoryArgs = @('--gpu0_memory', $Gpu0Memory, '--gpu1_memory', $Gpu1Memory)
+if ($Gpu0Memory -ne '20GiB' -or $Gpu1Memory -ne '20GiB') {
+    $tag += "_m${Gpu0Memory}_${Gpu1Memory}"
+}
+if ($VaeCpuActivations) {
+    $tag += '_vaecpu'
+    $memoryArgs += '--vae_cpu_activations'
+}
 $assets = Join-Path $OutputRoot "${tag}_assets"
 foreach ($p in @($Python, $Data, $InitialAttack, (Join-Path $WanCkpt 'Wan2.1_VAE.pth'))) {
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "Missing: $p" }
@@ -58,7 +71,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Trajectory tests failed; GPU experiment not st
     --data $Data --wan_ckpt $WanCkpt --initial_attack_file $InitialAttack `
     --output_dir $assets --iterations $Iterations --rollout_steps $RolloutSteps `
     --objective $Objective --backward_steps $BackwardSteps --epsilon $Epsilon --alpha $alphaArg `
-    --height $ProxyHeight --width $ProxyWidth @gridArgs
+    --height $ProxyHeight --width $ProxyWidth @gridArgs @memoryArgs
 if ($LASTEXITCODE -ne 0) { throw 'Candidate generation failed. Resume with the same command after fixing the error.' }
 $report = Get-Content -Raw -LiteralPath (Join-Path $assets 'generation.json') | ConvertFrom-Json
 if ($report.status -ne 'completed') { throw 'Incomplete generation' }

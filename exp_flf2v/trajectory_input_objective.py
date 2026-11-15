@@ -125,6 +125,12 @@ def rgb_distortion(reconstructed, reference):
     return 10 * torch.log10(frame_mse + 1e-10).mean()
 
 
+def uniform_grid_direction(shape, seed):
+    """Draw continuous control-grid values to spread RGB rounding thresholds."""
+    generator = torch.Generator(device='cpu').manual_seed(seed)
+    return torch.rand(shape, generator=generator, dtype=torch.float32) * 2 - 1
+
+
 def match_grid_amplitude(measure, target, max_amplitude, rtol=.01):
     """Fit only input energy along a fixed random direction, never codec scores."""
     if target <= 0 or max_amplitude <= 0:

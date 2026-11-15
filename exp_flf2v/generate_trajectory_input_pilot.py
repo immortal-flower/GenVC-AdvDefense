@@ -24,6 +24,7 @@ from generate_wan_boundary_pgd import tensor_conditions
 from probe_wan_condition_grad import checkpoint_blocks
 from trajectory_input_objective import (
     correction, full_trajectory, match_grid_amplitude, rgb_distortion, rollout_loss,
+    uniform_grid_direction,
 )
 from sde_rf_wan.sde_convert import shifted_timesteps
 from sde_rf_wan.turbo_codebook import TurboPerFrameCodebook
@@ -103,6 +104,8 @@ def main():
         if previous['fingerprint'] != fingerprint:
             raise ValueError('Configuration/source changed: use a new output directory')
         if previous['status'] == 'completed':
+            if a.grid_random and previous.get('grid_random_distribution') != 'uniform_continuous':
+                raise ValueError('Completed run used the old grid-random distribution; use a new output directory')
             for name, sha in previous['asset_sha256'].items():
                 if digest(out / name) != sha:
                     raise ValueError(f'Asset changed: {name}')
@@ -121,7 +124,8 @@ def main():
                       tracked_sde_steps=list(range(21 - a.backward_steps, 18)))
     if a.grid_random:
         report.update(control_grid=[control_h, control_w], grid_random_mse_rtol=.01,
-                      grid_random_rule='Fixed random control-grid signs centered on the shared initialization; only amplitude fitted to input MSE')
+                      grid_random_distribution='uniform_continuous',
+                      grid_random_rule='Fixed uniform [-1,1] control-grid direction centered on the shared initialization; only amplitude fitted to input MSE')
     atomic_json(report_path, report)
     start = time.monotonic()
     try:
@@ -308,9 +312,8 @@ def main():
             candidate = candidate_d.permute(0, 2, 3, 1).cpu().numpy()
             if a.grid_random:
                 target_mse = float(candidate_d.square().mean())
-                rng = torch.Generator(device='cpu').manual_seed(a.seed + 10001)
-                signs = torch.randint(0, 2, controls.shape, generator=rng, dtype=torch.int8)
-                lifted = lift(signs.to(device=controls.device, dtype=controls.dtype) * 2 - 1)
+                grid = uniform_grid_direction(controls.shape, a.seed + 10001)
+                lifted = lift(grid.to(device=controls.device, dtype=controls.dtype))
                 amp, grid_mse = match_grid_amplitude(
                     lambda v: float((pixels_from_lift(lifted * (v / 255)) - rgb).square().mean()),
                     target_mse, 2 * a.epsilon,

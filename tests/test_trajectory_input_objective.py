@@ -2,7 +2,7 @@ import unittest
 import torch
 from exp_flf2v.trajectory_input_objective import (
     correction, full_hard_forward, full_trajectory, hard_forward_soft_backward,
-    match_grid_amplitude, rgb_distortion, rollout_loss,
+    match_grid_amplitude, rgb_distortion, rollout_loss, uniform_grid_direction,
 )
 from sde_rf_wan.turbo_codebook import TurboPerFrameCodebook
 
@@ -117,6 +117,20 @@ class TrajectoryObjectiveTest(unittest.TestCase):
         self.assertLess(abs(mse - 2.25), .00225)
         with self.assertRaises(ValueError):
             match_grid_amplitude(lambda a: 1., 2., 4)
+
+    def test_continuous_grid_breaks_quantization_ties(self):
+        shape = (3, 3, 20, 20)
+        grid = uniform_grid_direction(shape, 42)
+        torch.testing.assert_close(grid, uniform_grid_direction(shape, 42))
+        self.assertLessEqual(float(grid.abs().max()), 1.)
+
+        def energy(direction, amplitude):
+            return float((direction * amplitude).round().clamp(-4, 4).square().mean())
+
+        with self.assertRaises(ValueError):
+            match_grid_amplitude(lambda a: energy(grid.sign(), a), 1.7, 8)
+        _, matched = match_grid_amplitude(lambda a: energy(grid, a), 1.7, 8)
+        self.assertLess(abs(matched - 1.7), .017)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
     def test_gpu_hard_selection_and_backward(self):

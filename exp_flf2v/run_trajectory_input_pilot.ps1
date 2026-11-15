@@ -13,6 +13,10 @@ param(
     [ValidateRange(2,255)]
     [int]$Epsilon = 2,
     [double]$Alpha = 0.5,
+    [int]$ProxyHeight = 128,
+    [int]$ProxyWidth = 224,
+    [switch]$GridRandom,
+    [switch]$PairedOnly,
     [switch]$GenerateOnly,
     [switch]$PlanOnly
 )
@@ -28,11 +32,22 @@ $tag = if ($Objective -eq 'final-rgb') {
 } else {
     "trajectory_v1_jockey_gop0_eps${Epsilon}_seed42_r${RolloutSteps}_p${Iterations}_a${alphaTag}"
 }
+$gridArgs = @()
+if ($GridRandom) {
+    $gridArgs = @('--grid_random', '--control_height', '128', '--control_width', '224')
+}
+if ($GridRandom -or $ProxyHeight -ne 128 -or $ProxyWidth -ne 224) {
+    $tag += "_h${ProxyHeight}w${ProxyWidth}"
+    if ($GridRandom) { $tag += '_grid128x224' }
+}
 $assets = Join-Path $OutputRoot "${tag}_assets"
 foreach ($p in @($Python, $Data, $InitialAttack, (Join-Path $WanCkpt 'Wan2.1_VAE.pth'))) {
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "Missing: $p" }
 }
 if ($Alpha -le 0 -or [double]::IsNaN($Alpha) -or [double]::IsInfinity($Alpha)) { throw 'Invalid Alpha' }
+if ($ProxyHeight -lt 32 -or $ProxyWidth -lt 32 -or $ProxyHeight % 16 -ne 0 -or $ProxyWidth % 16 -ne 0) {
+    throw 'Proxy height/width must be multiples of 16 and at least 32.'
+}
 if ($GenerateOnly) { Write-Host 'Plan: GPU candidate generation only; no native 720p runs.' }
 else { Write-Host 'Plan: candidate generation, then fresh 720p encoding/decoding if the proxy improves.' }
 Write-Host "Tag: $tag. Generation resumes from iteration checkpoints; completed codec cases are hash-verified."
@@ -42,7 +57,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Trajectory tests failed; GPU experiment not st
 & $Python '.\exp_flf2v\generate_trajectory_input_pilot.py' `
     --data $Data --wan_ckpt $WanCkpt --initial_attack_file $InitialAttack `
     --output_dir $assets --iterations $Iterations --rollout_steps $RolloutSteps `
-    --objective $Objective --backward_steps $BackwardSteps --epsilon $Epsilon --alpha $alphaArg
+    --objective $Objective --backward_steps $BackwardSteps --epsilon $Epsilon --alpha $alphaArg `
+    --height $ProxyHeight --width $ProxyWidth @gridArgs
 if ($LASTEXITCODE -ne 0) { throw 'Candidate generation failed. Resume with the same command after fixing the error.' }
 $report = Get-Content -Raw -LiteralPath (Join-Path $assets 'generation.json') | ConvertFrom-Json
 if ($report.status -ne 'completed') { throw 'Incomplete generation' }
@@ -54,7 +70,8 @@ if (-not $report.proxy_improved) {
     Write-Warning 'Hard surrogate did not improve. Stop without spending GPU time on identical/unsuccessful candidate acceptance.'
     return
 }
-$rows = foreach ($variant in @('initial', 'candidate', 'random')) {
+$variants = if ($PairedOnly) { @('candidate', 'random') } else { @('initial', 'candidate', 'random') }
+$rows = foreach ($variant in $variants) {
     $asset = Join-Path $assets "$variant.npz"
     $run = "${tag}_${variant}"
     $metric = Join-Path $OutputRoot "$run\Jockey\gop0\metrics.json"
@@ -87,13 +104,16 @@ $rows = foreach ($variant in @('initial', 'candidate', 'random')) {
         InputMSE=[double]$m.input_MSE; InputLinfPixel=[double]$m.input_Linf_pixel; BPP=$m.BPP
     }
 }
-$rows | Format-Table -AutoSize
-$rows | Export-Csv (Join-Path $OutputRoot "${tag}_summary.csv") -NoTypeInformation -Encoding UTF8
 $candidate = $rows | Where-Object Variant -eq 'candidate'
 $random = $rows | Where-Object Variant -eq 'random'
 $initial = $rows | Where-Object Variant -eq 'initial'
-if ([math]::Abs($candidate.InputMSE - $random.InputMSE) -gt 1e-9) { throw 'Input MSE matching failed' }
+$mseTol = if ($GridRandom) { $candidate.InputMSE * 0.01 } else { 1e-9 }
+if ([math]::Abs($candidate.InputMSE - $random.InputMSE) -gt $mseTol) { throw 'Native input MSE matching failed' }
+$rows | Format-Table -AutoSize
+$rows | Export-Csv (Join-Path $OutputRoot "${tag}_summary.csv") -NoTypeInformation -Encoding UTF8
 Write-Host "Candidate extra PSNR drop vs random: $($random.PSNR-$candidate.PSNR) dB"
 Write-Host "Candidate LPIPS increase vs random: $($candidate.LPIPS-$random.LPIPS)"
-Write-Host "Candidate extra PSNR drop vs initial: $($initial.PSNR-$candidate.PSNR) dB (input MSE may differ)"
+if ($initial) {
+    Write-Host "Candidate extra PSNR drop vs initial: $($initial.PSNR-$candidate.PSNR) dB (input MSE may differ)"
+}
 Write-Host 'One GOP is a pilot, not evidence of generalizable attack success.'

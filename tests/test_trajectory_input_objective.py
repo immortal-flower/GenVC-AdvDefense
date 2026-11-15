@@ -2,7 +2,7 @@ import unittest
 import torch
 from exp_flf2v.trajectory_input_objective import (
     correction, full_hard_forward, full_trajectory, hard_forward_soft_backward,
-    rgb_distortion, rollout_loss,
+    match_grid_amplitude, rgb_distortion, rollout_loss,
 )
 from sde_rf_wan.turbo_codebook import TurboPerFrameCodebook
 
@@ -110,6 +110,13 @@ class TrajectoryObjectiveTest(unittest.TestCase):
         self.assertAlmostEqual(score.item(), -16.9897, places=4)
         (grad,) = torch.autograd.grad(score, rgb)
         self.assertTrue((grad > 0).all())
+
+    def test_grid_amplitude_with_clipped_nonmonotonic_energy(self):
+        amp, mse = match_grid_amplitude(lambda a: min((a-1)**2 + 1, 5), 2.25, 4)
+        self.assertAlmostEqual(amp, 1 + 1.25**.5, delta=.002)
+        self.assertLess(abs(mse - 2.25), .00225)
+        with self.assertRaises(ValueError):
+            match_grid_amplitude(lambda a: 1., 2., 4)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
     def test_gpu_hard_selection_and_backward(self):

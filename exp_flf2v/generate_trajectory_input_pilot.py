@@ -22,7 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from run_flf2v_experiment import load_yuv420_frames, resize_frames, compress_boundary_frame
 from generate_wan_boundary_pgd import tensor_conditions
 from probe_wan_condition_grad import checkpoint_blocks
-from trajectory_input_objective import correction, full_trajectory, rgb_distortion, rollout_loss
+from trajectory_input_objective import (
+    correction, full_trajectory, match_grid_amplitude, rgb_distortion, rollout_loss,
+)
 from sde_rf_wan.sde_convert import shifted_timesteps
 from sde_rf_wan.turbo_codebook import TurboPerFrameCodebook
 from sde_rf_wan.wan_flf2v_wrapper import WanFLF2VWrapper
@@ -66,6 +68,9 @@ def main():
     p.add_argument('--backward_steps', type=int, default=6, help='Final RGB mode only')
     p.add_argument('--height', type=int, default=128)
     p.add_argument('--width', type=int, default=224)
+    p.add_argument('--control_height', type=int)
+    p.add_argument('--control_width', type=int)
+    p.add_argument('--grid_random', action='store_true')
     p.add_argument('--epsilon', type=float, default=2.)
     p.add_argument('--alpha', type=float, default=.5)
     p.add_argument('--seed', type=int, default=42)
@@ -74,6 +79,10 @@ def main():
     p.add_argument('--gpu1_memory', default='20GiB')
     a = p.parse_args()
     final_rgb = a.objective == 'final-rgb'
+    control_h = a.height if a.control_height is None else a.control_height
+    control_w = a.width if a.control_width is None else a.control_width
+    if min(control_h, control_w) < 1:
+        p.error('Control grid dimensions must be positive')
     if final_rgb and not 4 <= a.backward_steps <= 20:
         p.error('Final RGB backward suffix must include at least one SDE step (4–20 steps)')
     if (a.iterations < 1 or not 1 <= a.rollout_steps <= 16 or
@@ -84,6 +93,8 @@ def main():
     report_path = out / 'generation.json'
     checkpoint = out / 'optimizer_checkpoint.npz'
     config = vars(a) | dict(data_sha256=digest(a.data), init_sha256=digest(a.initial_attack_file), version=1)
+    if a.control_height is None and a.control_width is None and not a.grid_random:
+        del config['control_height'], config['control_width'], config['grid_random']
     if not final_rgb:  # retain compatibility with existing short-rollout checkpoints
         del config['objective'], config['backward_steps']
     fingerprint = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
@@ -108,6 +119,9 @@ def main():
                       limitation='Low-resolution 20-step hard forward, truncated backward and soft codebook gradients',
                       tracked_steps=list(range(21 - a.backward_steps, 21)),
                       tracked_sde_steps=list(range(21 - a.backward_steps, 18)))
+    if a.grid_random:
+        report.update(control_grid=[control_h, control_w], grid_random_mse_rtol=.01,
+                      grid_random_rule='Fixed random control-grid signs centered on the shared initialization; only amplitude fitted to input MSE')
     atomic_json(report_path, report)
     start = time.monotonic()
     try:
@@ -157,12 +171,18 @@ def main():
         rgb = torch.from_numpy(original).permute(0, 3, 1, 2).to('cuda:1')
         base = torch.from_numpy(init).permute(0, 3, 1, 2).to('cuda:1')
         mask = torch.ones(33, 1, 1, 1, device='cuda:1'); mask[[0, -1]] = 0
-        controls = torch.zeros(33, 3, a.height, a.width, device='cuda:1')
-        def pixels(c):
-            delta = (base + mask * F.interpolate(c, (720, 1280), mode='bilinear', align_corners=False)).clamp(-eps, eps)
+        controls = torch.zeros(33, 3, control_h, control_w, device='cuda:1')
+        def lift(c):
+            return mask * F.interpolate(c, (720, 1280), mode='bilinear', align_corners=False)
+
+        def pixels_from_lift(lifted):
+            delta = (base + lifted).clamp(-eps, eps)
             value = (rgb + delta).clamp(0, 1)
             rounded = torch.floor(value * 255 + .5) / 255
             return value + (rounded - value).detach()
+
+        def pixels(c):
+            return pixels_from_lift(lift(c))
         def encode(value):
             small = F.interpolate(value, (a.height, a.width), mode='bilinear', align_corners=False, antialias=True)
             return model.vae.encode([(small * 2 - 1).permute(1, 0, 2, 3)])[0].float().unsqueeze(0)
@@ -284,8 +304,21 @@ def main():
             atomic_json(report_path, report)
             print('[PGD] ' + json.dumps(row), flush=True)
         with torch.no_grad():
-            candidate = (pixels(controls)-rgb).permute(0, 2, 3, 1).cpu().numpy()
-        random = matched_random(original, candidate, a.seed)
+            candidate_d = pixels(controls) - rgb
+            candidate = candidate_d.permute(0, 2, 3, 1).cpu().numpy()
+            if a.grid_random:
+                target_mse = float(candidate_d.square().mean())
+                rng = torch.Generator(device='cpu').manual_seed(a.seed + 10001)
+                signs = torch.randint(0, 2, controls.shape, generator=rng, dtype=torch.int8)
+                lifted = lift(signs.to(device=controls.device, dtype=controls.dtype) * 2 - 1)
+                amp, grid_mse = match_grid_amplitude(
+                    lambda v: float((pixels_from_lift(lifted * (v / 255)) - rgb).square().mean()),
+                    target_mse, 2 * a.epsilon,
+                )
+                random = (pixels_from_lift(lifted * (amp / 255))-rgb).permute(0, 2, 3, 1).cpu().numpy()
+                report.update(grid_random_amplitude_pixel=amp, grid_random_mse_relative_gap=abs(grid_mse-target_mse)/target_mse)
+            else:
+                random = matched_random(original, candidate, a.seed)
         if not np.allclose(candidate[[0, -1]], init[[0, -1]], atol=1e-7):
             raise RuntimeError('Boundary invariant failed')
         for name, delta in [('initial', init), ('candidate', candidate), ('random', random)]:

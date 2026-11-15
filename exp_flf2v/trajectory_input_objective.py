@@ -123,3 +123,31 @@ def rgb_distortion(reconstructed, reference):
         raise ValueError('Expected matching (F,C,H,W) RGB tensors')
     frame_mse = (reconstructed.float() - reference.detach().float()).square().mean((1, 2, 3))
     return 10 * torch.log10(frame_mse + 1e-10).mean()
+
+
+def match_grid_amplitude(measure, target, max_amplitude, rtol=.01):
+    """Fit only input energy along a fixed random direction, never codec scores."""
+    if target <= 0 or max_amplitude <= 0:
+        raise ValueError('Expected positive target MSE and amplitude bound')
+    # The initialization and clipping can make the curve nonmonotonic. Find
+    # a local bracket first, then verify the achieved match after quantization.
+    amplitudes = [i * max_amplitude / 8 for i in range(9)]
+    samples = [(a, measure(a)) for a in amplitudes]
+    best = min(samples, key=lambda x: abs(x[1] - target))
+    for (lo, low), (hi, high) in zip(samples[:-1], samples[1:]):
+        if (low - target) * (high - target) >= 0:
+            continue
+        for _ in range(16):
+            mid = (lo + hi) / 2
+            value = measure(mid)
+            if abs(value - target) < abs(best[1] - target):
+                best = (mid, value)
+            if abs(best[1] - target) <= target * .001:
+                break
+            if (value - target) * (low - target) > 0:
+                lo, low = mid, value
+            else:
+                hi = mid
+    if abs(best[1] - target) > target * rtol:
+        raise ValueError(f'Grid random MSE match failed: {best[1]:.8g} vs {target:.8g}')
+    return best

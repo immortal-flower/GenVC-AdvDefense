@@ -59,3 +59,36 @@ def rollout_loss(target, reference, initial_state, times, predict, correct, g_sc
         estimate = state - next_t * velocity
         losses.append((estimate-reference.detach()).square().mean())
     return torch.stack(losses).mean(), torch.stack(losses)
+
+
+@torch.no_grad()
+def full_hard_forward(target, reference, initial_state, times, num_sde_steps,
+                      predict, correct, g_scale=3.0, progress=None):
+    """Run the native hard-forward recurrence through t=0 in the given geometry."""
+    if (len(times) < 2 or times[-1] != 0 or not 0 < times[0] <= 1 or
+            any(a <= b for a, b in zip(times[:-1], times[1:])) or
+            not 0 <= num_sde_steps <= len(times) - 2):
+        raise ValueError('Expected a descending schedule to zero with a deterministic tail')
+    if (target.shape != reference.shape or target.shape != initial_state.shape or
+            target.ndim != 5 or target.shape[0] != 1):
+        raise ValueError('Expected matching (1,C,F,H,W) tensors')
+    state = initial_state
+    terms = []
+    for step, (t, next_t) in enumerate(zip(times[:-1], times[1:])):
+        velocity = predict(state, t)
+        estimate = state - t * velocity
+        if step in (1, 2):  # post-update scores for the existing two-step proxy
+            terms.append(float((estimate - reference).square().mean()))
+        dt = t - next_t
+        if step < num_sde_steps:
+            residual = target - estimate
+            noise = torch.stack([correct(residual[0, :, pos], step, pos)
+                                 for pos in range(target.shape[2])], dim=1).unsqueeze(0)
+            g = diffusion_coeff(t, g_scale)
+            drift = sde_drift(velocity, velocity_to_score(velocity, state, t), g)
+            state = state - drift * dt + g * dt**0.5 * noise
+        else:
+            state = state - velocity * dt
+        if progress is not None:
+            progress(step + 1)
+    return state, terms

@@ -1,6 +1,8 @@
 import unittest
 import torch
-from exp_flf2v.trajectory_input_objective import hard_forward_soft_backward, rollout_loss, correction
+from exp_flf2v.trajectory_input_objective import (
+    correction, full_hard_forward, hard_forward_soft_backward, rollout_loss,
+)
 from sde_rf_wan.turbo_codebook import TurboPerFrameCodebook
 
 
@@ -41,6 +43,36 @@ class TrajectoryObjectiveTest(unittest.TestCase):
         x = torch.zeros(1, 2, 3, 2, 2)
         with self.assertRaises(ValueError):
             rollout_loss(x, x, x, [.8, .9], lambda x,t:x, lambda r,s,f:r)
+
+    def test_full_forward_same_early_scores_and_no_terminal_prediction(self):
+        target = torch.ones(1, 2, 3, 2, 2, requires_grad=True)
+        reference = torch.zeros_like(target)
+        initial = torch.zeros_like(target)
+        times = [1., .9, .8, .7, 0.]
+        _, early = rollout_loss(target, reference, initial, times[:3],
+                                lambda x, t: x * .1, lambda r, s, f: r * .2)
+        calls, picks = [], []
+
+        def predict(x, t):
+            calls.append(t)
+            return x * .1
+
+        def correct(r, step, pos):
+            picks.append((step, pos))
+            return r * .2
+
+        state, scores = full_hard_forward(target, reference, initial, times, 2,
+                                          predict, correct)
+        self.assertEqual(calls, times[:-1])
+        self.assertEqual(picks, [(step, pos) for step in range(2) for pos in range(3)])
+        torch.testing.assert_close(torch.tensor(scores), early.detach())
+        self.assertFalse(state.requires_grad)
+
+    def test_full_forward_final_step_is_ode(self):
+        initial = torch.ones(1, 1, 1, 1, 1)
+        state, _ = full_hard_forward(initial, initial, initial, [1., .5, 0.], 0,
+                                     lambda x, t: x, None)
+        torch.testing.assert_close(state, torch.full_like(initial, .25))
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
     def test_gpu_hard_selection_and_backward(self):

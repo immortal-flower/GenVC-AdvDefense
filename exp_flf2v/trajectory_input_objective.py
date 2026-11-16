@@ -71,7 +71,7 @@ def full_hard_forward(target, reference, initial_state, times, num_sde_steps,
 
 def full_trajectory(target, reference, initial_state, times, num_sde_steps,
                     predict, correct, *, backward_steps=0, predict_grad=None,
-                    correct_grad=None, g_scale=3.0, progress=None):
+                    correct_grad=None, g_scale=3.0, progress=None, state_callback=None):
     """Same recurrence; optionally retain gradients only over a final suffix.
 
     Callbacks for the suffix must preserve hard-forward values. Absolute
@@ -114,7 +114,75 @@ def full_trajectory(target, reference, initial_state, times, num_sde_steps,
                 state = state - velocity * dt
         if progress is not None:
             progress(step + 1)
+        if state_callback is not None:
+            state_callback(step + 1, state.detach())
     return state, terms
+
+
+def stepwise_trajectory_vjp(target, reference, initial_state, times, num_sde_steps,
+                            predict, correct, predict_grad, correct_grad, end_grad,
+                            *, backward_steps, expected_end=None, g_scale=3.0,
+                            progress=None):
+    """First-order VJP of the same surrogate, keeping only ONE step's graph.
+
+    Store hard-forward states on CPU, replay each tracked step in reverse, and
+    accumulate the direct target gradient as well as the recurrent state VJP.
+    This does not make hard atom selection differentiable: correct_grad still
+    defines the local surrogate derivative. Callbacks must be deterministic.
+    """
+    n_steps = len(times) - 1
+    cut = n_steps - backward_steps
+    if not 1 <= backward_steps <= n_steps or cut >= num_sde_steps:
+        raise ValueError('Backward suffix needs a codebook selection')
+    if end_grad.shape != target.shape or not torch.isfinite(end_grad).all():
+        raise ValueError('Invalid terminal gradient')
+    states = [initial_state.detach().cpu().clone()]
+    with torch.no_grad():
+        end, _ = full_trajectory(
+            target.detach(), reference, initial_state, times, num_sde_steps,
+            predict, correct, g_scale=g_scale,
+            state_callback=lambda _, state: states.append(state.cpu().clone()),
+        )
+    if expected_end is not None and not torch.allclose(end, expected_end, atol=1e-5, rtol=1e-4):
+        raise RuntimeError('Stepwise replay changed the hard-forward final state')
+    del end
+    adjoint = end_grad.detach()
+    total = torch.zeros_like(target)
+    for step in range(n_steps - 1, cut - 1, -1):
+        with torch.enable_grad():
+            state = states[step].to(target.device).requires_grad_(True)
+            leaf = target.detach().requires_grad_(True)
+            t, next_t = times[step:step + 2]
+            dt = t - next_t
+            velocity = predict_grad(state, t)
+            if step < num_sde_steps:
+                residual = leaf - (state - t * velocity)
+                noise = torch.stack([
+                    correct_grad(residual[0, :, pos], step, pos)
+                    for pos in range(target.shape[2])
+                ], dim=1).unsqueeze(0)
+                g = diffusion_coeff(t, g_scale)
+                drift = sde_drift(velocity, velocity_to_score(velocity, state, t), g)
+                output = state - drift * dt + g * dt**0.5 * noise
+            else:
+                output = state - velocity * dt
+            expected = states[step + 1].to(output.device)
+            if not torch.allclose(output.detach(), expected, atol=1e-5, rtol=1e-4):
+                raise RuntimeError(f'Stepwise replay changed hard-forward step {step + 1}')
+            state_grad, target_grad = torch.autograd.grad(
+                output, (state, leaf), grad_outputs=adjoint, allow_unused=True,
+            )
+        adjoint = torch.zeros_like(state) if state_grad is None else state_grad.detach()
+        if target_grad is not None:
+            total.add_(target_grad.detach())
+        if not torch.isfinite(adjoint).all() or not torch.isfinite(total).all():
+            raise RuntimeError(f'Non-finite stepwise gradient at step {step + 1}')
+        del state, leaf, velocity, output, expected, state_grad, target_grad
+        if step < num_sde_steps:
+            del residual, noise, drift
+        if progress is not None:
+            progress(step + 1)
+    return total.detach()
 
 
 def rgb_distortion(reconstructed, reference):

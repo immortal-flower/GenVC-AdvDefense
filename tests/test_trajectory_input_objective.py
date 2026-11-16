@@ -3,11 +3,71 @@ import torch
 from exp_flf2v.trajectory_input_objective import (
     correction, full_hard_forward, full_trajectory, hard_forward_soft_backward,
     match_grid_amplitude, rgb_distortion, rollout_loss, uniform_grid_direction,
+    stepwise_trajectory_vjp,
 )
 from sde_rf_wan.turbo_codebook import TurboPerFrameCodebook
 
 
 class TrajectoryObjectiveTest(unittest.TestCase):
+    def test_stepwise_matches_retained_full_and_suffix_vjp(self):
+        torch.manual_seed(7)
+        target = torch.randn(1, 2, 3, 2, 2, dtype=torch.float64, requires_grad=True)
+        initial = torch.randn_like(target)
+        reference = torch.zeros_like(target)
+        times = [1., .9, .8, .7, 0.]
+        predict = lambda x, t: x.sin() * .1 + t * .03
+        hard = lambda r, s, f: torch.tanh(r) * .2
+        soft = lambda r, s, f: hard_forward_soft_backward(hard(r, s, f), r * .13)
+        terminal_grad = torch.randn_like(target)
+        for horizon in (3, 4):
+            with self.subTest(horizon=horizon):
+                end, _ = full_trajectory(
+                    target, reference, initial, times, 2, predict, hard,
+                    backward_steps=horizon, predict_grad=predict, correct_grad=soft,
+                )
+                expected, = torch.autograd.grad(end, target, grad_outputs=terminal_grad)
+                calls = []
+                actual = stepwise_trajectory_vjp(
+                    target, reference, initial, times, 2, predict, hard, predict, soft,
+                    terminal_grad, backward_steps=horizon, expected_end=end.detach(),
+                    progress=calls.append,
+                )
+                torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
+                self.assertEqual(calls, list(range(4, 4 - horizon, -1)))
+                self.assertFalse(actual.requires_grad)
+
+    def test_stepwise_rejects_changed_replay_and_invalid_horizon(self):
+        x = torch.ones(1, 1, 1, 1, 1)
+        predict = lambda x, t: x * .1
+        hard = lambda r, s, f: r * .2
+        for horizon, replay in ((1, predict), (3, lambda x, t: x * .2)):
+            with self.subTest(horizon=horizon), self.assertRaises((ValueError, RuntimeError)):
+                stepwise_trajectory_vjp(
+                    x, x, x, [1., .8, .5, 0.], 2, predict, hard, replay, hard,
+                    x, backward_steps=horizon,
+                )
+
+    def test_stepwise_matches_retained_codebook_vjp(self):
+        torch.manual_seed(12)
+        book = TurboPerFrameCodebook(K=16, M=2, frame_shape=(1, 2, 2),
+                                    seed=42, device=torch.device('cpu'), gen_batch=8)
+        target = torch.randn(1, 1, 2, 2, 2, requires_grad=True)
+        initial = torch.randn_like(target)
+        times = [1., .8, .5, 0.]
+        predict = lambda x, t: x.sin() * .1
+        hard = lambda r, s, f: book.select_atoms(r, s, f)[2]
+        soft = lambda r, s, f: correction(book, r, s, f, pool_size=4)
+        end, _ = full_trajectory(
+            target, initial, initial, times, 2, predict, hard, backward_steps=3,
+            predict_grad=predict, correct_grad=soft,
+        )
+        expected, = torch.autograd.grad(end.square().mean(), target)
+        actual = stepwise_trajectory_vjp(
+            target, initial, initial, times, 2, predict, hard, predict, soft,
+            2 * end.detach() / end.numel(), backward_steps=3, expected_end=end.detach(),
+        )
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
     def test_hard_forward_soft_gradient(self):
         x = torch.tensor([2.], requires_grad=True)
         y = hard_forward_soft_backward(torch.tensor([7.]), x.square())

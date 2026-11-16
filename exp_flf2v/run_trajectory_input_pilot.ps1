@@ -22,6 +22,7 @@ param(
     [ValidatePattern('^[1-9][0-9]*GiB$')]
     [string]$Gpu1Memory = '20GiB',
     [switch]$VaeCpuActivations,
+    [switch]$StepwiseBackward,
     [switch]$GenerateOnly,
     [switch]$PlanOnly
 )
@@ -52,6 +53,11 @@ if ($Gpu0Memory -ne '20GiB' -or $Gpu1Memory -ne '20GiB') {
 if ($VaeCpuActivations) {
     $tag += '_vaecpu'
     $memoryArgs += '--vae_cpu_activations'
+}
+if ($StepwiseBackward) {
+    if ($Objective -ne 'final-rgb') { throw 'StepwiseBackward requires final-rgb' }
+    $tag += '_stepvjp'
+    $memoryArgs += '--stepwise_backward'
 }
 $assets = Join-Path $OutputRoot "${tag}_assets"
 foreach ($p in @($Python, $Data, $InitialAttack, (Join-Path $WanCkpt 'Wan2.1_VAE.pth'))) {

@@ -25,7 +25,7 @@ from generate_wan_boundary_pgd import tensor_conditions
 from probe_wan_condition_grad import checkpoint_blocks
 from trajectory_input_objective import (
     correction, full_trajectory, match_grid_amplitude, rgb_distortion, rollout_loss,
-    uniform_grid_direction,
+    uniform_grid_direction, stepwise_trajectory_vjp,
 )
 from sde_rf_wan.sde_convert import shifted_timesteps
 from sde_rf_wan.turbo_codebook import TurboPerFrameCodebook
@@ -81,8 +81,12 @@ def main():
     p.add_argument('--gpu1_memory', default='20GiB')
     p.add_argument('--vae_cpu_activations', action='store_true',
                    help='Keep VAE autograd saved tensors in host RAM, not on the GPU')
+    p.add_argument('--stepwise_backward', action='store_true',
+                   help='Replay one trajectory step at a time for the RGB VJP')
     a = p.parse_args()
     final_rgb = a.objective == 'final-rgb'
+    if a.stepwise_backward and not final_rgb:
+        p.error('Stepwise backward requires final-rgb')
     control_h = a.height if a.control_height is None else a.control_height
     control_w = a.width if a.control_width is None else a.control_width
     if min(control_h, control_w) < 1:
@@ -97,6 +101,8 @@ def main():
     report_path = out / 'generation.json'
     checkpoint = out / 'optimizer_checkpoint.npz'
     config = vars(a) | dict(data_sha256=digest(a.data), init_sha256=digest(a.initial_attack_file), version=1)
+    if not a.stepwise_backward:
+        del config['stepwise_backward']
     if not a.vae_cpu_activations:
         del config['vae_cpu_activations']
     if a.control_height is None and a.control_width is None and not a.grid_random:
@@ -127,6 +133,7 @@ def main():
                       limitation='Low-resolution 20-step hard forward, truncated backward and soft codebook gradients',
                       tracked_steps=list(range(21 - a.backward_steps, 21)),
                       tracked_sde_steps=list(range(21 - a.backward_steps, 18)))
+        report['backward_engine'] = 'stepwise-vjp-v1' if a.stepwise_backward else 'retained-graph'
     if a.grid_random:
         report.update(control_grid=[control_h, control_w], grid_random_mse_rtol=.01,
                       grid_random_distribution='uniform_continuous',
@@ -242,6 +249,17 @@ def main():
             del score, end_leaf
             if not torch.isfinite(end_grad).all() or not torch.any(end_grad):
                 raise RuntimeError('Final RGB gradient is zero or non-finite')
+            if a.stepwise_backward:
+                print('[BACKWARD] One-step-at-a-time trajectory VJP', flush=True)
+                return stepwise_trajectory_vjp(
+                    latent_value, reference, initial_state, times, 17,
+                    lambda x, t: model.predict_velocity(x, t, embeds, cond),
+                    lambda r, s, f: book.select_atoms(r, s, f)[2],
+                    lambda x, t: model.predict_velocity_with_grad(x, t, embeds, cond),
+                    lambda r, s, f: correction(book, r, s, f, a.pool_size),
+                    end_grad, backward_steps=a.backward_steps, expected_end=hard_end,
+                    progress=lambda step: print(f'[VJP] completed step {step}/20', flush=True),
+                )
             target_leaf = latent_value.detach().requires_grad_(True)
             print('[BACKWARD] DiT trajectory suffix gradient', flush=True)
             replay, _ = terminal(target_leaf, grad=True)

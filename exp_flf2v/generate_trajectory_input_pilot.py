@@ -306,7 +306,7 @@ def main():
                 raise RuntimeError('Non-finite hard rollout score')
             return float(score), terms.cpu().tolist()
         if audit_source is not None:
-            from rgb_direction_audit import recover_first_direction
+            from rgb_direction_audit import recover_first_direction, assert_same_submitted_pixels
             with np.load(audit_source / 'optimizer_checkpoint.npz', allow_pickle=False) as saved:
                 direction_np, accepted_step = recover_first_direction(source_report, saved)
             direction = torch.from_numpy(direction_np).to(controls)
@@ -318,27 +318,27 @@ def main():
             with torch.no_grad():
                 reproduced = (pixels(direction * (accepted_step / 255)) - rgb).permute(0, 2, 3, 1).cpu().numpy()
             with np.load(audit_source / 'candidate.npz', allow_pickle=False) as saved:
-                if not np.array_equal(reproduced, saved['delta']):
-                    raise RuntimeError('Recovered direction does not exactly reproduce the saved candidate')
+                replay_check = assert_same_submitted_pixels(
+                    original, reproduced, saved['delta'], 'Recovered candidate')
             cases = [('initial', 0.), ('positive_half', .5), ('negative_half', -.5),
                      ('positive_one', 1.), ('negative_one', -1.)]
             report.update(kind='fixed_initialization_direction_audit', direction_reproduces_candidate=True,
-                          source_accepted_step_pixel=accepted_step, rows=[], asset_sha256={})
+                          source_accepted_step_pixel=accepted_step, rows=[], asset_sha256={},
+                          input_equality_domain='codec-submitted uint8 RGB', replay_check=replay_check)
             for name, step in cases:
                 tick = time.monotonic()
                 c = direction * (step / 255)
                 with torch.no_grad():
                     delta = (pixels(c) - rgb).permute(0, 2, 3, 1).cpu().numpy()
-                if not np.array_equal(delta[[0, -1]], init[[0, -1]]):
-                    raise RuntimeError('Direction audit changed boundary frames')
+                boundary_check = assert_same_submitted_pixels(
+                    original[[0, -1]], delta[[0, -1]], init[[0, -1]], 'Boundary frames')
                 if not np.isfinite(delta).all() or np.abs(delta).max() * 255 > a.epsilon + 1e-3:
                     raise RuntimeError('Direction audit exceeded perturbation bound')
                 path = out / (name + '.npz')
                 reuse_variant = None
                 if step == 0:
                     with np.load(audit_source / 'initial.npz', allow_pickle=False) as saved:
-                        if not np.array_equal(delta, saved['delta']):
-                            raise RuntimeError('Initial pixels changed')
+                        assert_same_submitted_pixels(original, delta, saved['delta'], 'Initial frames')
                     reuse_variant = 'initial'
                 elif step == accepted_step:
                     reuse_variant = 'candidate'
@@ -355,7 +355,7 @@ def main():
                 row = dict(variant=name, step_pixel=step, proxy_rgb_psnr_db=-score,
                            input_MSE=float(np.mean(delta**2)),
                            input_Linf_pixel=float(np.abs(delta).max() * 255),
-                           seconds=time.monotonic()-tick)
+                           seconds=time.monotonic()-tick, boundary_check=boundary_check)
                 report['rows'].append(row)
                 report['asset_sha256'][name + '.npz'] = digest(path)
                 atomic_json(report_path, report)

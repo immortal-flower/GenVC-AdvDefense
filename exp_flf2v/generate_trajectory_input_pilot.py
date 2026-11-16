@@ -10,6 +10,7 @@ import gc
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -83,10 +84,14 @@ def main():
                    help='Keep VAE autograd saved tensors in host RAM, not on the GPU')
     p.add_argument('--stepwise_backward', action='store_true',
                    help='Replay one trajectory step at a time for the RGB VJP')
+    p.add_argument('--direction_audit_from', type=str,
+                   help='Replay +/-0.5 and +/-1 pixel steps from a completed one-update checkpoint')
     a = p.parse_args()
     final_rgb = a.objective == 'final-rgb'
     if a.stepwise_backward and not final_rgb:
         p.error('Stepwise backward requires final-rgb')
+    if a.direction_audit_from and not final_rgb:
+        p.error('Direction audit requires final-rgb')
     control_h = a.height if a.control_height is None else a.control_height
     control_w = a.width if a.control_width is None else a.control_width
     if min(control_h, control_w) < 1:
@@ -103,6 +108,20 @@ def main():
     config = vars(a) | dict(data_sha256=digest(a.data), init_sha256=digest(a.initial_attack_file), version=1)
     if not a.stepwise_backward:
         del config['stepwise_backward']
+    audit_source = None
+    if a.direction_audit_from:
+        audit_source = Path(a.direction_audit_from)
+        source_report = json.loads((audit_source / 'generation.json').read_text(encoding='utf-8'))
+        source_config = source_report['configuration']
+        for key in ('data_sha256', 'init_sha256', 'wan_ckpt', 'height', 'width',
+                    'control_height', 'control_width', 'epsilon', 'alpha', 'seed',
+                    'pool_size', 'backward_steps', 'gpu0_memory', 'gpu1_memory'):
+            if config.get(key) != source_config.get(key):
+                raise ValueError(f'Direction audit source configuration mismatch: {key}')
+        config['direction_report_sha256'] = digest(audit_source / 'generation.json')
+        config['direction_checkpoint_sha256'] = digest(audit_source / 'optimizer_checkpoint.npz')
+    else:
+        del config['direction_audit_from']
     if not a.vae_cpu_activations:
         del config['vae_cpu_activations']
     if a.control_height is None and a.control_width is None and not a.grid_random:
@@ -286,6 +305,65 @@ def main():
             if not torch.isfinite(score):
                 raise RuntimeError('Non-finite hard rollout score')
             return float(score), terms.cpu().tolist()
+        if audit_source is not None:
+            from rgb_direction_audit import recover_first_direction
+            with np.load(audit_source / 'optimizer_checkpoint.npz', allow_pickle=False) as saved:
+                direction_np, accepted_step = recover_first_direction(source_report, saved)
+            direction = torch.from_numpy(direction_np).to(controls)
+            if direction.shape != controls.shape:
+                raise ValueError('Direction control-grid shape mismatch')
+            for name, sha in source_report['asset_sha256'].items():
+                if digest(audit_source / name) != sha:
+                    raise ValueError(f'Source asset changed: {name}')
+            with torch.no_grad():
+                reproduced = (pixels(direction * (accepted_step / 255)) - rgb).permute(0, 2, 3, 1).cpu().numpy()
+            with np.load(audit_source / 'candidate.npz', allow_pickle=False) as saved:
+                if not np.array_equal(reproduced, saved['delta']):
+                    raise RuntimeError('Recovered direction does not exactly reproduce the saved candidate')
+            cases = [('initial', 0.), ('positive_half', .5), ('negative_half', -.5),
+                     ('positive_one', 1.), ('negative_one', -1.)]
+            report.update(kind='fixed_initialization_direction_audit', direction_reproduces_candidate=True,
+                          source_accepted_step_pixel=accepted_step, rows=[], asset_sha256={})
+            for name, step in cases:
+                tick = time.monotonic()
+                c = direction * (step / 255)
+                with torch.no_grad():
+                    delta = (pixels(c) - rgb).permute(0, 2, 3, 1).cpu().numpy()
+                if not np.array_equal(delta[[0, -1]], init[[0, -1]]):
+                    raise RuntimeError('Direction audit changed boundary frames')
+                if not np.isfinite(delta).all() or np.abs(delta).max() * 255 > a.epsilon + 1e-3:
+                    raise RuntimeError('Direction audit exceeded perturbation bound')
+                path = out / (name + '.npz')
+                reuse_variant = None
+                if step == 0:
+                    with np.load(audit_source / 'initial.npz', allow_pickle=False) as saved:
+                        if not np.array_equal(delta, saved['delta']):
+                            raise RuntimeError('Initial pixels changed')
+                    reuse_variant = 'initial'
+                elif step == accepted_step:
+                    reuse_variant = 'candidate'
+                if reuse_variant:
+                    shutil.copyfile(audit_source / (reuse_variant + '.npz'), path)
+                else:
+                    np.savez_compressed(path, delta=delta)
+                if step == 0:
+                    score = source_report['initial_score']
+                elif step == accepted_step:
+                    score = source_report['final_score']
+                else:
+                    score, _ = evaluate(c)
+                row = dict(variant=name, step_pixel=step, proxy_rgb_psnr_db=-score,
+                           input_MSE=float(np.mean(delta**2)),
+                           input_Linf_pixel=float(np.abs(delta).max() * 255),
+                           seconds=time.monotonic()-tick)
+                report['rows'].append(row)
+                report['asset_sha256'][name + '.npz'] = digest(path)
+                atomic_json(report_path, report)
+                print('[DIRECTION] ' + json.dumps(row), flush=True)
+            report.update(status='completed', seconds=time.monotonic()-start,
+                          note='Signed PGD direction diagnostic; step pairs are not input-MSE matched. No proxy gate.')
+            atomic_json(report_path, report)
+            return
         done = 0
         if checkpoint.exists():
             with np.load(checkpoint, allow_pickle=False) as z:

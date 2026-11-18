@@ -8,6 +8,7 @@ param(
     [string]$Tag = 'vae_continue_eps4_r12_jockey_gop0_v1',
     [int[]]$TargetRounds = @(8,12),
     [switch]$Refine,
+    [switch]$DirectRGB,
     [switch]$PlanOnly
 )
 $ErrorActionPreference = 'Stop'
@@ -17,6 +18,7 @@ $arguments = @('--data',$Data,'--wan_ckpt',$WanCkpt,'--initial',$Initial,
 $arguments += '--extension_rounds'
 foreach ($round in $TargetRounds) { $arguments += [string]$round }
 if ($Refine) { $arguments += '--refine' }
+if ($DirectRGB) { $arguments += '--direct_rgb' }
 if ($PlanOnly) { $arguments += '--plan_only' }
 Start-Transcript -Path '.\vae_attack_continuation.log' -Append
 try {

@@ -17,7 +17,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from exp_flf2v.search_native_rgb_input import atomic_json, load_source, sha256
-from exp_flf2v.vae_warmstart_utils import bounded_delta, clipping_audit, crop_starts, quantized_pair, temporal_weights
+from exp_flf2v.vae_warmstart_utils import bounded_delta, clipping_audit, crop_starts, quantized_pair, temporal_weights, vae_attack_loss
 
 
 def save_npz(path, **arrays):
@@ -27,13 +27,15 @@ def save_npz(path, **arrays):
     os.replace(tmp, path)
 
 
-def validate_extension(source, config):
+def validate_extension(source, config, rebase=False):
     previous = json.loads((source/'generation.json').read_text(encoding='utf-8'))
     if previous['status'] != 'completed':
         raise ValueError('Source generation must be completed')
     keys = ('data_sha256','initial_sha256','vae_path','vae_size','geometry','crop','stride',
             'anchors','alpha_pixel','momentum','seed','schedule_offset','objective','parameterization','boundary')
     for key in keys:
+        if rebase and key in ('alpha_pixel','momentum','objective','parameterization'):
+            continue  # A declared new optimizer variant may change these, not source geometry/data.
         if previous['configuration'][key] != config[key]:
             raise ValueError(f'Continuation setting differs: {key}')
     source_round = max(previous['configuration']['saved_rounds'])
@@ -47,6 +49,17 @@ def validate_extension(source, config):
     return previous
 
 
+def load_source_base(source, report):
+    entries = [r for r in report['assets'] if r['name']=='initial']
+    if len(entries) != 1 or sha256(source/entries[0]['file']) != entries[0]['sha256']:
+        raise ValueError('Source optimizer base hash mismatch')
+    with np.load(source/entries[0]['file'],allow_pickle=False) as z:
+        base = z['delta'].astype(np.float32)
+    if not np.isfinite(base).all() or np.abs(base).max()*255 > 4.001:
+        raise ValueError('Invalid source optimizer base')
+    return base
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', type=Path, required=True)
@@ -57,7 +70,10 @@ def main():
                    help='Continue epsilon4 from a completed batch, retaining controls and momentum')
     p.add_argument('--extension_rounds', type=int, nargs='+', default=[8,12])
     p.add_argument('--refine',action='store_true',help='Rebase at saved pixels, reset momentum, alpha0.25; use straight-through epsilon-clamp gradient')
+    p.add_argument('--direct_rgb',action='store_true',help='Refinement maximizing VAE reconstruction MSE against original input RGB, not clean VAE output')
     a = p.parse_args()
+    if a.direct_rgb:
+        a.refine = True
     config = dict(version=1, data_sha256=sha256(a.data), initial_sha256=sha256(a.initial),
                   generator_sha256=sha256(__file__),
                   helpers_sha256=sha256(Path(__file__).with_name('vae_warmstart_utils.py')),
@@ -74,7 +90,7 @@ def main():
     if a.extend_from:
         if a.extend_from.resolve() == a.output.resolve():
             raise ValueError('Continuation must use a new output directory')
-        source = validate_extension(a.extend_from,config)
+        source = validate_extension(a.extend_from,config,rebase=a.refine)
         source_round = max(source['configuration']['saved_rounds'])
         if (a.extension_rounds != sorted(set(a.extension_rounds))
                 or min(a.extension_rounds) <= source_round or max(a.extension_rounds) > 64):
@@ -88,6 +104,8 @@ def main():
             config.update(alpha_pixel=.25,clamp_gradient='straight-through surrogate',
                           optimizer_state='rebase at realized source input; reset additive controls and momentum',
                           parameterization='frozen realized source checkpoint plus three-anchor additive controls')
+        if a.direct_rgb:
+            config.update(objective='MSE(VAE(x+delta), x)',objective_reference='original source RGB; VAE surrogate, not full GVCC output')
     import hashlib
     fingerprint = hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest()
     a.output.mkdir(parents=True, exist_ok=True)
@@ -115,7 +133,12 @@ def main():
     initial = actual.astype(np.float32)/255
     audit = None
     if a.refine:
-        old_base = torch.from_numpy(initial).permute(3,0,1,2)
+        # Refinement checkpoints may already use a rebased initializer, not the
+        # original epsilon2 input. Replay against their own hashed base.
+        source_base = load_source_base(a.extend_from,source)
+        if source_base.shape != raw.shape:
+            raise ValueError('Source base geometry mismatch')
+        old_base = torch.from_numpy(source_base).permute(3,0,1,2)
         with np.load(a.extend_from/'eps4_optimizer.npz',allow_pickle=False) as z:
             old_controls = torch.from_numpy(z['controls'].copy())
         audit = clipping_audit(old_base,old_controls,temporal_weights(33),4/255)
@@ -134,7 +157,7 @@ def main():
         report['source_clipping_audit'] = audit
         atomic_json(a.output/'clipping_audit.json',audit)
         print('[CLIPPING AUDIT] '+json.dumps(audit),flush=True)
-        del old_base,old_controls,replay,realized,saved_delta
+        del old_base,old_controls,replay,realized,saved_delta,source_base
     save_npz(a.output/'initial.npz',delta=initial)
     report['assets'].append(dict(name='initial',file='initial.npz',kind='initial',epsilon=4 if a.refine else 2,round=0,
                                 input_MSE=float(np.mean(initial**2)),
@@ -217,13 +240,15 @@ def main():
                         t = (tile_id*7+(8+round_id)*5) % 29
                         target = clean[:,t:t+5,y:y+192,x:x+192].to(device)
                         fixed = base[:,t:t+5,y:y+192,x:x+192].to(device)
-                        with torch.no_grad():
-                            reference = reconstruct(target)
+                        reference = None
+                        if not a.direct_rgb:
+                            with torch.no_grad():
+                                reference = reconstruct(target)
                         c = controls[:,:,y:y+192,x:x+192].to(device).detach().requires_grad_(True)
                         w = weights[t:t+5].to(device)
                         d = bounded_delta(fixed,c,w,epsilon/255,straight_through=a.refine)
                         recon = reconstruct((target+d).clamp(0,1))
-                        loss = (recon-reference).square().mean()
+                        loss = vae_attack_loss(recon,target,reference,direct_rgb=a.direct_rgb)
                         grad, = torch.autograd.grad(loss,c)
                         if not torch.isfinite(grad).all():
                             raise RuntimeError('Non-finite VAE input gradient')

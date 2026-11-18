@@ -3,6 +3,13 @@ import numpy as np
 import torch
 
 
+def vae_attack_loss(reconstruction, original, clean_reconstruction=None, direct_rgb=False):
+    reference = original if direct_rgb else clean_reconstruction
+    if reference is None or reference.shape != reconstruction.shape:
+        raise ValueError('Missing or incompatible objective reference')
+    return (reconstruction-reference.detach()).square().mean()
+
+
 def temporal_weights(frames, anchors=3):
     positions = np.linspace(0, anchors - 1, frames)
     weights = np.zeros((frames, anchors), np.float32)

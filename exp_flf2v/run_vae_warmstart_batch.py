@@ -65,8 +65,11 @@ def main():
     p.add_argument('--extend_tag', help='Continue the epsilon4 optimizer from this completed source tag')
     p.add_argument('--extension_rounds',type=int,nargs='+',default=[8,12])
     p.add_argument('--refine',action='store_true')
+    p.add_argument('--direct_rgb',action='store_true')
     p.add_argument('--plan_only', action='store_true')
     a = p.parse_args()
+    if a.direct_rgb:
+        a.refine = True
     if not re.fullmatch(r'[A-Za-z0-9_-]+', a.tag):
         p.error('Invalid tag')
     if a.extend_tag and (not re.fullmatch(r'[A-Za-z0-9_-]+',a.extend_tag) or a.tag == a.extend_tag):
@@ -88,6 +91,8 @@ def main():
             p.error('Target rounds must increase beyond the source round, up to 64')
         mode = 'rebase saved pixels/reset momentum, alpha0.25, surrogate clamp gradient' if a.refine else 'retain epsilon4 controls/momentum'
         print(f'Plan: {mode}; rounds{source_round} -> {a.extension_rounds}; bound stays 4/255.',flush=True)
+        if a.direct_rgb:
+            print('Objective: maximize VAE reconstruction MSE against original RGB; native GVCC used only for acceptance.',flush=True)
         print(f'Reuse verified round{source_round} native results; {2*len(a.extension_rounds)} new 720p codec runs.',flush=True)
     else:
         print('Plan: independent epsilon 2/4 branches, checkpoints after 1/4 additional crop sweeps.', flush=True)
@@ -106,6 +111,8 @@ def main():
                                '--extension_rounds',*map(str,a.extension_rounds)]
     if a.refine:
         generation_command += ['--refine']
+    if a.direct_rgb:
+        generation_command += ['--direct_rgb']
     subprocess.run(generation_command,check=True)
     generation = json.loads((assets/'generation.json').read_text(encoding='utf-8'))
     expected_assets = 3+2*len(a.extension_rounds) if a.extend_tag else 9

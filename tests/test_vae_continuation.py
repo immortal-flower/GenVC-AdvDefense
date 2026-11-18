@@ -8,8 +8,8 @@ from unittest.mock import patch
 import numpy as np
 
 from exp_flf2v import run_vae_warmstart_batch as batch
-from exp_flf2v.generate_vae_warmstart import validate_extension
-from exp_flf2v.vae_warmstart_utils import bounded_delta,clipping_audit,temporal_weights,quantized_pair
+from exp_flf2v.generate_vae_warmstart import validate_extension,load_source_base
+from exp_flf2v.vae_warmstart_utils import bounded_delta,clipping_audit,temporal_weights,quantized_pair,vae_attack_loss
 import torch
 
 
@@ -32,6 +32,9 @@ class ContinuationTest(unittest.TestCase):
             self.assertEqual(validate_extension(source,config)['fingerprint'],'old')
             with self.assertRaisesRegex(ValueError,'differs: momentum'):
                 validate_extension(source,dict(config,momentum='changed'))
+            self.assertEqual(validate_extension(source,dict(config,momentum='changed'),rebase=True)['fingerprint'],'old')
+            with self.assertRaisesRegex(ValueError,'differs: data_sha256'):
+                validate_extension(source,dict(config,data_sha256='changed'),rebase=True)
             np.savez(source/'eps4_optimizer.npz',done=8,fingerprint='old')
             with self.assertRaisesRegex(ValueError,'completed source round'):
                 validate_extension(source,config)
@@ -44,6 +47,34 @@ class ContinuationTest(unittest.TestCase):
 
     def test_refine28_to32_and36_runs_and_resume(self):
         self._check_native_runs(28,(32,36),refine=True)
+
+    def test_direct_rgb36_to40_and44_runs_and_resume(self):
+        self._check_native_runs(36,(40,44),refine=True,direct_rgb=True)
+
+    def test_direct_rgb_objective_changes_gradient_reference(self):
+        x = torch.tensor([0.],requires_grad=True)
+        clean_vae = torch.tensor([2.],requires_grad=True)
+        recon = torch.tensor([1.],requires_grad=True)
+        direct = vae_attack_loss(recon,x,clean_vae,direct_rgb=True)
+        deviation = vae_attack_loss(recon,x,clean_vae,direct_rgb=False)
+        gd, = torch.autograd.grad(direct,recon)
+        gv, = torch.autograd.grad(deviation,recon)
+        self.assertEqual(float(gd),2.)
+        self.assertEqual(float(gv),-2.)
+        self.assertIsNone(x.grad)
+        self.assertIsNone(clean_vae.grad)
+
+    def test_load_rebased_source_initializer_and_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            f = folder/'initial.npz'
+            saved = np.full((5,2,2,3),4/255,dtype=np.float32)
+            np.savez(f,delta=saved)
+            report = dict(assets=[dict(name='initial',file=f.name,sha256=batch.sha256(f))])
+            np.testing.assert_array_equal(load_source_base(folder,report),saved)
+            f.write_bytes(b'corrupted')
+            with self.assertRaisesRegex(ValueError,'base hash mismatch'):
+                load_source_base(folder,report)
 
     def test_surrogate_forward_bound_and_gradient(self):
         w = temporal_weights(5)
@@ -73,7 +104,7 @@ class ContinuationTest(unittest.TestCase):
         np.testing.assert_array_equal(actual,saved)
         np.testing.assert_array_equal(reference,random)
 
-    def _check_native_runs(self,source_round,target_rounds,refine=False):
+    def _check_native_runs(self,source_round,target_rounds,refine=False,direct_rgb=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ckpt = root/'ckpt'
@@ -106,11 +137,14 @@ class ContinuationTest(unittest.TestCase):
                     '--extension_rounds',*map(str,target_rounds)]
             if refine:
                 argv += ['--refine']
+            if direct_rgb:
+                argv += ['--direct_rgb']
             launches = []
             def launch(cmd,check):
                 if 'generate_vae_warmstart.py' in cmd[1]:
                     self.assertIn('--extend_from',cmd)
                     self.assertEqual('--refine' in cmd,refine)
+                    self.assertEqual('--direct_rgb' in cmd,direct_rgb)
                     assets = root/'new_assets'
                     assets.mkdir(exist_ok=True)
                     rows = [dict(name='initial',kind='initial')]

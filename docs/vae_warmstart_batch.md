@@ -140,3 +140,33 @@ and their magnitude-matched random references against the verified round28
 results. Do not claim the clamp change alone caused improvement: rebasing,
 momentum reset, and smaller step also changed. Keep the old candidate if the
 real codec results do not improve, even when the VAE loss increases.
+
+## Source-referenced RGB objective after refinement36
+
+```powershell
+& '.\exp_flf2v\run_vae_attack_continuation.ps1' `
+    -SourceTag 'vae_refine_eps4_r28_jockey_gop0_v1' `
+    -Tag 'vae_source_rgb_eps4_r36_jockey_gop0_v1' `
+    -TargetRounds @(40,44) -DirectRGB
+```
+
+Rebase at the saved round36 candidate, reset controls/momentum, retain 4/255
+and alpha0.25/255, and maximize `MSE(VAE(x+delta), x)` instead of
+`MSE(VAE(x+delta), VAE(x))`. Original RGB is detached as the fixed reference;
+no clean VAE reconstruction is needed for this loss. Gradients still pass
+through VAE encode/decode and the surrogate epsilon-clamp derivative, **not**
+through normal GVCC encoding or atom selection. Candidate validation still
+performs fresh native720p encoding and decoding. Model seed remains42.
+
+Round40/44 labels denote four/eight new objective sweeps beyond refinement36.
+Four native jobs cover the two candidates and magnitude-matched random
+references. Baseline reuse verifies the existing round36 metrics and assets.
+`ExtraDropVsInitial` now means improvement relative to round36, not round28
+or clean video. Keep prior PSNR/LPIPS-best inputs if the new objective fails.
+This comparison does not isolate objective change from optimizer reset or
+additional compute. An increased VAE source error is not proof of native
+GVCC degradation; use the final native comparisons for that decision.
+
+Refinement-chain replay reads each source checkpoint's own hashed
+`initial.npz`, so a previously rebased checkpoint is not incorrectly replayed
+against the original epsilon2 initializer.

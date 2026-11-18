@@ -64,12 +64,15 @@ def main():
     p.add_argument('--tag', default='vae_warmstart_jockey_gop0_v1')
     p.add_argument('--extend_tag', help='Continue the epsilon4 optimizer from this completed source tag')
     p.add_argument('--extension_rounds',type=int,nargs='+',default=[8,12])
+    p.add_argument('--refine',action='store_true')
     p.add_argument('--plan_only', action='store_true')
     a = p.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_-]+', a.tag):
         p.error('Invalid tag')
     if a.extend_tag and (not re.fullmatch(r'[A-Za-z0-9_-]+',a.extend_tag) or a.tag == a.extend_tag):
         p.error('Continuation requires valid, distinct source and destination tags')
+    if a.refine and not a.extend_tag:
+        p.error('Refinement requires --extend_tag')
     for path in (a.data, a.initial, a.wan_ckpt/'Wan2.1_VAE.pth'):
         if not path.is_file():
             p.error(f'Missing file: {path}')
@@ -83,7 +86,8 @@ def main():
         if (a.extension_rounds != sorted(set(a.extension_rounds))
                 or min(a.extension_rounds) <= source_round or max(a.extension_rounds)>64):
             p.error('Target rounds must increase beyond the source round, up to 64')
-        print(f'Plan: retain epsilon4 controls/momentum, rounds{source_round} -> {a.extension_rounds}; bound stays 4/255.',flush=True)
+        mode = 'rebase saved pixels/reset momentum, alpha0.25, surrogate clamp gradient' if a.refine else 'retain epsilon4 controls/momentum'
+        print(f'Plan: {mode}; rounds{source_round} -> {a.extension_rounds}; bound stays 4/255.',flush=True)
         print(f'Reuse verified round{source_round} native results; {2*len(a.extension_rounds)} new 720p codec runs.',flush=True)
     else:
         print('Plan: independent epsilon 2/4 branches, checkpoints after 1/4 additional crop sweeps.', flush=True)
@@ -100,6 +104,8 @@ def main():
     if a.extend_tag:
         generation_command += ['--extend_from',str(root/(a.extend_tag+'_assets')),
                                '--extension_rounds',*map(str,a.extension_rounds)]
+    if a.refine:
+        generation_command += ['--refine']
     subprocess.run(generation_command,check=True)
     generation = json.loads((assets/'generation.json').read_text(encoding='utf-8'))
     expected_assets = 3+2*len(a.extension_rounds) if a.extend_tag else 9

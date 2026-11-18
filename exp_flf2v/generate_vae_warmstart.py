@@ -17,7 +17,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from exp_flf2v.search_native_rgb_input import atomic_json, load_source, sha256
-from exp_flf2v.vae_warmstart_utils import bounded_delta, crop_starts, quantized_pair, temporal_weights
+from exp_flf2v.vae_warmstart_utils import bounded_delta, clipping_audit, crop_starts, quantized_pair, temporal_weights
 
 
 def save_npz(path, **arrays):
@@ -56,6 +56,7 @@ def main():
     p.add_argument('--extend_from', type=Path,
                    help='Continue epsilon4 from a completed batch, retaining controls and momentum')
     p.add_argument('--extension_rounds', type=int, nargs='+', default=[8,12])
+    p.add_argument('--refine',action='store_true',help='Rebase at saved pixels, reset momentum, alpha0.25; use straight-through epsilon-clamp gradient')
     a = p.parse_args()
     config = dict(version=1, data_sha256=sha256(a.data), initial_sha256=sha256(a.initial),
                   generator_sha256=sha256(__file__),
@@ -68,6 +69,8 @@ def main():
                   boundary='all frames, including first and last, can change',
                   optimizer_state='zero additional controls and zero momentum for each epsilon branch')
     source = None
+    if a.refine and not a.extend_from:
+        p.error('Refinement requires a completed source checkpoint')
     if a.extend_from:
         if a.extend_from.resolve() == a.output.resolve():
             raise ValueError('Continuation must use a new output directory')
@@ -81,6 +84,10 @@ def main():
                       optimizer_state=f'continue round{source_round} epsilon4 controls and momentum',
                       source_fingerprint=source['fingerprint'],
                       source_checkpoint_sha256=sha256(a.extend_from/'eps4_optimizer.npz'))
+        if a.refine:
+            config.update(alpha_pixel=.25,clamp_gradient='straight-through surrogate',
+                          optimizer_state='rebase at realized source input; reset additive controls and momentum',
+                          parameterization='frozen realized source checkpoint plus three-anchor additive controls')
     import hashlib
     fingerprint = hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest()
     a.output.mkdir(parents=True, exist_ok=True)
@@ -106,8 +113,30 @@ def main():
     submitted = (np.clip(original+initial,0,1)*255+.5).astype(np.uint8)
     actual = submitted.astype(np.int16)-raw.astype(np.int16)
     initial = actual.astype(np.float32)/255
+    audit = None
+    if a.refine:
+        old_base = torch.from_numpy(initial).permute(3,0,1,2)
+        with np.load(a.extend_from/'eps4_optimizer.npz',allow_pickle=False) as z:
+            old_controls = torch.from_numpy(z['controls'].copy())
+        audit = clipping_audit(old_base,old_controls,temporal_weights(33),4/255)
+        src_row = next(r for r in source['assets'] if r['name']==f'eps4_r{source_round}_candidate')
+        with np.load(a.extend_from/src_row['file'],allow_pickle=False) as z:
+            saved_delta = z['delta'].astype(np.float32)
+        # Verify checkpoint geometry before replacing its internal parameterization.
+        with torch.no_grad():
+            replay = bounded_delta(old_base,old_controls,temporal_weights(33),4/255).permute(1,2,3,0).numpy()
+        realized,_ = quantized_pair(raw,replay,42)
+        if not np.array_equal(realized,saved_delta):
+            raise ValueError('Source optimizer does not reproduce its saved candidate')
+        initial = saved_delta
+        if initial.shape != raw.shape or not np.isfinite(initial).all() or np.abs(initial).max()*255>4.001:
+            raise ValueError('Invalid refinement base')
+        report['source_clipping_audit'] = audit
+        atomic_json(a.output/'clipping_audit.json',audit)
+        print('[CLIPPING AUDIT] '+json.dumps(audit),flush=True)
+        del old_base,old_controls,replay,realized,saved_delta
     save_npz(a.output/'initial.npz',delta=initial)
-    report['assets'].append(dict(name='initial',file='initial.npz',kind='initial',epsilon=2,round=0,
+    report['assets'].append(dict(name='initial',file='initial.npz',kind='initial',epsilon=4 if a.refine else 2,round=0,
                                 input_MSE=float(np.mean(initial**2)),
                                 input_Linf_pixel=float(np.abs(initial).max()*255),
                                 sha256=sha256(a.output/'initial.npz')))
@@ -173,6 +202,10 @@ def main():
                     if (controls.shape != (3,3,720,1280) or velocity.shape != controls.shape
                             or not torch.isfinite(controls).all() or not torch.isfinite(velocity).all()):
                         raise ValueError('Invalid saved optimizer tensors')
+                    if a.refine and loading != checkpoint:
+                        controls.zero_()
+                        velocity.zero_()
+                        history = []
                 if source is not None and done == config['source_round']:
                     save_pair(4,config['source_round'],controls)
                 for round_id in range(done,max(config['saved_rounds'])):
@@ -188,7 +221,7 @@ def main():
                             reference = reconstruct(target)
                         c = controls[:,:,y:y+192,x:x+192].to(device).detach().requires_grad_(True)
                         w = weights[t:t+5].to(device)
-                        d = bounded_delta(fixed,c,w,epsilon/255)
+                        d = bounded_delta(fixed,c,w,epsilon/255,straight_through=a.refine)
                         recon = reconstruct((target+d).clamp(0,1))
                         loss = (recon-reference).square().mean()
                         grad, = torch.autograd.grad(loss,c)
@@ -205,7 +238,7 @@ def main():
                         raise RuntimeError('Entire crop sweep produced zero gradient')
                     gradients /= gradients.abs().mean(dim=(1,2,3),keepdim=True).clamp_min(1e-12)
                     velocity = .8*velocity+gradients
-                    controls = (controls+.5/255*velocity.sign()).clamp(-2*epsilon/255,2*epsilon/255)
+                    controls = (controls+config['alpha_pixel']/255*velocity.sign()).clamp(-2*epsilon/255,2*epsilon/255)
                     history.append(dict(round=round_id+1,mean_crop_loss=float(np.mean(losses)),
                                         coverage=float((counts>0).float().mean()),seconds=time.monotonic()-tick))
                     if round_id+1 in config['saved_rounds']:

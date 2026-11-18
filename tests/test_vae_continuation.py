@@ -9,6 +9,8 @@ import numpy as np
 
 from exp_flf2v import run_vae_warmstart_batch as batch
 from exp_flf2v.generate_vae_warmstart import validate_extension
+from exp_flf2v.vae_warmstart_utils import bounded_delta,clipping_audit,temporal_weights,quantized_pair
+import torch
 
 
 class ContinuationTest(unittest.TestCase):
@@ -40,7 +42,38 @@ class ContinuationTest(unittest.TestCase):
     def test_round12_to20_and28_native_runs_and_resume(self):
         self._check_native_runs(12,(20,28))
 
-    def _check_native_runs(self,source_round,target_rounds):
+    def test_refine28_to32_and36_runs_and_resume(self):
+        self._check_native_runs(28,(32,36),refine=True)
+
+    def test_surrogate_forward_bound_and_gradient(self):
+        w = temporal_weights(5)
+        base = torch.zeros(3,5,2,2)
+        c = torch.full((3,3,2,2),6/255,requires_grad=True)
+        exact = bounded_delta(base,c,w,4/255)
+        surrogate = bounded_delta(base,c,w,4/255,straight_through=True)
+        torch.testing.assert_close(exact,surrogate,rtol=0,atol=0)
+        g0, = torch.autograd.grad(exact.sum(),c)
+        g1, = torch.autograd.grad(surrogate.sum(),c)
+        self.assertEqual(float(g0.abs().max()),0.)
+        self.assertGreater(float(g1.abs().min()),0.)
+        audit = clipping_audit(base,c.detach(),w,4/255)
+        self.assertEqual(audit['clamp_zero_derivative_fraction'],1.)
+        self.assertAlmostEqual(audit['max_overshoot_pixel'],2.,places=5)
+
+    def test_rebase_preserves_saved_input(self):
+        raw = np.full((5,2,2,3),128,dtype=np.uint8)
+        base = torch.zeros(3,5,2,2)
+        c = torch.full((3,3,2,2),6/255)
+        w = temporal_weights(5)
+        old = bounded_delta(base,c,w,4/255).permute(1,2,3,0).numpy()
+        saved,random = quantized_pair(raw,old,42)
+        rebased = torch.from_numpy(saved).permute(3,0,1,2)
+        new = bounded_delta(rebased,torch.zeros_like(c),w,4/255).permute(1,2,3,0).numpy()
+        actual,reference = quantized_pair(raw,new,42)
+        np.testing.assert_array_equal(actual,saved)
+        np.testing.assert_array_equal(reference,random)
+
+    def _check_native_runs(self,source_round,target_rounds,refine=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ckpt = root/'ckpt'
@@ -71,10 +104,13 @@ class ContinuationTest(unittest.TestCase):
             argv = ['batch','--data',str(data),'--initial',str(initial),'--wan_ckpt',str(ckpt),
                     '--results_root',str(root),'--extend_tag','old','--tag','new',
                     '--extension_rounds',*map(str,target_rounds)]
+            if refine:
+                argv += ['--refine']
             launches = []
             def launch(cmd,check):
                 if 'generate_vae_warmstart.py' in cmd[1]:
                     self.assertIn('--extend_from',cmd)
+                    self.assertEqual('--refine' in cmd,refine)
                     assets = root/'new_assets'
                     assets.mkdir(exist_ok=True)
                     rows = [dict(name='initial',kind='initial')]

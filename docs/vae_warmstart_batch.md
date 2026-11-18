@@ -110,3 +110,33 @@ is **round12**, and only four new native codec evaluations are needed. Source
 round12 assets and results are preserved. An interrupted new run resumes with
 the same command. The 20/28 labels count total warm-start refinement sweeps,
 not an additional 20/28 sweeps beyond round12.
+
+## Boundary-gradient refinement after round28
+
+```powershell
+& '.\exp_flf2v\run_vae_attack_continuation.ps1' `
+    -SourceTag 'vae_continue_eps4_r28_jockey_gop0_v1' `
+    -Tag 'vae_refine_eps4_r28_jockey_gop0_v1' `
+    -TargetRounds @(32,36) -Refine
+```
+
+This is a new optimizer variant, not ordinary continuation. First audit the
+source optimizer's raw pre-clamp perturbation: fraction strictly outside the
+epsilon bound and overshoot sizes. Ordinary clamp derivatives are zero outside
+the bound, but the count alone does not establish the cause of the plateau.
+Save the diagnostic to the new assets folder's `clipping_audit.json`.
+
+Verify that the source checkpoint exactly reproduces the accepted round28
+pixels, then rebase on that realized perturbation. Reset additional controls
+and momentum to zero, use step0.25/255, and use a straight-through derivative
+for the epsilon clamp during optimization only. The forward bound remains
+4/255, and saved inputs use normal quantization. RGB-range clipping retains its
+ordinary derivative. The VAE is frozen; this is not an exact discrete/codec
+gradient. First/last frames remain in scope as before.
+
+Labels32/36 mean 4/8 refinement sweeps after round28. Candidate generation
+loads the VAE once. Four native fresh codec evaluations compare these candidates
+and their magnitude-matched random references against the verified round28
+results. Do not claim the clamp change alone caused improvement: rebasing,
+momentum reset, and smaller step also changed. Keep the old candidate if the
+real codec results do not improve, even when the VAE loss increases.

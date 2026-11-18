@@ -14,9 +14,29 @@ def temporal_weights(frames, anchors=3):
     return torch.from_numpy(weights)
 
 
-def bounded_delta(base, controls, weights, epsilon):
+def bounded_delta(base, controls, weights, epsilon, straight_through=False):
     # base: C,F,H,W; controls: anchors,C,H,W. Frozen base + smooth update.
-    return (base + torch.einsum('fa,achw->cfhw', weights, controls)).clamp(-epsilon, epsilon)
+    raw = base + torch.einsum('fa,achw->cfhw', weights, controls)
+    bounded = raw.clamp(-epsilon, epsilon)
+    # Optional surrogate derivative only; forward perturbations stay bounded.
+    return bounded.detach() + (raw-raw.detach()) if straight_through else bounded
+
+
+def clipping_audit(base, controls, weights, epsilon):
+    """Count latent control overshoot, not empirical attack effectiveness."""
+    total = outside = 0
+    excess_sum = excess_max = 0.
+    with torch.no_grad():
+        for f in range(weights.shape[0]):
+            raw = base[:,f:f+1] + torch.einsum('fa,achw->cfhw',weights[f:f+1],controls)
+            excess = (raw.abs()-epsilon).clamp_min(0)
+            total += raw.numel()
+            outside += int((raw.abs()>epsilon).sum())
+            excess_sum += float(excess.double().sum())
+            excess_max = max(excess_max,float(excess.max()))
+    return dict(clamp_zero_derivative_fraction=outside/total,
+                mean_overshoot_pixel=255*excess_sum/total,max_overshoot_pixel=255*excess_max,
+                note='Strictly outside the epsilon clamp. Does not prove this causes the quality plateau.')
 
 
 def quantized_pair(original, delta, seed):

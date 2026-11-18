@@ -50,3 +50,24 @@ Input energy may grow between checkpoints and bounds: do not attribute an
 epsilon-4 gain over epsilon-2 solely to a better direction. One GOP/seed is
 screening only. Do not expand this batch automatically if there is no useful
 improvement; inspect original/perturbed frames before claiming imperceptibility.
+
+## Frozen candidate model-seed validation
+
+After selecting `eps4_r4_candidate` on seed 42, run:
+
+```powershell
+& '.\exp_flf2v\run_vae_warmstart_seed_validation.ps1'
+```
+
+This runs clean/candidate/magnitude-matched random at model seeds 123 and 2026
+(six fresh native evaluations). Both saved perturbations remain frozen; there
+is no additional generation or tuning on these seeds. Each seed gets its own
+clean baseline. Source data and asset hashes are checked before launch;
+completed metrics are hash-checked for resumption. All inputs use normal
+encoding, atom selection, conditioning and decoding, without codebook reuse.
+
+Outputs: `vae_warmstart_eps4_r4_heldout_v1_evaluation/summary.csv`, `paired.csv`,
+and `completed.json` under the results root. Positive extra PSNR drop and
+positive extra LPIPS mean greater degradation than the matched random input.
+Report both seeds, including negative results. These are held-out model seeds,
+not held-out videos: source-content generalization remains untested.

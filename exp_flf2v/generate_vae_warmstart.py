@@ -7,6 +7,7 @@ Both epsilon branches start independently from the same accepted input.
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 import sys
 import time
@@ -26,12 +27,33 @@ def save_npz(path, **arrays):
     os.replace(tmp, path)
 
 
+def validate_extension(source, config):
+    previous = json.loads((source/'generation.json').read_text(encoding='utf-8'))
+    if previous['status'] != 'completed':
+        raise ValueError('Source generation must be completed')
+    keys = ('data_sha256','initial_sha256','vae_path','vae_size','geometry','crop','stride',
+            'anchors','alpha_pixel','momentum','seed','schedule_offset','objective','parameterization','boundary')
+    for key in keys:
+        if previous['configuration'][key] != config[key]:
+            raise ValueError(f'Continuation setting differs: {key}')
+    with np.load(source/'eps4_optimizer.npz',allow_pickle=False) as z:
+        if int(z['done']) != 4 or str(z['fingerprint'].item()) != previous['fingerprint']:
+            raise ValueError('Expected the original four-round optimizer checkpoint')
+    for kind in ('candidate','random'):
+        matches = [r for r in previous['assets'] if r['name'] == f'eps4_r4_{kind}']
+        if len(matches) != 1 or sha256(source/matches[0]['file']) != matches[0]['sha256']:
+            raise ValueError('Original round-4 asset hash mismatch')
+    return previous
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', type=Path, required=True)
     p.add_argument('--vae', type=Path, required=True)
     p.add_argument('--initial', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--extend_from', type=Path,
+                   help='Continue epsilon4 from a completed four-round batch, retaining momentum; save rounds4,8,12')
     a = p.parse_args()
     config = dict(version=1, data_sha256=sha256(a.data), initial_sha256=sha256(a.initial),
                   generator_sha256=sha256(__file__),
@@ -43,6 +65,15 @@ def main():
                   parameterization='frozen realized initial delta plus three-anchor additive controls',
                   boundary='all frames, including first and last, can change',
                   optimizer_state='zero additional controls and zero momentum for each epsilon branch')
+    source = None
+    if a.extend_from:
+        if a.extend_from.resolve() == a.output.resolve():
+            raise ValueError('Continuation must use a new output directory')
+        source = validate_extension(a.extend_from,config)
+        config.update(saved_rounds=[4,8,12],epsilon_pixels=[4],
+                      optimizer_state='continue four-round epsilon4 controls and momentum',
+                      source_fingerprint=source['fingerprint'],
+                      source_checkpoint_sha256=sha256(a.extend_from/'eps4_optimizer.npz'))
     import hashlib
     fingerprint = hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest()
     a.output.mkdir(parents=True, exist_ok=True)
@@ -98,7 +129,15 @@ def main():
             if not np.isfinite(delta).all() or np.abs(delta).max()*255 > epsilon+.001:
                 raise ValueError(f'Invalid saved input: {name}')
             path = a.output/(name+'.npz')
-            save_npz(path,delta=delta)
+            if source is not None and round_id == 4:
+                original_row = next(r for r in source['assets'] if r['name'] == name)
+                original_path = a.extend_from/original_row['file']
+                with np.load(original_path,allow_pickle=False) as z:
+                    if not np.array_equal(delta,z['delta']):
+                        raise ValueError('Resumed optimizer does not reproduce the round-4 input')
+                shutil.copy2(original_path,path)
+            else:
+                save_npz(path,delta=delta)
             row = dict(name=name,file=path.name,kind=kind,epsilon=epsilon,round=round_id,
                        input_MSE=float(np.mean(delta**2)),input_Linf_pixel=float(np.abs(delta).max()*255),
                        sha256=sha256(path))
@@ -107,25 +146,29 @@ def main():
 
     try:
         with torch.enable_grad():
-            for epsilon in (2,4):
+            for epsilon in config['epsilon_pixels']:
                 checkpoint = a.output/f'eps{epsilon}_optimizer.npz'
                 controls = torch.zeros(3,3,720,1280)
                 velocity = torch.zeros_like(controls)
                 done, history = 0, []
-                if checkpoint.exists():
-                    with np.load(checkpoint,allow_pickle=False) as z:
-                        if str(z['fingerprint'].item()) != fingerprint:
+                loading = checkpoint if checkpoint.exists() else (a.extend_from/'eps4_optimizer.npz' if source else None)
+                if loading is not None:
+                    with np.load(loading,allow_pickle=False) as z:
+                        expected_fp = fingerprint if loading == checkpoint else source['fingerprint']
+                        if str(z['fingerprint'].item()) != expected_fp:
                             raise ValueError('Optimizer fingerprint mismatch')
                         controls = torch.from_numpy(z['controls'].copy())
                         velocity = torch.from_numpy(z['velocity'].copy())
                         done = int(z['done'])
                         history = json.loads(str(z['history'].item()))
-                    if done not in range(5):
+                    if done not in range(max(config['saved_rounds'])+1):
                         raise ValueError('Invalid optimizer round')
                     if (controls.shape != (3,3,720,1280) or velocity.shape != controls.shape
                             or not torch.isfinite(controls).all() or not torch.isfinite(velocity).all()):
                         raise ValueError('Invalid saved optimizer tensors')
-                for round_id in range(done,4):
+                if source is not None and done == 4:
+                    save_pair(4,4,controls)
+                for round_id in range(done,max(config['saved_rounds'])):
                     tick = time.monotonic()
                     gradients = torch.zeros_like(controls)
                     counts = torch.zeros(3,1,720,1280)
@@ -149,7 +192,7 @@ def main():
                         losses.append(float(loss.detach()))
                         del target,fixed,reference,c,w,d,recon,loss,grad
                         if (tile_id+1)%10 == 0 or tile_id+1 == len(tiles):
-                            print(f'[VAE] eps={epsilon} round={round_id+1}/4 crops={tile_id+1}/{len(tiles)}',flush=True)
+                            print(f'[VAE] eps={epsilon} round={round_id+1}/{max(config["saved_rounds"])} crops={tile_id+1}/{len(tiles)}',flush=True)
                     gradients /= counts.clamp_min(1e-8)
                     if not torch.any(gradients):
                         raise RuntimeError('Entire crop sweep produced zero gradient')
@@ -158,12 +201,12 @@ def main():
                     controls = (controls+.5/255*velocity.sign()).clamp(-2*epsilon/255,2*epsilon/255)
                     history.append(dict(round=round_id+1,mean_crop_loss=float(np.mean(losses)),
                                         coverage=float((counts>0).float().mean()),seconds=time.monotonic()-tick))
-                    if round_id+1 in (1,4):
+                    if round_id+1 in config['saved_rounds']:
                         save_pair(epsilon,round_id+1,controls)
                     # Save only after selected assets and metadata are complete.
                     save_npz(checkpoint,controls=controls.numpy(),velocity=velocity.numpy(),
                              done=round_id+1,history=json.dumps(history),fingerprint=fingerprint)
-                for round_id in (1,4):
+                for round_id in config['saved_rounds']:
                     for kind in ('candidate','random'):
                         meta = a.output/f'eps{epsilon}_r{round_id}_{kind}.json'
                         item = json.loads(meta.read_text(encoding='utf-8'))

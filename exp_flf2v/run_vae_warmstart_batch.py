@@ -23,17 +23,18 @@ def codec_command(python, script, data, checkpoint, root, run, asset, epsilon):
             '--attack_scope', 'all', '--defense', 'none', '--input_attack_diagnostics']
 
 
-def compare(rows):
+def compare(rows, extension=False):
     by_name = {row['name']: row for row in rows}
-    initial = by_name['initial']
+    initial = by_name['eps4_r4_candidate' if extension else 'initial']
     result = []
-    for eps in (2, 4):
-        for rounds in (1, 4):
+    for eps in ((4,) if extension else (2,4)):
+        for rounds in ((8,12) if extension else (1,4)):
             c = by_name[f'eps{eps}_r{rounds}_candidate']
             r = by_name[f'eps{eps}_r{rounds}_random']
             if abs(c['InputMSE'] - r['InputMSE']) > 1e-9:
                 raise ValueError('Native paired input MSE mismatch')
             result.append(dict(Epsilon=eps, AdditionalRounds=rounds,
+                               Baseline='eps4_r4_candidate' if extension else 'initial',
                                CandidatePSNR=c['PSNR'], RandomPSNR=r['PSNR'],
                                ExtraDropVsInitial=initial['PSNR']-c['PSNR'],
                                ExtraDropVsRandom=r['PSNR']-c['PSNR'],
@@ -60,15 +61,22 @@ def main():
     p.add_argument('--initial', type=Path, required=True)
     p.add_argument('--results_root', type=Path, default=Path('exp_flf2v/results_720p'))
     p.add_argument('--tag', default='vae_warmstart_jockey_gop0_v1')
+    p.add_argument('--extend_tag', help='Continue the epsilon4 optimizer from this completed source tag')
     p.add_argument('--plan_only', action='store_true')
     a = p.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_-]+', a.tag):
         p.error('Invalid tag')
+    if a.extend_tag and (not re.fullmatch(r'[A-Za-z0-9_-]+',a.extend_tag) or a.tag == a.extend_tag):
+        p.error('Continuation requires valid, distinct source and destination tags')
     for path in (a.data, a.initial, a.wan_ckpt/'Wan2.1_VAE.pth'):
         if not path.is_file():
             p.error(f'Missing file: {path}')
-    print('Plan: independent epsilon 2/4 branches, checkpoints after 1/4 additional crop sweeps.', flush=True)
-    print('One VAE load for generation; 9 sequential fresh native 720p codec runs (models reloaded per run).', flush=True)
+    if a.extend_tag:
+        print('Plan: retain epsilon4 controls/momentum, continue rounds4 -> 8 -> 12; bound stays 4/255.',flush=True)
+        print('Reuse verified round4 native results; four new 720p codec runs for round8/12 candidate/random.',flush=True)
+    else:
+        print('Plan: independent epsilon 2/4 branches, checkpoints after 1/4 additional crop sweeps.', flush=True)
+        print('One VAE load for generation; 9 sequential fresh native 720p codec runs (models reloaded per run).', flush=True)
     if a.plan_only:
         return
     root = a.results_root.resolve()
@@ -76,18 +84,42 @@ def main():
     folder = root/(a.tag+'_evaluation')
     folder.mkdir(parents=True, exist_ok=True)
     here = Path(__file__).resolve().parent
-    subprocess.run([sys.executable, str(here/'generate_vae_warmstart.py'),
+    generation_command = [sys.executable, str(here/'generate_vae_warmstart.py'),
                     '--data', str(a.data), '--vae', str(a.wan_ckpt/'Wan2.1_VAE.pth'),
-                    '--initial', str(a.initial), '--output', str(assets)], check=True)
+                    '--initial', str(a.initial), '--output', str(assets)]
+    if a.extend_tag:
+        generation_command += ['--extend_from',str(root/(a.extend_tag+'_assets'))]
+    subprocess.run(generation_command,check=True)
     generation = json.loads((assets/'generation.json').read_text(encoding='utf-8'))
-    if generation['status'] != 'completed' or len(generation['assets']) != 9:
-        raise ValueError('Expected completed generation with nine assets')
+    expected_assets = 7 if a.extend_tag else 9
+    if generation['status'] != 'completed' or len(generation['assets']) != expected_assets:
+        raise ValueError('Unexpected or incomplete generation assets')
     script = here/'run_flf2v_experiment.py'
     rows = []
-    for number, item in enumerate(generation['assets'], 1):
+    cases = [r for r in generation['assets'] if not (a.extend_tag and r['kind']=='initial')]
+    for number, item in enumerate(cases, 1):
         asset = assets/item['file']
         if sha256(asset) != item['sha256']:
             raise ValueError('Input asset hash mismatch')
+        if a.extend_tag and item['round'] == 4:
+            old_metrics = root/(a.extend_tag+'_'+item['name'])/'Jockey/gop0/metrics.json'
+            old_receipt = root/(a.extend_tag+'_evaluation')/(item['name']+'.json')
+            saved = json.loads(old_receipt.read_text(encoding='utf-8'))
+            old_asset = root/(a.extend_tag+'_assets')/item['file']
+            expected_command = codec_command(sys.executable,script,a.data.resolve(),a.wan_ckpt.resolve(),
+                                             root,a.extend_tag+'_'+item['name'],old_asset,4)
+            if (saved['configuration']['asset'] != item['sha256']
+                    or saved['configuration']['script'] != sha256(script)
+                    or saved['configuration']['command'] != expected_command
+                    or saved['metrics_sha256'] != sha256(old_metrics)):
+                raise ValueError('Round4 native baseline cannot be verified; no new native jobs started')
+            values = read_metrics(old_metrics)
+            if abs(values['InputMSE']-item['input_MSE']) > 1e-9:
+                raise ValueError('Round4 native energy mismatch')
+            rows.append(dict(name=item['name'],**values))
+            write_csv(folder/'summary.csv',rows)
+            print(f'[BASELINE REUSE] {item["name"]}: PSNR={values["PSNR"]:.4f} LPIPS={values["LPIPS"]:.4f}',flush=True)
+            continue
         run = a.tag+'_'+item['name']
         metrics = root/run/'Jockey/gop0/metrics.json'
         command = codec_command(sys.executable, script, a.data.resolve(),
@@ -103,7 +135,7 @@ def main():
                 raise ValueError('Evaluation configuration changed; use a new tag')
             cached = metrics.exists() and sha256(metrics) == saved['metrics_sha256']
         if not cached:
-            print(f'[NATIVE {number}/9] {item["name"]}: fresh encoding and decoding', flush=True)
+            print(f'[CASE {number}/{len(cases)}] {item["name"]}: fresh encoding and decoding', flush=True)
             subprocess.run(command, check=True)
         values = read_metrics(metrics)
         if abs(values['InputMSE']-item['input_MSE']) > 1e-9:
@@ -116,11 +148,13 @@ def main():
         write_csv(folder/'summary.csv', rows)
         print(f'[{"REUSE" if cached else "DONE"}] {item["name"]}: '
               f'PSNR={values["PSNR"]:.4f}, LPIPS={values["LPIPS"]:.4f}', flush=True)
-    paired = compare(rows)
+    paired = compare(rows,extension=bool(a.extend_tag))
     write_csv(folder/'paired.csv', paired)
     atomic_json(folder/'completed.json', dict(status='completed', generation=generation['fingerprint'],
                 comparisons=paired, limitation='Single GOP/seed screening; input energies may differ across checkpoints and epsilon branches.'))
     print('\nEps Rounds  ExtraDropVsInitial  ExtraDropVsRandom  ExtraLPIPSVsRandom')
+    if a.extend_tag:
+        print('Initial here means the existing epsilon4 round4 strongest candidate, NOT clean video.',flush=True)
     for r in paired:
         print(f'{r["Epsilon"]:3} {r["AdditionalRounds"]:6} '
               f'{r["ExtraDropVsInitial"]:+19.4f} {r["ExtraDropVsRandom"]:+18.4f} '

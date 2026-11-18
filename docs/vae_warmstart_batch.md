@@ -71,3 +71,25 @@ and `completed.json` under the results root. Positive extra PSNR drop and
 positive extra LPIPS mean greater degradation than the matched random input.
 Report both seeds, including negative results. These are held-out model seeds,
 not held-out videos: source-content generalization remains untested.
+
+## Continue the effective attack at the same bound
+
+```powershell
+& '.\exp_flf2v\run_vae_attack_continuation.ps1'
+```
+
+Continues the completed epsilon4 optimizer checkpoint, retaining its controls,
+momentum, fixed initial input and crop schedule. The source batch stays intact;
+the new tag is `vae_continue_eps4_r12_jockey_gop0_v1`. Save total warm-start
+rounds8 and12 (4 and8 further sweeps beyond the already completed round4).
+The bound remains 4/255, alpha0.5/255 and momentum0.8. The source four-round
+checkpoint must reproduce its saved candidate and random pixels exactly.
+
+Two new candidates and their matched random references require four native
+720p codec evaluations. Verified round4 metrics are reused as the baseline.
+In this batch `ExtraDropVsInitial` and `ExtraLPIPSVsInitial` refer to the existing
+**epsilon4 round4 candidate**, not the old epsilon2 initializer or clean video.
+Do not assume later iterations improve the actual codec. Input energy can
+change within the same Linf bound; report it with paired random controls.
+Existing files are preserved even if later candidates are weaker. This remains
+VAE-surrogate optimization accepted by a real codec, not end-to-end GVCC PGD.

@@ -36,13 +36,14 @@ def validate_extension(source, config):
     for key in keys:
         if previous['configuration'][key] != config[key]:
             raise ValueError(f'Continuation setting differs: {key}')
+    source_round = max(previous['configuration']['saved_rounds'])
     with np.load(source/'eps4_optimizer.npz',allow_pickle=False) as z:
-        if int(z['done']) != 4 or str(z['fingerprint'].item()) != previous['fingerprint']:
-            raise ValueError('Expected the original four-round optimizer checkpoint')
+        if int(z['done']) != source_round or str(z['fingerprint'].item()) != previous['fingerprint']:
+            raise ValueError('Optimizer checkpoint does not match the completed source round')
     for kind in ('candidate','random'):
-        matches = [r for r in previous['assets'] if r['name'] == f'eps4_r4_{kind}']
+        matches = [r for r in previous['assets'] if r['name'] == f'eps4_r{source_round}_{kind}']
         if len(matches) != 1 or sha256(source/matches[0]['file']) != matches[0]['sha256']:
-            raise ValueError('Original round-4 asset hash mismatch')
+            raise ValueError('Original final-round asset hash mismatch')
     return previous
 
 
@@ -53,7 +54,8 @@ def main():
     p.add_argument('--initial', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--extend_from', type=Path,
-                   help='Continue epsilon4 from a completed four-round batch, retaining momentum; save rounds4,8,12')
+                   help='Continue epsilon4 from a completed batch, retaining controls and momentum')
+    p.add_argument('--extension_rounds', type=int, nargs='+', default=[8,12])
     a = p.parse_args()
     config = dict(version=1, data_sha256=sha256(a.data), initial_sha256=sha256(a.initial),
                   generator_sha256=sha256(__file__),
@@ -70,8 +72,13 @@ def main():
         if a.extend_from.resolve() == a.output.resolve():
             raise ValueError('Continuation must use a new output directory')
         source = validate_extension(a.extend_from,config)
-        config.update(saved_rounds=[4,8,12],epsilon_pixels=[4],
-                      optimizer_state='continue four-round epsilon4 controls and momentum',
+        source_round = max(source['configuration']['saved_rounds'])
+        if (a.extension_rounds != sorted(set(a.extension_rounds))
+                or min(a.extension_rounds) <= source_round or max(a.extension_rounds) > 64):
+            p.error('Continuation rounds must be increasing, above the source round, and at most 64')
+        config.update(saved_rounds=[source_round]+a.extension_rounds,epsilon_pixels=[4],
+                      source_round=source_round,
+                      optimizer_state=f'continue round{source_round} epsilon4 controls and momentum',
                       source_fingerprint=source['fingerprint'],
                       source_checkpoint_sha256=sha256(a.extend_from/'eps4_optimizer.npz'))
     import hashlib
@@ -129,12 +136,12 @@ def main():
             if not np.isfinite(delta).all() or np.abs(delta).max()*255 > epsilon+.001:
                 raise ValueError(f'Invalid saved input: {name}')
             path = a.output/(name+'.npz')
-            if source is not None and round_id == 4:
+            if source is not None and round_id == config['source_round']:
                 original_row = next(r for r in source['assets'] if r['name'] == name)
                 original_path = a.extend_from/original_row['file']
                 with np.load(original_path,allow_pickle=False) as z:
                     if not np.array_equal(delta,z['delta']):
-                        raise ValueError('Resumed optimizer does not reproduce the round-4 input')
+                        raise ValueError('Resumed optimizer does not reproduce the source checkpoint input')
                 shutil.copy2(original_path,path)
             else:
                 save_npz(path,delta=delta)
@@ -166,8 +173,8 @@ def main():
                     if (controls.shape != (3,3,720,1280) or velocity.shape != controls.shape
                             or not torch.isfinite(controls).all() or not torch.isfinite(velocity).all()):
                         raise ValueError('Invalid saved optimizer tensors')
-                if source is not None and done == 4:
-                    save_pair(4,4,controls)
+                if source is not None and done == config['source_round']:
+                    save_pair(4,config['source_round'],controls)
                 for round_id in range(done,max(config['saved_rounds'])):
                     tick = time.monotonic()
                     gradients = torch.zeros_like(controls)

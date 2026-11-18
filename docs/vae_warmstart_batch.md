@@ -93,3 +93,20 @@ Do not assume later iterations improve the actual codec. Input energy can
 change within the same Linf bound; report it with paired random controls.
 Existing files are preserved even if later candidates are weaker. This remains
 VAE-surrogate optimization accepted by a real codec, not end-to-end GVCC PGD.
+
+To continue the completed round12 state to rounds20 and28, without increasing
+the 4/255 bound or resetting momentum:
+
+```powershell
+& '.\exp_flf2v\run_vae_attack_continuation.ps1' `
+    -SourceTag 'vae_continue_eps4_r12_jockey_gop0_v1' `
+    -Tag 'vae_continue_eps4_r28_jockey_gop0_v1' `
+    -TargetRounds @(20,28)
+```
+
+The source checkpoint's final round is read from its completed generation
+report and checked against the optimizer. In this run the comparison baseline
+is **round12**, and only four new native codec evaluations are needed. Source
+round12 assets and results are preserved. An interrupted new run resumes with
+the same command. The 20/28 labels count total warm-start refinement sweeps,
+not an additional 20/28 sweeps beyond round12.

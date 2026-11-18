@@ -16,6 +16,7 @@ class ContinuationTest(unittest.TestCase):
         keys = ('data_sha256','initial_sha256','vae_path','vae_size','geometry','crop','stride',
                 'anchors','alpha_pixel','momentum','seed','schedule_offset','objective','parameterization','boundary')
         config = dict.fromkeys(keys,'same')
+        config['saved_rounds'] = [1,4]
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp)
             items = []
@@ -30,10 +31,16 @@ class ContinuationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'differs: momentum'):
                 validate_extension(source,dict(config,momentum='changed'))
             np.savez(source/'eps4_optimizer.npz',done=8,fingerprint='old')
-            with self.assertRaisesRegex(ValueError,'four-round'):
+            with self.assertRaisesRegex(ValueError,'completed source round'):
                 validate_extension(source,config)
 
     def test_four_new_native_runs_and_resume(self):
+        self._check_native_runs(4,(8,12))
+
+    def test_round12_to20_and28_native_runs_and_resume(self):
+        self._check_native_runs(12,(20,28))
+
+    def _check_native_runs(self,source_round,target_rounds):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ckpt = root/'ckpt'
@@ -43,6 +50,8 @@ class ContinuationTest(unittest.TestCase):
                 f.write_bytes(b'fake')
             source_assets = root/'old_assets'
             source_assets.mkdir()
+            (source_assets/'generation.json').write_text(json.dumps(dict(status='completed',
+                configuration=dict(saved_rounds=[source_round]))))
             source_eval = root/'old_evaluation'
             source_eval.mkdir()
             script = Path(batch.__file__).with_name('run_flf2v_experiment.py').resolve()
@@ -51,7 +60,7 @@ class ContinuationTest(unittest.TestCase):
                 path.write_text(json.dumps(dict(per_frame_PSNR_dB=[psnr]*33,LPIPS=.2,
                     input_MSE=.0001,input_Linf_pixel=4.,BPP=.01,reconstruction_vs_submitted_PSNR_dB=psnr)))
             for kind in ('candidate','random'):
-                name = 'eps4_r4_'+kind
+                name = f'eps4_r{source_round}_'+kind
                 f = source_assets/(name+'.npz')
                 f.write_bytes(name.encode())
                 metrics = root/('old_'+name)/'Jockey/gop0/metrics.json'
@@ -60,7 +69,8 @@ class ContinuationTest(unittest.TestCase):
                 (source_eval/(name+'.json')).write_text(json.dumps(dict(metrics_sha256=batch.sha256(metrics),
                     configuration=dict(asset=batch.sha256(f),script=batch.sha256(script),command=cmd))))
             argv = ['batch','--data',str(data),'--initial',str(initial),'--wan_ckpt',str(ckpt),
-                    '--results_root',str(root),'--extend_tag','old','--tag','new']
+                    '--results_root',str(root),'--extend_tag','old','--tag','new',
+                    '--extension_rounds',*map(str,target_rounds)]
             launches = []
             def launch(cmd,check):
                 if 'generate_vae_warmstart.py' in cmd[1]:
@@ -68,7 +78,7 @@ class ContinuationTest(unittest.TestCase):
                     assets = root/'new_assets'
                     assets.mkdir(exist_ok=True)
                     rows = [dict(name='initial',kind='initial')]
-                    for r in (4,8,12):
+                    for r in (source_round,*target_rounds):
                         for kind in ('candidate','random'):
                             name = f'eps4_r{r}_{kind}'
                             path = assets/(name+'.npz')
@@ -86,7 +96,7 @@ class ContinuationTest(unittest.TestCase):
                 batch.main()
                 self.assertEqual(len(launches),4)
                 result = json.loads((root/'new_evaluation/completed.json').read_text())
-                self.assertEqual(result['comparisons'][0]['Baseline'],'eps4_r4_candidate')
+                self.assertEqual(result['comparisons'][0]['Baseline'],f'eps4_r{source_round}_candidate')
                 self.assertEqual(result['comparisons'][0]['ExtraDropVsInitial'],1.)
                 batch.main()
                 self.assertEqual(len(launches),4)

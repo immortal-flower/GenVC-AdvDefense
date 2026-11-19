@@ -50,6 +50,7 @@ def main():
     p.add_argument('--wan_ckpt', type=Path, required=True)
     p.add_argument('--results_root', type=Path, default=Path('exp_flf2v/results_720p'))
     p.add_argument('--source_tag', default='vae_warmstart_jockey_gop0_v1')
+    p.add_argument('--source_round', type=int, default=4)
     p.add_argument('--tag', default='vae_warmstart_eps4_r4_heldout_v1')
     p.add_argument('--plan_only', action='store_true')
     a = p.parse_args()
@@ -68,11 +69,11 @@ def main():
         raise ValueError('Source video changed; fixed-candidate validation requires the original Jockey input')
     selected = {}
     for kind in ('candidate','random'):
-        entries = [r for r in generation['assets'] if r['name'] == 'eps4_r4_'+kind]
+        entries = [r for r in generation['assets'] if r['name'] == f'eps4_r{a.source_round}_'+kind]
         if len(entries) != 1:
             raise ValueError(f'Expected one frozen {kind} asset')
         item = entries[0]
-        if item['epsilon'] != 4 or item['round'] != 4 or item['input_Linf_pixel'] > 4.001:
+        if item['epsilon'] != 4 or item['round'] != a.source_round or item['input_Linf_pixel'] > 4.001:
             raise ValueError('Unexpected selected candidate settings')
         path = assets/item['file']
         if path.resolve().parent != assets.resolve() or sha256(path) != item['sha256']:
@@ -80,7 +81,7 @@ def main():
         selected[kind] = item
     if abs(selected['candidate']['input_MSE']-selected['random']['input_MSE']) > 1e-9:
         raise ValueError('Source pair is not energy matched')
-    print('Frozen eps4/r4 candidate and paired random; seeds 123,2026; clean/candidate/random = 6 native runs.', flush=True)
+    print(f'Frozen eps4/r{a.source_round} candidate and paired random; seeds 123,2026; clean/candidate/random = 6 native runs.', flush=True)
     print('No new candidate generation. Every case uses fresh normal 720p encoding and decoding.', flush=True)
     if a.plan_only:
         return
@@ -95,7 +96,7 @@ def main():
     config = dict(source_generation_sha256=sha256(generation_path),
         source_fingerprint=generation['fingerprint'], selected=selected, seeds=[123,2026],
         source_path=str(a.data.resolve()), checkpoint=str(a.wan_ckpt.resolve()), code=code_hashes,
-        protocol='fixed eps4/r4; no held-out optimization; normal 720p33 re-encoding',
+        protocol=f'fixed eps4/r{a.source_round}; no held-out optimization; normal 720p33 re-encoding',
         codec='M64 K16384 steps20 tail3 g3 CompressAI-q4')
     digest = hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest()
     manifest = folder/'protocol.json'

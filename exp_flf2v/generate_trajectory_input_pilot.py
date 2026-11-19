@@ -86,7 +86,10 @@ def main():
                    help='Replay one trajectory step at a time for the RGB VJP')
     p.add_argument('--direction_audit_from', type=str,
                    help='Replay +/-0.5 and +/-1 pixel steps from a completed one-update checkpoint')
+    p.add_argument('--audit_random_directions', type=int, default=0)
     a = p.parse_args()
+    if a.audit_random_directions < 0 or (a.audit_random_directions and not a.direction_audit_from):
+        p.error('Random audit directions require direction_audit_from and a nonnegative count')
     final_rgb = a.objective == 'final-rgb'
     if a.stepwise_backward and not final_rgb:
         p.error('Stepwise backward requires final-rgb')
@@ -106,6 +109,8 @@ def main():
     report_path = out / 'generation.json'
     checkpoint = out / 'optimizer_checkpoint.npz'
     config = vars(a) | dict(data_sha256=digest(a.data), init_sha256=digest(a.initial_attack_file), version=1)
+    if not a.audit_random_directions:
+        del config['audit_random_directions']
     if not a.stepwise_backward:
         del config['stepwise_backward']
     audit_source = None
@@ -322,12 +327,27 @@ def main():
                     original, reproduced, saved['delta'], 'Recovered candidate')
             cases = [('initial', 0.), ('positive_half', .5), ('negative_half', -.5),
                      ('positive_one', 1.), ('negative_one', -1.)]
+            directions = {name: direction for name, _ in cases}
+            if a.audit_random_directions:
+                for magnitude in (.25, 2.):
+                    for sign, label in ((1, 'positive'), (-1, 'negative')):
+                        name = f'{label}_step{magnitude}'
+                        cases.append((name, sign * magnitude))
+                        directions[name] = direction
+                for k in range(a.audit_random_directions):
+                    rng = torch.Generator(device='cpu').manual_seed(a.seed + 20000 + k)
+                    random_direction = (torch.randint(0, 2, direction.shape, generator=rng) * 2 - 1).to(direction)
+                    for magnitude in (.25, .5, 1., 2.):
+                        for sign, label in ((1, 'plus'), (-1, 'minus')):
+                            name = f'random{k}_{label}_step{magnitude}'
+                            cases.append((name, sign * magnitude))
+                            directions[name] = random_direction
             report.update(kind='fixed_initialization_direction_audit', direction_reproduces_candidate=True,
                           source_accepted_step_pixel=accepted_step, rows=[], asset_sha256={},
                           input_equality_domain='codec-submitted uint8 RGB', replay_check=replay_check)
             for name, step in cases:
                 tick = time.monotonic()
-                c = direction * (step / 255)
+                c = directions[name] * (step / 255)
                 with torch.no_grad():
                     delta = (pixels(c) - rgb).permute(0, 2, 3, 1).cpu().numpy()
                 boundary_check = assert_same_submitted_pixels(
@@ -340,7 +360,7 @@ def main():
                     with np.load(audit_source / 'initial.npz', allow_pickle=False) as saved:
                         assert_same_submitted_pixels(original, delta, saved['delta'], 'Initial frames')
                     reuse_variant = 'initial'
-                elif step == accepted_step:
+                elif step == accepted_step and not name.startswith('random'):
                     reuse_variant = 'candidate'
                 if reuse_variant:
                     shutil.copyfile(audit_source / (reuse_variant + '.npz'), path)
@@ -348,7 +368,7 @@ def main():
                     np.savez_compressed(path, delta=delta)
                 if step == 0:
                     score = source_report['initial_score']
-                elif step == accepted_step:
+                elif step == accepted_step and not name.startswith('random'):
                     score = source_report['final_score']
                 else:
                     score, _ = evaluate(c)

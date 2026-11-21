@@ -308,11 +308,18 @@ def main():
         # converted without repeating codebook search.
         pipe.save_compressed(clean_step_data, str(canonical_clean))
     else:
-        if clean_codebook.read_bytes()[:4] != b"TDCM":
-            raise ValueError(
-                "index-bitflip baseline requires a legacy TDCM clean stream"
-            )
-        shutil.copy2(clean_codebook, canonical_clean)
+        if clean_codebook.read_bytes()[:4] == b"TDCM":
+            shutil.copy2(clean_codebook, canonical_clean)
+        else:
+            TurboBitstream.save(str(canonical_clean), clean_step_data,
+                **{key: loaded[key] for key in (
+                    "K", "M", "num_sde_steps", "num_ddim_steps", "num_latent_frames",
+                    "seed", "frame_shape", "prompt", "num_frames", "height", "width")},
+                index_coding="fixed-width")
+            restored = TurboBitstream.load(str(canonical_clean))
+            if restored["step_data"] != clean_step_data:
+                raise ValueError("Lossless fixed-width conversion failed")
+            print("[BASELINE] Converted TDC2 to TDCM; identical indices and signs verified.")
 
     for index, (job, row) in enumerate(zip(jobs, manifest_rows), start=1):
         if row["status"] == "complete":

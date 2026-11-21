@@ -258,13 +258,16 @@ class TurboBitstream:
         frame_shape: Tuple[int, ...],
         prompt: str = "",
         num_frames: int = 81, height: int = 480, width: int = 832,
+        index_coding: str = "combinatorial",
     ):
         """Save compressed Turbo-DDCM bitstream.
 
         Args:
             step_data: [sde_step][frame] = (indices, signs)
         """
-        data = bytearray(b"TDC2")  # combinatorial-index format
+        if index_coding not in ("combinatorial", "fixed-width"):
+            raise ValueError("Unsupported index coding")
+        data = bytearray(b"TDC2" if index_coding == "combinatorial" else b"TDCM")
         prompt_b = prompt.encode("utf-8")
 
         # Header: 10 uint32 values
@@ -285,9 +288,15 @@ class TurboBitstream:
                 if len(signs) != m_actual:
                     raise ValueError("Each selected index must have one sign")
                 data.extend(struct.pack("<H", m_actual))
-                rank = rank_combination(indices, K)
-                rank_bytes = (combinatorial_index_bits(K, m_actual) + 7) // 8
-                data.extend(rank.to_bytes(rank_bytes, "little"))
+                if index_coding == "combinatorial":
+                    rank = rank_combination(indices, K)
+                    rank_bytes = (combinatorial_index_bits(K, m_actual) + 7) // 8
+                    data.extend(rank.to_bytes(rank_bytes, "little"))
+                else:
+                    for index in indices:
+                        if not 0 <= index < K:
+                            raise ValueError("Index outside codebook")
+                        data.extend(struct.pack("<H" if K <= 65536 else "<I", index))
                 sb = bytearray((m_actual + 7) // 8)
                 for j, s in enumerate(signs):
                     if s > 0:

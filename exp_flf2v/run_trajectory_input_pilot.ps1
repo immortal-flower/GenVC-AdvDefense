@@ -24,6 +24,8 @@ param(
     [switch]$VaeCpuActivations,
     [switch]$StepwiseBackward,
     [switch]$GenerateOnly,
+    [ValidatePattern('^[A-Za-z0-9_-]*$')]
+    [string]$TagSuffix = '',
     [switch]$PlanOnly
 )
 $ErrorActionPreference = 'Stop'
@@ -59,6 +61,7 @@ if ($StepwiseBackward) {
     $tag += '_stepvjp'
     $memoryArgs += '--stepwise_backward'
 }
+if ($TagSuffix) { $tag += "_$TagSuffix" }
 $assets = Join-Path $OutputRoot "${tag}_assets"
 foreach ($p in @($Python, $Data, $InitialAttack, (Join-Path $WanCkpt 'Wan2.1_VAE.pth'))) {
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "Missing: $p" }

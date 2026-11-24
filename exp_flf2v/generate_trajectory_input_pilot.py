@@ -111,6 +111,8 @@ def main():
     report_path = out / 'generation.json'
     checkpoint = out / 'optimizer_checkpoint.npz'
     config = vars(a) | dict(data_sha256=digest(a.data), init_sha256=digest(a.initial_attack_file), version=1)
+    if os.environ.get('GVCC_REF_CODEC_DEVICE'):
+        config['reference_codec_device'] = os.environ['GVCC_REF_CODEC_DEVICE']
     if not a.vae_decode_cpu:
         del config['vae_decode_cpu']
     if not a.audit_random_directions:
@@ -235,7 +237,9 @@ def main():
             small = F.interpolate(value, (a.height, a.width), mode='bilinear', align_corners=False, antialias=True)
             return model.vae.encode([(small * 2 - 1).permute(1, 0, 2, 3)])[0].float().unsqueeze(0)
         with torch.no_grad():
+            print('[INIT] Encoding full input video with VAE', flush=True)
             reference = encode(rgb).to('cuda:0')
+            print('[INIT] Input latent ready', flush=True)
         initial_state = torch.randn(reference.shape, generator=torch.Generator(device='cpu').manual_seed(a.seed)).to('cuda:0')
         schedule = shifted_timesteps(20, shift=model.flow_shift, device='cpu').tolist()
         times = schedule if final_rgb else schedule[:a.rollout_steps + 1]
@@ -255,6 +259,8 @@ def main():
                 backward_steps=a.backward_steps if grad else 0,
                 predict_grad=lambda x, t: model.predict_velocity_with_grad(x, t, embeds, cond),
                 correct_grad=lambda r, s, f: correction(book, r, s, f, a.pool_size),
+                state_callback=lambda step, _: print(f'[FORWARD] completed step {step}/20', flush=True)
+                    if step % 5 == 0 else None,
             )
 
         def decoded_score(state):

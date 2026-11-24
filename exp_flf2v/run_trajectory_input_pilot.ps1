@@ -85,7 +85,7 @@ New-Item -ItemType Directory -Path $assets -Force | Out-Null
 $savedErrorAction = $ErrorActionPreference
 # Windows PowerShell 5.1 wraps native stderr as ErrorRecord, including warnings.
 $ErrorActionPreference = 'Continue'
-& $Python -X faulthandler -u '.\exp_flf2v\generate_trajectory_input_pilot.py' `
+& $Python -X faulthandler -u '.\exp_flf2v\run_python_logged.py' '.\exp_flf2v\generate_trajectory_input_pilot.py' `
     --data $Data --wan_ckpt $WanCkpt --initial_attack_file $InitialAttack `
     --output_dir $assets --iterations $Iterations --rollout_steps $RolloutSteps `
     --objective $Objective --backward_steps $BackwardSteps --epsilon $Epsilon --alpha $alphaArg `

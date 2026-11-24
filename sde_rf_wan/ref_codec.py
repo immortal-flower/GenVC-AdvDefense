@@ -16,6 +16,7 @@ Usage:
 """
 
 import io
+import os
 import struct
 import torch
 import numpy as np
@@ -48,7 +49,7 @@ _compressai_cache = {}  # model cache to avoid reloading
 
 
 def _get_compressai_model(model_name: str, quality: int, device: str = "cuda"):
-    key = (model_name, quality)
+    key = (model_name, quality, str(torch.device(device)))
     if key not in _compressai_cache:
         from compressai.zoo import models
         net = models[model_name](quality=quality, pretrained=True).eval().to(device)
@@ -169,7 +170,7 @@ def compress_ref(image: Image.Image, codec: str = "compressai", **kwargs):
     elif codec == "compressai":
         model_name = kwargs.get("model_name", "cheng2020-attn")
         quality = kwargs.get("quality", 4)
-        device = kwargs.get("device", "cuda")
+        device = kwargs.get("device", os.environ.get('GVCC_REF_CODEC_DEVICE', 'cuda'))
         return compress_ref_compressai(image, model_name, quality, device)
     else:
         raise ValueError(f"Unknown codec: {codec}")
@@ -182,7 +183,7 @@ def decompress_ref(data: bytes, codec: str = "compressai", **kwargs) -> Image.Im
     elif codec == "compressai":
         model_name = kwargs.get("model_name", "cheng2020-attn")
         quality = kwargs.get("quality", 4)
-        device = kwargs.get("device", "cuda")
+        device = kwargs.get("device", os.environ.get('GVCC_REF_CODEC_DEVICE', 'cuda'))
         return decompress_ref_compressai(data, model_name, quality, device)
     else:
         raise ValueError(f"Unknown codec: {codec}")

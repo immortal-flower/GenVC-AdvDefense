@@ -83,6 +83,8 @@ def parse_args():
         choices=["rank-bitflip", "index-bitflip"],
     )
     parser.add_argument("--attack_count", type=int, default=1)
+    parser.add_argument("--attack_counts", type=int, nargs='+',
+                        help="Optional multi-budget sweep with one shared model load")
     parser.add_argument(
         "--rank_regions", nargs="+", default=["low", "middle", "high"],
         choices=["low", "middle", "high"],
@@ -199,10 +201,11 @@ def main():
 
     output_dir = Path(args.output_dir)
     cells = load_cells(args.plan)
-    jobs = expand_jobs(
-        cells, args.rank_regions, args.attack_seeds,
-        args.attack_mode, args.attack_count,
-    )
+    counts = args.attack_counts or [args.attack_count]
+    if min(counts) < 1 or len(set(counts)) != len(counts):
+        raise ValueError('Budgets must be positive and distinct')
+    jobs = [job for count in counts for job in expand_jobs(
+        cells, args.rank_regions, args.attack_seeds, args.attack_mode, count)]
     gop_tag = "" if args.gop_index == 0 else f"_gop{args.gop_index}"
     sequence_tag = args.sequence.lower()
     if args.attack_mode == "rank-bitflip":
@@ -214,6 +217,8 @@ def main():
         experiment_tag = "tdcm_index"
     else:
         experiment_tag = f"tdcm_index{args.attack_count}"
+    if args.attack_counts:
+        experiment_tag += '_budgets' + '-'.join(map(str, counts))
     manifest_path = output_dir / (
         f"{experiment_tag}_manifest_{sequence_tag}{gop_tag}.csv"
     )

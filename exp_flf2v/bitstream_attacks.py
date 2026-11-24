@@ -532,18 +532,28 @@ def apply_serialized_codebook_attack(input_path, output_path, attack, rate=0.0,
     examples = []
     occupied = {key: set(values) for key, values in layout['frame_indices'].items()}
     changed_symbols = 0
-    for entry, bit, new_rank in chosen_rank:
+    grouped_rank = {}
+    for entry, bit, _ in chosen_rank:
+        key = (entry['step'], entry['frame'])
+        grouped_rank.setdefault(key, (entry, []))[1].append(bit)
+    for entry, bits in grouped_rank.values():
+        new_rank = entry['rank']
+        for bit in bits:
+            new_rank ^= 1 << bit
+        if new_rank >= math.comb(layout['K'], entry['m_actual']):
+            raise ValueError('Joint rank flips produce invalid rank; no decode performed')
         old_indices = entry['indices']
         new_indices = unrank_combination(new_rank, layout['K'], entry['m_actual'])
         removed = sorted(set(old_indices) - set(new_indices))
         added = sorted(set(new_indices) - set(old_indices))
         replaced = len(removed)
         changed_symbols += replaced
-        byte_offset = entry['rank_offset'] + bit // 8
-        raw[byte_offset] ^= 1 << (bit % 8)
+        for bit in bits:
+            byte_offset = entry['rank_offset'] + bit // 8
+            raw[byte_offset] ^= 1 << (bit % 8)
         if len(examples) < 20:
             examples.append(dict(
-                step=entry['step'], frame=entry['frame'], flipped_bit=bit,
+                step=entry['step'], frame=entry['frame'], flipped_bit=(bits[0] if len(bits)==1 else bits),
                 rank_region=rank_region, old_rank=entry['rank'], new_rank=new_rank,
                 replaced_atoms=replaced, shared_atoms=entry['m_actual'] - replaced,
                 removed_indices=removed, added_indices=added,

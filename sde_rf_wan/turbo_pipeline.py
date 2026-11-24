@@ -343,7 +343,13 @@ class TurboDDCMWanPipeline:
     # Bitstream I/O
     # ==================================================================
 
-    def save_compressed(self, step_data, filepath: str, prompt: str = ""):
+    def save_compressed(
+        self,
+        step_data,
+        filepath: str,
+        prompt: str = "",
+        index_coding: str = "combinatorial",
+    ):
         """Save step_data to binary file."""
         TurboBitstream.save(
             filepath, step_data,
@@ -352,6 +358,7 @@ class TurboDDCMWanPipeline:
             self.num_latent_frames, self.seed,
             self.frame_shape, prompt,
             self.num_frames, self.height, self.width,
+            index_coding=index_coding,
         )
 
     def load_and_decode(self, filepath: str) -> List[Image.Image]:

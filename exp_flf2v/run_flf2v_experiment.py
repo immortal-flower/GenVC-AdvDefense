@@ -35,7 +35,7 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _project_root)
 from sde_rf_wan.wan_flf2v_wrapper import WanFLF2VWrapper
 from sde_rf_wan.turbo_pipeline import TurboDDCMWanPipeline
-from sde_rf_wan.turbo_codebook import TurboBitstream
+from sde_rf_wan.turbo_codebook import TurboBitstream, combinatorial_index_bits
 from sde_rf_wan.sde_convert import velocity_to_score, diffusion_coeff, sde_drift
 from sde_rf_wan.ref_codec import compress_ref
 from uvg_data import find_uvg_sequences as find_uvg_sequences_shared
@@ -149,6 +149,71 @@ def compute_lpips(orig, recon, device="cuda:1", loss_fn=None):
         loss_fn.to("cpu")
     torch.cuda.empty_cache()
     return sum(vals) / len(vals)
+
+def _canonical_step_data(step_data):
+    """Convert tensor/numpy/list payloads to comparable Python integers."""
+    canonical = []
+    for step in step_data:
+        frames = []
+        for indices, signs in step:
+            if hasattr(indices, "tolist"):
+                indices = indices.tolist()
+            if hasattr(signs, "tolist"):
+                signs = signs.tolist()
+            frames.append(([int(v) for v in indices], [int(v) for v in signs]))
+        canonical.append(frames)
+    return canonical
+
+def save_rate_comparison_streams(pipe, step_data, gop_dir):
+    """Serialize one trajectory both ways and verify exact round trips."""
+    combinatorial_path = gop_dir / "codebook_combinatorial.tdc2"
+    independent_path = gop_dir / "codebook_independent.tdcm"
+    pipe.save_compressed(
+        step_data, str(combinatorial_path), index_coding="combinatorial")
+    pipe.save_compressed(
+        step_data, str(independent_path), index_coding="fixed-width")
+
+    combinatorial_data = TurboBitstream.load(str(combinatorial_path))
+    independent_data = TurboBitstream.load(str(independent_path))
+    source = _canonical_step_data(step_data)
+    if (source != _canonical_step_data(combinatorial_data["step_data"]) or
+            source != _canonical_step_data(independent_data["step_data"])):
+        raise RuntimeError("Independent/combinatorial bitstream round-trip mismatch")
+
+    independent_index_bits = pipe.codebook.bits_per_index
+    combinatorial_bits = 0
+    independent_bits = 0
+    entry_count = 0
+    symbol_count = 0
+    for step in source:
+        for indices, signs in step:
+            m_actual = len(indices)
+            if len(signs) != m_actual:
+                raise RuntimeError("Index/sign count mismatch in encoded trajectory")
+            combinatorial_bits += combinatorial_index_bits(pipe.K, m_actual) + m_actual
+            independent_bits += m_actual * independent_index_bits + m_actual
+            entry_count += 1
+            symbol_count += m_actual
+
+    combinatorial_bytes = combinatorial_path.stat().st_size
+    independent_bytes = independent_path.stat().st_size
+    return combinatorial_data["step_data"], {
+        "rate_comparison_version": 1,
+        "rate_roundtrip_verified": True,
+        "rate_entry_count": entry_count,
+        "rate_symbol_count": symbol_count,
+        "combinatorial_codebook_bits": combinatorial_bits,
+        "independent_codebook_bits": independent_bits,
+        "codebook_saving_percent": round(
+            100.0 * (1.0 - combinatorial_bits / independent_bits), 6),
+        "combinatorial_container_bytes": combinatorial_bytes,
+        "independent_container_bytes": independent_bytes,
+        "container_saving_percent": round(
+            100.0 * (1.0 - combinatorial_bytes / independent_bytes), 6),
+        "combinatorial_stream": combinatorial_path.name,
+        "independent_stream": independent_path.name,
+        "independent_bits_per_index": independent_index_bits,
+    }
 
 def save_video_mp4(frames, path, fps=16):
     # MP4 仅用于查看结果；指标在保存前的内存帧上计算，MP4 有额外有损误差。
@@ -1052,6 +1117,16 @@ def main():
                       f"residual_symbols={stream_attack_metadata['changed_symbols']}, "
                       f"payload_BER={stream_attack_metadata['payload_BER']:.8f}")
 
+            # Clean rate experiment: write the exact same selected trajectory
+            # with both index codings.  Decode from the reloaded TDC2 payload,
+            # while asserting that TDC2 and legacy independent TDCM recover
+            # identical indices and signs.
+            rate_comparison = {}
+            if (args.attack == "none" and args.defense == "none" and
+                    args.stream_attack == "none" and args.stream_defense == "none"):
+                decode_step_data, rate_comparison = save_rate_comparison_streams(
+                    pipe, step_data, gop_dir)
+
             # 编码阶段结束后释放条件和真值潜变量，给解码阶段留显存。
             del flf2v_cond
             if x0_true is not None:
@@ -1132,6 +1207,30 @@ def main():
             gop_total_bytes = (gop_total_bits + 7) // 8
             # bit / (原 RGB 视频的总像素数)，分母是 33×720×1280，不是潜空间大小。
             bpp = gop_total_bits / (FPG * HEIGHT * WIDTH)
+            if rate_comparison:
+                combination_total_bits = (
+                    rate_comparison["combinatorial_codebook_bits"] +
+                    gop_boundary_bytes * 8)
+                independent_total_bits = (
+                    rate_comparison["independent_codebook_bits"] +
+                    gop_boundary_bytes * 8)
+                rate_comparison.update({
+                    "combinatorial_total_bits": combination_total_bits,
+                    "independent_total_bits": independent_total_bits,
+                    "combinatorial_total_BPP": round(
+                        combination_total_bits / (FPG * HEIGHT * WIDTH), 9),
+                    "independent_total_BPP": round(
+                        independent_total_bits / (FPG * HEIGHT * WIDTH), 9),
+                    "total_bitrate_saving_percent": round(
+                        100.0 * (1.0 - combination_total_bits /
+                                 independent_total_bits), 6),
+                    "combinatorial_serialized_total_bytes": (
+                        rate_comparison["combinatorial_container_bytes"] +
+                        gop_boundary_bytes),
+                    "independent_serialized_total_bytes": (
+                        rate_comparison["independent_container_bytes"] +
+                        gop_boundary_bytes),
+                })
             
             # 每 GOP 单独保存指标，尤其 per_frame_PSNR_dB 可定位关键帧或局部退化。
             # result 是字典；键如 "PSNR_dB" 供 JSON、汇总脚本读取。
@@ -1158,8 +1257,9 @@ def main():
                 "encode_seconds": round(t_enc, 3),
                 "decode_seconds": round(t_dec, 3),
             }
-            gop_results.append(result)
+            result.update(rate_comparison)
             result.update(input_reference_metrics)
+            gop_results.append(result)
             # 每个 gopN/metrics.json 记录整 GOP 平均指标与逐帧 PSNR。
             with open(gop_dir / "metrics.json", "w") as mf: json.dump(result, mf, indent=2)
 

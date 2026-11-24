@@ -80,12 +80,22 @@ if ($PlanOnly) { return }
 if ($LASTEXITCODE -ne 0) { throw 'Trajectory tests failed; GPU experiment not started' }
 $reportPath = Join-Path $assets 'generation.json'
 $startedUtc = [datetime]::UtcNow
-& $Python '.\exp_flf2v\generate_trajectory_input_pilot.py' `
+$pythonLog = Join-Path $assets 'python_console.log'
+New-Item -ItemType Directory -Path $assets -Force | Out-Null
+$savedErrorAction = $ErrorActionPreference
+# Windows PowerShell 5.1 wraps native stderr as ErrorRecord, including warnings.
+$ErrorActionPreference = 'Continue'
+& $Python -X faulthandler -u '.\exp_flf2v\generate_trajectory_input_pilot.py' `
     --data $Data --wan_ckpt $WanCkpt --initial_attack_file $InitialAttack `
     --output_dir $assets --iterations $Iterations --rollout_steps $RolloutSteps `
     --objective $Objective --backward_steps $BackwardSteps --epsilon $Epsilon --alpha $alphaArg `
-    --height $ProxyHeight --width $ProxyWidth @gridArgs @memoryArgs
-if ($LASTEXITCODE -ne 0) {
+    --height $ProxyHeight --width $ProxyWidth @gridArgs @memoryArgs 2>&1 |
+    Tee-Object -FilePath $pythonLog
+$generationExitCode = $LASTEXITCODE
+$ErrorActionPreference = $savedErrorAction
+@{ exit_code=$generationExitCode; exit_hex=('0x{0:X8}' -f [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$generationExitCode),0)); console_log=$pythonLog; finished_utc=[datetime]::UtcNow.ToString('o') } |
+    ConvertTo-Json | Set-Content -LiteralPath (Join-Path $assets 'process_exit.json') -Encoding UTF8
+if ($generationExitCode -ne 0) {
     $failedReport = $null
     if ((Test-Path -LiteralPath $reportPath -PathType Leaf) -and
         ((Get-Item -LiteralPath $reportPath).LastWriteTimeUtc -ge $startedUtc)) {
@@ -94,7 +104,7 @@ if ($LASTEXITCODE -ne 0) {
     if ($failedReport.status -eq 'failed' -and $failedReport.error -match '\bCUDA out of memory\b') {
         throw [System.OutOfMemoryException]::new("Candidate CUDA OOM: $($failedReport.error)")
     }
-    throw 'Candidate generation failed. Resume with the same command after fixing the error.'
+    throw "Candidate generation failed, exit=$generationExitCode. See $pythonLog and process_exit.json; diagnose before retrying."
 }
 $report = Get-Content -Raw -LiteralPath $reportPath | ConvertFrom-Json
 if ($report.status -ne 'completed') { throw 'Incomplete generation' }

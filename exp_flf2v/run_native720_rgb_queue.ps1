@@ -9,7 +9,7 @@ $entry=@($g.assets | Where-Object name -eq 'eps4_r44_candidate')
 if($g.status -ne 'completed' -or $entry.Count -ne 1){throw 'Expected completed r44 candidate'}
 $initial=Join-Path $sourceAssets $entry[0].file
 if((Get-FileHash -LiteralPath $initial).Hash -ne $entry[0].sha256){throw 'r44 input hash mismatch'}
-$tag='trajectory_rgb_jockey_gop0_eps4_seed42_b6_p1_a0p5_h720w1280_grid128x224_m20GiB_16GiB_vaecpu_stepvjp_decodecpu_r44_native_v2'
+$tag='trajectory_rgb_jockey_gop0_eps4_seed42_b6_p1_a0p5_h720w1280_grid128x224_m20GiB_16GiB_vaecpu_stepvjp_decodecpu_r44_native_v3'
 Start-Transcript '.\native720_rgb_queue.log' -Append
 try {
     # Complete 720p forward, one update through final 6 steps, then native acceptance.
@@ -19,7 +19,7 @@ try {
         -BackwardSteps 6 -Iterations 1 -ProxyHeight 720 -ProxyWidth 1280 `
         -Gpu0Memory 20GiB -Gpu1Memory 16GiB `
         -VaeCpuActivations -VaeDecodeCpu -StepwiseBackward -GridRandom `
-        -TagSuffix r44_native_v2
+        -TagSuffix r44_native_v3
     # Even if the candidate fails the proxy gate, evaluate signed directions.
     & '.\exp_flf2v\run_rgb_direction_calibration.ps1' `
         -Python $Python -OutputRoot $root -SourceTag $tag

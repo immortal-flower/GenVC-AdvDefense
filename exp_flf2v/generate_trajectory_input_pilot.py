@@ -277,11 +277,20 @@ def main():
             # Never hold the VAE decoder and the DiT suffix graphs at once.
             with torch.no_grad():
                 hard_end, _ = terminal(latent_value)
-            end_leaf = hard_end.detach().requires_grad_(True)
+            # Keep CPU decoder autograd entirely on CPU, then transfer only its
+            # small latent gradient back to the GPU trajectory. No CPU<->CUDA
+            # CopyBackward or save_on_cpu hook is needed for this decoder graph.
+            end_leaf = hard_end.detach().to('cpu' if a.vae_decode_cpu else hard_end.device).requires_grad_(True)
             print('[BACKWARD] VAE decoder RGB gradient', flush=True)
-            with vae_saved_tensor_context():
+            if a.vae_decode_cpu:
+                np.savez_compressed(out/'decoder_probe.npz',
+                    latent=end_leaf.detach().cpu().numpy(),
+                    reference=rgb_reference.detach().cpu().numpy())
+                print('[BACKWARD] Saved decoder_probe.npz before CPU backward', flush=True)
+            with (nullcontext() if a.vae_decode_cpu else vae_saved_tensor_context()):
                 score = decoded_score(end_leaf)
             end_grad, = torch.autograd.grad(score, end_leaf)
+            end_grad = end_grad.to(hard_end.device)
             del score, end_leaf
             if not torch.isfinite(end_grad).all() or not torch.any(end_grad):
                 raise RuntimeError('Final RGB gradient is zero or non-finite')

@@ -30,6 +30,7 @@ try {
     $extra = @()
     if ($cfg.vae_cpu_activations) { $extra += '--vae_cpu_activations' }
     if ($cfg.stepwise_backward) { $extra += '--stepwise_backward' }
+    if ($cfg.vae_decode_cpu) { $extra += '--vae_decode_cpu' }
     & $Python '.\exp_flf2v\generate_trajectory_input_pilot.py' `
         --data $cfg.data --wan_ckpt $cfg.wan_ckpt `
         --initial_attack_file $cfg.initial_attack_file --output_dir $assets `

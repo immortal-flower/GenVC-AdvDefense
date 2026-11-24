@@ -84,6 +84,8 @@ def main():
                    help='Keep VAE autograd saved tensors in host RAM, not on the GPU')
     p.add_argument('--stepwise_backward', action='store_true',
                    help='Replay one trajectory step at a time for the RGB VJP')
+    p.add_argument('--vae_decode_cpu', action='store_true',
+                   help='Full-resolution VAE RGB decoder forward/backward on CPU; no tiling')
     p.add_argument('--direction_audit_from', type=str,
                    help='Replay +/-0.5 and +/-1 pixel steps from a completed one-update checkpoint')
     p.add_argument('--audit_random_directions', type=int, default=0)
@@ -109,6 +111,8 @@ def main():
     report_path = out / 'generation.json'
     checkpoint = out / 'optimizer_checkpoint.npz'
     config = vars(a) | dict(data_sha256=digest(a.data), init_sha256=digest(a.initial_attack_file), version=1)
+    if not a.vae_decode_cpu:
+        del config['vae_decode_cpu']
     if not a.audit_random_directions:
         del config['audit_random_directions']
     if not a.stepwise_backward:
@@ -226,6 +230,8 @@ def main():
         def pixels(c):
             return pixels_from_lift(lift(c))
         def encode(value):
+            model.vae.model.to('cuda:1')
+            model.vae.scale = [v.to('cuda:1') for v in model.vae.scale]
             small = F.interpolate(value, (a.height, a.width), mode='bilinear', align_corners=False, antialias=True)
             return model.vae.encode([(small * 2 - 1).permute(1, 0, 2, 3)])[0].float().unsqueeze(0)
         with torch.no_grad():
@@ -252,9 +258,15 @@ def main():
             )
 
         def decoded_score(state):
-            video = model.vae.decode([state[0].to('cuda:1')])[0]
+            decoder_device = 'cpu' if a.vae_decode_cpu else 'cuda:1'
+            model.vae.model.to(decoder_device)
+            model.vae.scale = [v.to(decoder_device) for v in model.vae.scale]
+            if a.vae_decode_cpu:
+                gc.collect(); torch.cuda.empty_cache()
+                print('[RGB] Full VAE decode on CPU (no spatial/temporal tiling)', flush=True)
+            video = model.vae.decode([state[0].to(decoder_device)])[0]
             reconstructed = (video.permute(1, 0, 2, 3) / 2 + .5).clamp(0, 1)
-            return rgb_distortion(reconstructed, rgb_reference)
+            return rgb_distortion(reconstructed, rgb_reference.to(decoder_device))
 
         def vae_saved_tensor_context():
             # Scope it to the VAE VJPs; the no-grad forward and DiT are unchanged.

@@ -22,6 +22,7 @@ param(
     [ValidatePattern('^[1-9][0-9]*GiB$')]
     [string]$Gpu1Memory = '20GiB',
     [switch]$VaeCpuActivations,
+    [switch]$VaeDecodeCpu,
     [switch]$StepwiseBackward,
     [switch]$GenerateOnly,
     [ValidatePattern('^[A-Za-z0-9_-]*$')]
@@ -61,6 +62,7 @@ if ($StepwiseBackward) {
     $tag += '_stepvjp'
     $memoryArgs += '--stepwise_backward'
 }
+if ($VaeDecodeCpu) { $tag += '_decodecpu'; $memoryArgs += '--vae_decode_cpu' }
 if ($TagSuffix) { $tag += "_$TagSuffix" }
 $assets = Join-Path $OutputRoot "${tag}_assets"
 foreach ($p in @($Python, $Data, $InitialAttack, (Join-Path $WanCkpt 'Wan2.1_VAE.pth'))) {

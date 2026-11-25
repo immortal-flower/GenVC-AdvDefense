@@ -18,6 +18,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from exp_flf2v.search_native_rgb_input import atomic_json, load_source, sha256
 from exp_flf2v.vae_warmstart_utils import bounded_delta, clipping_audit, crop_starts, quantized_pair, temporal_weights, vae_attack_loss
+from exp_flf2v.vae_temporal_schedule import crop_start
 
 
 def save_npz(path, **arrays):
@@ -72,7 +73,10 @@ def main():
     p.add_argument('--refine',action='store_true',help='Rebase at saved pixels, reset momentum, alpha0.25; use straight-through epsilon-clamp gradient')
     p.add_argument('--direct_rgb',action='store_true',help='Refinement maximizing VAE reconstruction MSE against original input RGB, not clean VAE output')
     p.add_argument('--fresh_rgb_rounds', type=int, nargs='+', help='New standardized source-RGB experiment; zero initializer, epsilon4 only (not the historical r44 recipe)')
+    p.add_argument('--temporal_window',type=int,choices=[5,9,17],default=5)
     a = p.parse_args()
+    if a.temporal_window != 5 and not a.fresh_rgb_rounds:
+        p.error('Long temporal windows require the fresh RGB experiment')
     if a.direct_rgb and not a.fresh_rgb_rounds:
         a.refine = True
     config = dict(version=1, data_sha256=sha256(a.data), initial_sha256=sha256(a.initial),
@@ -92,6 +96,7 @@ def main():
         if a.fresh_rgb_rounds != sorted(set(a.fresh_rgb_rounds)) or min(a.fresh_rgb_rounds)<1 or max(a.fresh_rgb_rounds)>64:
             p.error('Fresh rounds must increase within [1,64]')
         config.update(saved_rounds=a.fresh_rgb_rounds, epsilon_pixels=[4],
+                      temporal_window=a.temporal_window,
                       objective='MSE(VAE(x+delta), x)',
                       experiment='fresh zero-start source RGB; not historical staged r44')
     if a.refine and not a.extend_from:
@@ -248,15 +253,16 @@ def main():
                     counts = torch.zeros(3,1,720,1280)
                     losses = []
                     for tile_id,(y,x) in enumerate(tiles):
-                        t = (tile_id*7+(8+round_id)*5) % 29
-                        target = clean[:,t:t+5,y:y+192,x:x+192].to(device)
-                        fixed = base[:,t:t+5,y:y+192,x:x+192].to(device)
+                        window = a.temporal_window
+                        t = crop_start(tile_id,round_id,window)
+                        target = clean[:,t:t+window,y:y+192,x:x+192].to(device)
+                        fixed = base[:,t:t+window,y:y+192,x:x+192].to(device)
                         reference = None
                         if not a.direct_rgb:
                             with torch.no_grad():
                                 reference = reconstruct(target)
                         c = controls[:,:,y:y+192,x:x+192].to(device).detach().requires_grad_(True)
-                        w = weights[t:t+5].to(device)
+                        w = weights[t:t+window].to(device)
                         d = bounded_delta(fixed,c,w,epsilon/255,straight_through=a.refine)
                         recon = reconstruct((target+d).clamp(0,1))
                         loss = vae_attack_loss(recon,target,reference,direct_rgb=a.direct_rgb)
@@ -264,7 +270,7 @@ def main():
                         if not torch.isfinite(grad).all():
                             raise RuntimeError('Non-finite VAE input gradient')
                         gradients[:,:,y:y+192,x:x+192] += grad.detach().cpu()
-                        counts[:,:,y:y+192,x:x+192] += (w.sum(0).cpu()/5)[:,None,None,None]
+                        counts[:,:,y:y+192,x:x+192] += (w.sum(0).cpu()/window)[:,None,None,None]
                         losses.append(float(loss.detach()))
                         del target,fixed,reference,c,w,d,recon,loss,grad
                         if (tile_id+1)%10 == 0 or tile_id+1 == len(tiles):

@@ -22,6 +22,12 @@ def mean(rows, key):
     return sum(values) / len(values) if values else None
 
 
+def aggregate_saving(rows, smaller_key, baseline_key):
+    smaller = sum(float(row[smaller_key]) for row in rows)
+    baseline = sum(float(row[baseline_key]) for row in rows)
+    return 100.0 * (1.0 - smaller / baseline) if baseline else None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", type=Path, required=True)
@@ -54,6 +60,8 @@ def main():
             "combinatorial_total_BPP": mean(items, "combinatorial_total_BPP"),
             "total_bitrate_saving_percent": mean(
                 items, "total_bitrate_saving_percent"),
+            "aggregate_total_bitrate_saving_percent": aggregate_saving(
+                items, "combinatorial_total_BPP", "independent_total_BPP"),
         }
         for name, items in sorted(sequences.items())
     }
@@ -71,6 +79,11 @@ def main():
             "codebook_saving_percent": mean(rows, "codebook_saving_percent"),
             "total_bitrate_saving_percent": mean(
                 rows, "total_bitrate_saving_percent"),
+            "aggregate_total_bitrate_saving_percent": aggregate_saving(
+                rows, "combinatorial_total_BPP", "independent_total_BPP"),
+            "aggregate_container_saving_percent": aggregate_saving(
+                rows, "combinatorial_container_bytes",
+                "independent_container_bytes"),
         },
         "per_sequence": per_sequence,
     }

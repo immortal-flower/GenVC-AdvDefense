@@ -123,6 +123,30 @@ def summarize(rows, out):
                matched_rate_M98_vs_M64=paired, bd_rate=bd))
 
 
+def check_resume(out, protocol):
+    manifest = out / "protocol.json"
+    if not manifest.exists():
+        write_json(manifest, protocol)
+        return
+    saved = json.loads(manifest.read_text())
+    changed = sorted(k for k in saved.keys() | protocol.keys()
+                     if k != "commit" and saved.get(k) != protocol.get(k))
+    if changed:
+        raise ValueError("Resume protocol differs in: " + ", ".join(changed))
+    if saved["commit"] == protocol["commit"]:
+        return
+    paths = ["sde_rf_wan", "wan", "uvg_data.py", "exp_flf2v/run_flf2v_experiment.py",
+             "exp_flf2v/attacks.py", "exp_flf2v/defenses.py", "exp_flf2v/bitstream_attacks.py"]
+    diff = subprocess.check_output(["git", "diff", "--name-only", saved["commit"],
+                                    protocol["commit"], "--", *paths], cwd=ROOT, text=True)
+    if diff.strip():
+        raise ValueError("Codec sources differ from archived run:\n" + diff)
+    with (out / "resume_history.jsonl").open("a", encoding="utf-8") as handle:
+        print(json.dumps(dict(time=datetime.now().isoformat(), original=saved["commit"],
+                              resumed=protocol["commit"])), file=handle)
+    print("Verified archived parameters, inputs and committed codec sources.", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(__doc__)
     ap.add_argument("--data", type=Path, default=Path(r"D:\data\UVG"))
@@ -146,10 +170,7 @@ def main():
                     commit=subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),
                     inputs={s:dict(path=str(p),sha256_first_97_frames=fingerprint(Path(p),97*1920*1080*3//2))
                             for s,p in files.items()})
-    manifest = a.out/"protocol.json"
-    if manifest.exists() and json.loads(manifest.read_text()) != protocol:
-        raise ValueError("Run configuration changed; choose a fresh --out")
-    write_json(manifest, protocol)
+    check_resume(a.out, protocol)
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
     rows = []
     for m in (64,98,32,128):

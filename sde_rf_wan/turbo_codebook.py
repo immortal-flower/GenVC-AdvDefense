@@ -241,6 +241,59 @@ class TurboPerFrameCodebook:
 # Bitstream I/O for Turbo-DDCM
 # ==================================================================
 
+def _format_bits(value, width):
+    return format(value, f"0{width}b") if width else ""
+
+
+def _compact_indices(indices, K, rice):
+    width = (K - 1).bit_length()
+    if any(not 0 <= i < K for i in indices):
+        raise ValueError("Invalid index")
+    if rice:
+        gaps = [i - prev - 1 for prev, i in zip([-1] + indices, indices)]
+        if any(g < 0 for g in gaps):
+            raise ValueError("Rice gaps require increasing indices")
+        k = min(range(width + 1), key=lambda b: sum((g >> b) + 1 + b for g in gaps))
+        bits = _format_bits(k, 8) + "".join(
+            "0" * (g >> k) + "1" + _format_bits(g % (1 << k), k) for g in gaps)
+    else:
+        bits = "".join(_format_bits(i, width) for i in indices)
+    padded = bits + "0" * (-len(bits) % 8)
+    return int(padded or "0", 2).to_bytes(len(padded) // 8, "big")
+
+
+def _read_compact(raw, offset, count, K, rice):
+    width = (K - 1).bit_length()
+    pos = offset * 8
+
+    def take(n):
+        nonlocal pos
+        value = 0
+        for _ in range(n):
+            value = (value << 1) | ((raw[pos // 8] >> (7 - pos % 8)) & 1)
+            pos += 1
+        return value
+
+    k = take(8) if rice else width
+    if k > width:
+        raise ValueError("Invalid Rice parameter")
+    indices = []
+    prev = -1
+    for _ in range(count):
+        quotient = 0
+        if rice:
+            while take(1) == 0:
+                quotient += 1
+        i = take(k)
+        if rice:
+            i += prev + 1 + (quotient << k)
+        if i >= K:
+            raise ValueError("Invalid decoded index")
+        indices.append(i)
+        prev = i
+    return indices, (pos + 7) // 8
+
+
 class TurboBitstream:
     """Binary I/O for Turbo-DDCM multi-atom indices + signs.
 
@@ -265,9 +318,11 @@ class TurboBitstream:
         Args:
             step_data: [sde_step][frame] = (indices, signs)
         """
-        if index_coding not in ("combinatorial", "fixed-width"):
+        formats = {"combinatorial": b"TDC2", "fixed-width": b"TDCM",
+                   "packed": b"TDCP", "rice": b"TDCR"}
+        if index_coding not in formats:
             raise ValueError("Unsupported index coding")
-        data = bytearray(b"TDC2" if index_coding == "combinatorial" else b"TDCM")
+        data = bytearray(formats[index_coding])
         prompt_b = prompt.encode("utf-8")
 
         # Header: 10 uint32 values
@@ -292,6 +347,8 @@ class TurboBitstream:
                     rank = rank_combination(indices, K)
                     rank_bytes = (combinatorial_index_bits(K, m_actual) + 7) // 8
                     data.extend(rank.to_bytes(rank_bytes, "little"))
+                elif index_coding in ("packed", "rice"):
+                    data.extend(_compact_indices(list(map(int, indices)), K, index_coding == "rice"))
                 else:
                     for index in indices:
                         if not 0 <= index < K:
@@ -311,7 +368,9 @@ class TurboBitstream:
         """Load Turbo-DDCM bitstream."""
         raw = Path(filepath).read_bytes()
         magic = raw[:4]
-        if magic not in (b"TDCM", b"TDC2"):
+        formats = {b"TDCM": "fixed-width", b"TDC2": "combinatorial",
+                   b"TDCP": "packed", b"TDCR": "rice"}
+        if magic not in formats:
             raise ValueError(f"Invalid magic: {magic!r}")
         off = 4
 
@@ -346,6 +405,8 @@ class TurboBitstream:
                     rank = int.from_bytes(raw[off:off + rank_bytes], "little")
                     off += rank_bytes
                     indices = unrank_combination(rank, K, m_actual)
+                elif magic in (b"TDCP", b"TDCR"):
+                    indices, off = _read_compact(raw, off, m_actual, K, magic == b"TDCR")
                 else:
                     indices = []
                     for _ in range(m_actual):
@@ -373,5 +434,5 @@ class TurboBitstream:
             frame_shape=tuple(shape), prompt=prompt,
             num_frames=n_fr, height=h, width=w,
             step_data=step_data,
-            index_coding="combinatorial" if magic == b"TDC2" else "fixed-width",
+            index_coding=formats[magic],
         )

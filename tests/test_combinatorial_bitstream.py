@@ -27,6 +27,23 @@ unrank_combination = MODULE.unrank_combination
 
 
 class CombinatorialCodingTest(unittest.TestCase):
+    def test_paper_formats_at_all_operating_points(self):
+        import random
+        rng = random.Random(42)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stream"
+            for m in (32, 64, 98, 128):
+                selections = [sorted(rng.sample(range(16384), m)), list(range(16384-m, 16384))]
+                source = [[(indices, [(-1)**i for i in range(m)]) for indices in selections]]
+                for mode in ("packed", "rice", "combinatorial"):
+                    TurboBitstream.save(path, source, 16384, m, 1, 3, 2, 42, (16,90,160),
+                                        index_coding=mode)
+                    restored = TurboBitstream.load(path)
+                    self.assertEqual(restored["step_data"], source)
+                    self.assertEqual(restored["index_coding"], mode)
+                    if mode == "packed":
+                        self.assertEqual(path.stat().st_size, 60 + 2*(2+(14*m+7)//8+(m+7)//8))
+
     def test_rank_round_trip(self):
         for K in range(1, 14):
             for M in range(K + 1):

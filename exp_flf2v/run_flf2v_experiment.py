@@ -430,6 +430,8 @@ def main():
     # nargs="*"：可跟零个或多个序列名，如 --sequences Jockey Beauty。
     parser.add_argument("--sequences", nargs="*", default=None)
     parser.add_argument("--run_name", default=None, help="Optional subdirectory name under output_dir")
+    parser.add_argument("--archive_rate_sweep", action="store_true",
+                        help="Retain lossless RGB, boundary packets and resume completed paper GOPs")
     # 攻击和防御都发生在输入帧上，不直接改 Wan / VAE 权重或码本索引。
     parser.add_argument("--attack", default="none", choices=ATTACK_CHOICES)
     parser.add_argument("--defense", default="none", choices=DEFENSE_CHOICES)
@@ -922,7 +924,15 @@ def main():
                 boundary_compressed[idx] = (gt_frame, 0)
             else:
                 # FLF2V 两端使用相同的“解压后”帧作条件，而不是让解码端看到原始帧。
-                decoded, nbytes = compress_boundary_frame(gt_frame, ref_codec=args.ref_codec, ref_quality=args.ref_quality)
+                if args.archive_rate_sweep:
+                    decoded, payload, nbytes = compress_ref(gt_frame, codec=args.ref_codec, quality=args.ref_quality)
+                    anchor = seq_dir / f"anchor_{idx}.bin"
+                    if anchor.exists() and anchor.read_bytes() != payload:
+                        raise RuntimeError(f"Boundary differs from archived run: {anchor}")
+                    if not anchor.exists():
+                        anchor.write_bytes(payload)
+                else:
+                    decoded, nbytes = compress_boundary_frame(gt_frame, ref_codec=args.ref_codec, ref_quality=args.ref_quality)
                 boundary_compressed[idx] = (decoded, nbytes)
                 total_boundary_bytes += nbytes
 
@@ -932,6 +942,14 @@ def main():
         # 外层 for 处理序列；这里的内层 for 再逐个处理这个序列的 GOP。
         for g in range(actual_gops):
             source_gop = args.start_gop + g
+            if args.archive_rate_sweep:
+                folder = seq_dir / f"gop{source_gop}"
+                if (folder / "metrics.json").is_file():
+                    for artifact in ("reconstructed_rgb.npy", "codebook_independent.tdcm", "codebook_combinatorial.tdc2"):
+                        if not (folder / artifact).is_file():
+                            raise RuntimeError(f"Incomplete archive: {folder / artifact}")
+                    gop_results.append(json.loads((folder / "metrics.json").read_text()))
+                    continue
             print(f"\n  --- {seq_name} GOP {source_gop} "
                   f"(local {g}/{actual_gops-1})  ({datetime.now().strftime('%H:%M:%S')}) ---")
             gop_frames_gt = gops_gt[g]
@@ -1142,6 +1160,16 @@ def main():
             flf2v_cond_dec = model.encode_first_last_frames(first_decoded, last_decoded, FPG, HEIGHT, WIDTH)
             frames_recon = flf2v_decode(pipe, model, decode_step_data, flf2v_cond_dec)
             t_dec = time.time() - t0
+            if args.archive_rate_sweep:
+                rgb = np.stack([np.asarray(frame) for frame in frames_recon])
+                np.save(gop_dir / "reconstructed_rgb.npy", rgb, allow_pickle=False)
+                if args.M == 98 and seq_name == "Beauty" and source_gop == 0:
+                    legacy = TurboBitstream.load(str(gop_dir / "codebook_independent.tdcm"))
+                    other = flf2v_decode(pipe, model, legacy["step_data"], flf2v_cond_dec)
+                    other_rgb = np.stack([np.asarray(frame) for frame in other])
+                    np.save(gop_dir / "independent_rgb.npy", other_rgb, allow_pickle=False)
+                    rate_comparison["double_decode_max_rgb_error"] = int(
+                        np.abs(rgb.astype(np.int16) - other_rgb).max())
 
             if inverse_after_decode == "hflip":
                 # PIL 的 transpose 不改原帧对象；逐帧镜像后恢复显示方向。
@@ -1261,7 +1289,9 @@ def main():
             result.update(input_reference_metrics)
             gop_results.append(result)
             # 每个 gopN/metrics.json 记录整 GOP 平均指标与逐帧 PSNR。
-            with open(gop_dir / "metrics.json", "w") as mf: json.dump(result, mf, indent=2)
+            temporary = gop_dir / "metrics.tmp.json"
+            temporary.write_text(json.dumps(result, indent=2))
+            temporary.replace(gop_dir / "metrics.json")
 
             print(f"    PSNR={mean_psnr:.2f} dB, LPIPS={mean_lpips:.4f}, BPP={bpp:.6f}")
             del pipe, frames_recon, t_gt, t_rec, step_data, decode_step_data, flf2v_cond_dec
@@ -1269,7 +1299,8 @@ def main():
             torch.cuda.empty_cache()
 
         # 多 GOP 时输出无重复边界帧的整段重建视频。
-        save_video_mp4(all_recon_frames, seq_dir / "reconstructed_full.mp4")
+        if not args.archive_rate_sweep:
+            save_video_mp4(all_recon_frames, seq_dir / "reconstructed_full.mp4")
         all_seq_results.append({"sequence": seq_name, "gop_results": gop_results})
         del frames_resized, attacked_frames, codec_frames, all_recon_frames
         gc.collect()

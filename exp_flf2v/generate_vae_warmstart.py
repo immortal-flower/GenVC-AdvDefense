@@ -71,8 +71,9 @@ def main():
     p.add_argument('--extension_rounds', type=int, nargs='+', default=[8,12])
     p.add_argument('--refine',action='store_true',help='Rebase at saved pixels, reset momentum, alpha0.25; use straight-through epsilon-clamp gradient')
     p.add_argument('--direct_rgb',action='store_true',help='Refinement maximizing VAE reconstruction MSE against original input RGB, not clean VAE output')
+    p.add_argument('--fresh_rgb_rounds', type=int, nargs='+', help='New standardized source-RGB experiment; zero initializer, epsilon4 only (not the historical r44 recipe)')
     a = p.parse_args()
-    if a.direct_rgb:
+    if a.direct_rgb and not a.fresh_rgb_rounds:
         a.refine = True
     config = dict(version=1, data_sha256=sha256(a.data), initial_sha256=sha256(a.initial),
                   generator_sha256=sha256(__file__),
@@ -85,6 +86,14 @@ def main():
                   boundary='all frames, including first and last, can change',
                   optimizer_state='zero additional controls and zero momentum for each epsilon branch')
     source = None
+    if a.fresh_rgb_rounds:
+        if a.extend_from or a.refine or not a.direct_rgb:
+            p.error('Fresh RGB requires --direct_rgb without continuation/refinement')
+        if a.fresh_rgb_rounds != sorted(set(a.fresh_rgb_rounds)) or min(a.fresh_rgb_rounds)<1 or max(a.fresh_rgb_rounds)>64:
+            p.error('Fresh rounds must increase within [1,64]')
+        config.update(saved_rounds=a.fresh_rgb_rounds, epsilon_pixels=[4],
+                      objective='MSE(VAE(x+delta), x)',
+                      experiment='fresh zero-start source RGB; not historical staged r44')
     if a.refine and not a.extend_from:
         p.error('Refinement requires a completed source checkpoint')
     if a.extend_from:
@@ -127,6 +136,8 @@ def main():
         initial = z['delta'].astype(np.float32)
     if initial.shape != raw.shape or not np.isfinite(initial).all() or np.abs(initial).max()*255 > 2.001:
         raise ValueError('Expected the accepted 33-frame epsilon=2 initialization')
+    if a.fresh_rgb_rounds and np.any(initial):
+        raise ValueError('Fresh RGB experiment requires a zero initializer')
     original = raw.astype(np.float32)/255
     submitted = (np.clip(original+initial,0,1)*255+.5).astype(np.uint8)
     actual = submitted.astype(np.int16)-raw.astype(np.int16)
